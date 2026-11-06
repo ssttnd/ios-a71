@@ -1,0 +1,131 @@
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+index eea02c9..58f3b81 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -29,7 +29,21 @@ struct Backend {
+  int (*health)(void *)=nullptr;
+  bool published=false,opened=false,lost=false,cpu_present=false;
+  bool pipeline=true;   // sweetpipeline=0 restores a full drain before every submit/map
++ /* Slot 0 is backboardd's original window. Extra slots are separate 256 MiB
++  * windows of the same 2 GiB arena above it, each with its own queue range,
++  * so one client's IOVAs can never collide with another's. */
++ bool slot_open[4]={false,false,false,false};
++ unsigned extra_slots=3;
+ } backend;
++enum : uint64_t {ExtraWindowStart=0x70000000,ExtraWindowBytes=0x10000000};
++/* Processes that receive a Metal device besides backboardd. AegirPoster (the
++ * configured iOS 16 wallpaper) aborts without one; sweetm2extra=0 disables. */
++bool extra_client(const char *name)
++{
++ static const char *const names[]={"AegirPoster"};
++ for(const char *n:names)if(!strcmp(name,n))return true;
++ return false;
++}
+ // Release/acquire publishes the completed backend to the framebuffer workloop.
+ static bool presentation_ready=false;
+ bool healthy()
+@@ -76,9 +90,11 @@ class AGXDeviceUserClient : public IOUserClient {
+  NativeAdrenoUserClient *core_=nullptr;
+  task_t task_=TASK_NULL;
+  bool mounted_=false,closed_=false;
++ unsigned slot_=0;
++ NativeAdrenoAbiDeviceInfo info_{};   // this client's window; outlives core_
+  unsigned trace_calls_=0,trace_errors_=0;
+ public:
+- bool mount(task_t task,void *securityID,UInt32 type,OSDictionary *properties);
++ bool mount(task_t task,void *securityID,UInt32 type,OSDictionary *properties,unsigned slot);
+  IOReturn externalMethod(uint32_t selector,IOExternalMethodArguments *arguments,
+      IOExternalMethodDispatch *dispatch,OSObject *target,void *reference) APPLE_KEXT_OVERRIDE;
+  IOReturn clientMemoryForType(UInt32 type,IOOptionBits *options,IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
+@@ -100,17 +116,22 @@ public:
+      IOUserClient **handler) APPLE_KEXT_OVERRIDE;
+ };
+ OSDefineMetaClassAndStructors(AGXAccelerator,IOAcceleratorES)
+-bool AGXDeviceUserClient::mount(task_t task,void *securityID,UInt32 type,OSDictionary *properties)
++bool AGXDeviceUserClient::mount(task_t task,void *securityID,UInt32 type,OSDictionary *properties,unsigned slot)
+ {
+  if(!IOUserClient::initWithTask(task,securityID,type,properties))return false;
+- task_=task;
++ task_=task;slot_=slot;info_=backend.info;
++ if(slot) {
++  info_.va_start=ExtraWindowStart+(uint64_t)(slot-1)*ExtraWindowBytes;
++  info_.va_size=ExtraWindowBytes;
++  if(info_.va_start<backend.info.va_start+backend.info.va_size)return false;
++ }
+  core_=new NativeAdrenoUserClient;
+  if(!core_)return false;
+  IOReturn error=core_->open(NativeAdrenoAbiVersion,backend.vm,backend.submit,backend.ring,32,36);
+- if(!error)error=core_->setScope(0,backend.info.va_start,backend.info.va_size);
++ if(!error)error=core_->setScope(slot*NativeAdrenoAbiMaxQueues,info_.va_start,info_.va_size);
+  if(!error)error=core_->attachTimer(&backend.timer);
+  if(!error)error=core_->attachStatus(&backend.status);
+- if(!error)error=core_->attachDeviceInfo(&backend.info);
++ if(!error)error=core_->attachDeviceInfo(&info_);
+  if(error) {if(core_->close()!=kIOReturnSuccess)backend.lost=true;return false;}
+  mounted_=true;return true;
+ }
+@@ -121,18 +142,31 @@ IOReturn AGXAccelerator::newUserClient(task_t task,void *securityID,UInt32 type,
+  *handler=nullptr;
+  if(type!=0x4147 || task!=current_task())return kIOReturnUnsupported;
+  char name[32]={};proc_selfname(name,sizeof name);
+- if(strcmp(name,"backboardd"))return kIOReturnNotPrivileged;
++ const bool compositor=!strcmp(name,"backboardd");
++ if(!compositor && !(backend.extra_slots && extra_client(name)))return kIOReturnNotPrivileged;
+  IOLockLock(backend.lock);
+  static unsigned open_traces=0;
+- if(open_traces<16) {++open_traces;IOLog("SWEET RENDER: compositor open type=%#x\n",type); }
+- if(backend.opened || !healthy()) {IOLockUnlock(backend.lock);return kIOReturnBusy;}
++ if(open_traces<16) {++open_traces;IOLog("SWEET RENDER: %s open type=%#x\n",name,type); }
++ unsigned slot=0;
++ if(compositor) {
++  if(backend.opened || !healthy()) {IOLockUnlock(backend.lock);return kIOReturnBusy;}
++ } else {
++  for(slot=1;slot<=backend.extra_slots && backend.slot_open[slot];++slot) {}
++  if(slot>backend.extra_slots || !healthy()) {
++   IOLog("SWEET RENDER: %s refused: no free extra Metal slot\n",name);
++   IOLockUnlock(backend.lock);return kIOReturnBusy;
++  }
++ }
+  auto client=new AGXDeviceUserClient;
+- if(!client || !client->mount(task,securityID,type,properties) || !client->attach(this) || !client->start(this)) {
++ if(!client || !client->mount(task,securityID,type,properties,slot) || !client->attach(this) || !client->start(this)) {
+   if(client)client->release();
+   IOLockUnlock(backend.lock);return kIOReturnNoResources;
+  }
+- backend.opened=true;*handler=client;
+- IOLog("SWEET RENDER: compositor client connected ABI=%u\n",NativeAdrenoAbiVersion);
++ if(compositor)backend.opened=true;
++ backend.slot_open[slot]=true;*handler=client;
++ IOLog("SWEET RENDER: %s client connected ABI=%u slot=%u window=%#llx+%#llx\n",name,NativeAdrenoAbiVersion,
++   slot,slot?ExtraWindowStart+(uint64_t)(slot-1)*ExtraWindowBytes:backend.info.va_start,
++   slot?(uint64_t)ExtraWindowBytes:backend.info.va_size);
+  IOLockUnlock(backend.lock);return kIOReturnSuccess;
+ }
+ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *options,IOMemoryDescriptor **memory)
+@@ -267,7 +301,11 @@ IOReturn AGXDeviceUserClient::clientClose()
+   backend.lost=true;
+   // Keep uncertain GPU resources and their bookkeeping alive for this boot.
+   retain();
+- } else {mounted_=false;backend.opened=false;}
++ } else {
++  mounted_=false;backend.slot_open[slot_]=false;
++  if(!slot_)backend.opened=false;
++  if(slot_)IOLog("SWEET RENDER: extra Metal slot %u closed\n",slot_);
++ }
+  IOLockUnlock(backend.lock);
+  terminate();return error;
+ }
+@@ -310,9 +348,12 @@ extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit
+  } else IOLog("SWEET GLES: native A618 transport published; Metal discovery disabled for GLES boot\n");
+  provider->setProperty("model","Adreno 618");
+  provider->setProperty("NativeAdrenoABI",NativeAdrenoAbiVersion,32);
++ int extra=3;PE_parse_boot_argn("sweetm2extra",&extra,sizeof(extra));
++ backend.extra_slots=extra<0?0u:(extra>3?3u:(unsigned)extra);
+  int pipeline=1;PE_parse_boot_argn("sweetpipeline",&pipeline,sizeof(pipeline));
+  backend.pipeline=pipeline!=0;
+- IOLog("SWEET RENDER: submission pipelining %s (BoFree/close still drain)\n",backend.pipeline?"enabled":"disabled");
++ IOLog("SWEET RENDER: submission pipelining %s (BoFree/close still drain); extra Metal slots=%u\n",
++   backend.pipeline?"enabled":"disabled",backend.extra_slots);
+  int present_wait=0;PE_parse_boot_argn("sweetpresentwait",&present_wait,sizeof(present_wait));
+  backend.cpu_present=mtl==2 && gles!=1 && present_wait==1;
+  __atomic_store_n(&presentation_ready,true,__ATOMIC_RELEASE);

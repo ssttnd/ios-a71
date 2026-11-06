@@ -1,0 +1,125 @@
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+index d348393..789a5f6 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -38,6 +38,7 @@ struct Backend {
+  bool pipeline=true;   // sweetpipeline=0 restores a full drain before every submit/map
+  bool present_locked=false;   // sweetpresentlock=1: present holds the lock across drain and copy
+  bool present_swap_fence=false;   // sweetpresentfence=1: wait for the SwapEnd-time fence
++ bool wait_unlocked=true;   // sweetwaitlock=1: WaitFence spins with the lock held, as before 0144
+  /* Slot 0 is backboardd's original window. Extra slots are separate 256 MiB
+   * windows of the same 2 GiB arena above it, each with its own queue range,
+   * so one client's IOVAs can never collide with another's. */
+@@ -148,6 +149,55 @@ extern "C" void sweet_native_adreno_cpu_present_end(int state)
+ {
+  if(state==1)IOLockUnlock(backend.lock);
+ }
++/* Per-window GPU and lock telemetry (0144). Busy is sampled from the
++ * framebuffer's 120 Hz timer: the newest fence still incomplete. A sample
++ * that finds the lock taken is counted apart rather than guessed. */
++namespace {
++struct MethodStat {uint64_t calls,us;};
++MethodStat method_stats[NativeAdrenoMethodSubmitResources+1];
++uint64_t lock_wait_us,lock_wait_max_us,lock_takes,wait_polls;
++unsigned busy_samples,idle_samples,locked_samples;
++uint64_t window_began_us;
++}
++extern "C" void sweet_native_adreno_sample_busy(void)
++{
++ if(!__atomic_load_n(&presentation_ready,__ATOMIC_ACQUIRE) || !backend.ring)return;
++ if(!IOLockTryLock(backend.lock)) {++locked_samples;return;}
++ const uint32_t newest=healthy()?backend.ring->lastSubmitted():0;
++ const IOReturn state=newest?backend.submit->observeFence(newest,&backend.clock,0):kIOReturnSuccess;
++ if(state==kIOReturnTimeout)++busy_samples;else ++idle_samples;
++ IOLockUnlock(backend.lock);
++}
++/* Called with the lock held after each method; prints once per 10 s. */
++static void method_window(void)
++{
++ const uint64_t now=backend.clock.now_us(backend.clock.cookie);
++ if(!window_began_us) {window_began_us=now;return;}
++ if(now-window_began_us<10000000)return;
++ static const char *const names[]={"0","query","alloc","map","free","submit","wait","ts","status","setmeta","getmeta","mkq","rmq","cpumap","cpuunmap","devinfo","import","submit-res"};
++ char line[320];size_t at=0;
++ for(unsigned i=1;i<=NativeAdrenoMethodSubmitResources && at<sizeof line;i++) {
++  if(!method_stats[i].calls)continue;
++  at+=snprintf(line+at,sizeof line-at," %s=%llu/%llu",i<sizeof names/sizeof names[0]?names[i]:"?",
++    method_stats[i].calls,method_stats[i].us/method_stats[i].calls);
++ }
++ if(at>=sizeof line)at=sizeof line-1;
++ line[at]=0;
++ const unsigned sampled=busy_samples+idle_samples;
++ IOLog("SWEET RENDER: window_ms=%llu gpu_busy_pct=%u samples=%u locked=%u lock_avg_us=%llu lock_max_us=%llu wait_polls=%llu calls/avg_us:%s\n",
++   (now-window_began_us)/1000,sampled?busy_samples*100/sampled:0,sampled,locked_samples,
++   lock_takes?lock_wait_us/lock_takes:0,lock_wait_max_us,wait_polls,line);
++ memset(method_stats,0,sizeof method_stats);
++ lock_wait_us=lock_wait_max_us=lock_takes=wait_polls=0;busy_samples=idle_samples=locked_samples=0;
++ window_began_us=now;
++}
++static void lock_timed(void)
++{
++ const uint64_t asked=backend.clock.now_us(backend.clock.cookie);
++ IOLockLock(backend.lock);
++ const uint64_t waited=backend.clock.now_us(backend.clock.cookie)-asked;
++ lock_wait_us+=waited;++lock_takes;if(waited>lock_wait_max_us)lock_wait_max_us=waited;
++}
+ class AGXDeviceUserClient : public IOUserClient {
+  OSDeclareDefaultStructors(AGXDeviceUserClient)
+  NativeAdrenoUserClient *core_=nullptr;
+@@ -288,7 +338,35 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
+  const size_t input=NativeAdrenoUserClient::inputSize(selector),output=NativeAdrenoUserClient::outputSize(selector);
+  if(args->structureInputSize!=input || args->structureOutputSize!=output ||
+     (input && !args->structureInput) || (output && !args->structureOutput))return kIOReturnBadArgument;
+- IOLockLock(backend.lock);
++ /* Turnip waits in 1 ms WaitFence slices. Spinning one under the global lock
++  * stalled every Submit/BoMap/import of the next frame behind the GPU (and
++  * burned a core). Poll the same single check (timeout 0) with the lock
++  * taken only for that check, and block between polls. */
++ if(selector==NativeAdrenoMethodWaitFence && backend.wait_unlocked) {
++  NativeAdrenoAbiWaitFence request{};memcpy(&request,args->structureInput,sizeof request);
++  if(request.timeout_ns) {
++   NativeAdrenoAbiWaitFence poll=request;poll.timeout_ns=0;
++   const uint64_t limit_us=request.timeout_ns/1000?request.timeout_ns/1000:1;
++   const uint64_t began=backend.clock.now_us(backend.clock.cookie);
++   for(;;) {
++    lock_timed();
++    if(!mounted_ || closed_ || !healthy()) {IOLockUnlock(backend.lock);return kIOReturnNotReady;}
++    const IOReturn result=core_->dispatch(selector,&poll,sizeof poll,args->structureOutput,output,&backend.clock);
++    ++wait_polls;
++    const uint64_t now=backend.clock.now_us(backend.clock.cookie);
++    if(result!=kIOReturnTimeout || now-began>=limit_us) {
++     ++method_stats[selector].calls;method_stats[selector].us+=now-began;
++     method_window();
++     if(result && result!=kIOReturnTimeout && trace_errors_++<16)
++      IOLog("SWEET RENDER: method=%u result=%#x\n",selector,result);
++     IOLockUnlock(backend.lock);return result;
++    }
++    IOLockUnlock(backend.lock);
++    IODelay(20);
++   }
++  }
++ }
++ lock_timed();
+  if(!mounted_ || closed_ || !healthy()) {IOLockUnlock(backend.lock);return kIOReturnNotReady;}
+  const uint64_t began=backend.clock.now_us(backend.clock.cookie);
+  uint64_t quiesce_us=0;
+@@ -360,6 +438,8 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
+  }
+  if(!pending_poll && (trace_calls_++<64 || (result && trace_errors_++<16)))
+   IOLog("SWEET RENDER: method=%u result=%#x\n",selector,result);
++ ++method_stats[selector].calls;method_stats[selector].us+=backend.clock.now_us(backend.clock.cookie)-began;
++ method_window();
+  IOLockUnlock(backend.lock);return result;
+ }
+ IOReturn AGXDeviceUserClient::clientClose()
+@@ -444,6 +524,10 @@ extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit
+  backend.present_locked=present_locked!=0;
+  int pipeline=1;PE_parse_boot_argn("sweetpipeline",&pipeline,sizeof(pipeline));
+  backend.pipeline=pipeline!=0;
++ int wait_locked=0;PE_parse_boot_argn("sweetwaitlock",&wait_locked,sizeof(wait_locked));
++ backend.wait_unlocked=wait_locked==0;
++ IOLog("SWEET RENDER: fence waits %s (sweetwaitlock=%d)\n",
++   backend.wait_unlocked?"poll with the lock dropped between checks":"spin under the lock",wait_locked);
+  IOLog("SWEET RENDER: submission pipelining %s (BoFree/close still drain); extra Metal slots=%u\n",
+    backend.pipeline?"enabled":"disabled",backend.extra_slots);
+  int present_wait=0;PE_parse_boot_argn("sweetpresentwait",&present_wait,sizeof(present_wait));

@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -245,6 +245,19 @@
+      cp.interrupt, cp.hw_fault);
+  printf("SWEET ADRENO: CP MMU CB0FSR=%#x CB1FSR=%#x\n",
+      sweet_adreno_read((void *)smmu, 0x8058), sweet_adreno_read((void *)smmu, 0x9058));
++ /* Snapshot the first hardware fault before any new translation probe or
++  * W1C operation. ATOS success does not prove the CP used the same VA. */
++ printf("SWEET ADRENO: CP fault FAR=%#llx FSYNR0=%#x FSYNR1=%#x SID=%#x TTBR0=%#llx TCR=%#x SCTLR=%#x\n",
++     sweet_adreno_read64((void *)smmu, 0x8060),
++     sweet_adreno_read((void *)smmu, 0x8068), sweet_adreno_read((void *)smmu, 0x806c),
++     sweet_adreno_read((void *)smmu, 0x1400),
++     sweet_adreno_read64((void *)smmu, 0x8020),
++     sweet_adreno_read((void *)smmu, 0x8030), sweet_adreno_read((void *)smmu, 0x8000));
++ printf("SWEET ADRENO: CP addresses SQE=%#llx RING=%#llx SHADOW=%#llx CNTL=%#x SQECTL=%#x\n",
++     ((uint64_t)sweet_adreno_read((void *)core, 0x20c4) << 32) | sweet_adreno_read((void *)core, 0x20c0),
++     ((uint64_t)sweet_adreno_read((void *)core, 0x2004) << 32) | sweet_adreno_read((void *)core, 0x2000),
++     ((uint64_t)sweet_adreno_read((void *)core, 0x2014) << 32) | sweet_adreno_read((void *)core, 0x2010),
++     sweet_adreno_read((void *)core, 0x2008), sweet_adreno_read((void *)core, 0x2020));
+  if (error) return error;
+  error = sweet_adreno_pas_allocate(&metadata);
+  if (error) return error;

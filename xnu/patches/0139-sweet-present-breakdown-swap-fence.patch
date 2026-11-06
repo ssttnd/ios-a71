@@ -1,0 +1,166 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f5af167..1ea8873 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -54,7 +54,8 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <kern/thread_call.h>
+ #include <sys/proc.h>
+ #include "unixnu/NativeAdrenoMemory.h"
+-extern "C" int sweet_native_adreno_cpu_present_begin();
++extern "C" int sweet_native_adreno_cpu_present_begin(uint32_t swap_fence);
++extern "C" uint32_t sweet_native_adreno_last_fence(void);
+ extern "C" void sweet_native_adreno_cpu_present_end(int state);
+ 
+ enum {
+@@ -162,6 +163,10 @@ public:
+ 	bool          fPresentThreaded;       /* sweetfb_thread=0: present inline on the vsync tick */
+ 	uint8_t       fPresentRec[SWEET_FB_SWAP_REC_SIZE];
+ 	uint64_t      fStatsPresentUs, fStatsPresentMaxUs, fStatsCoalesced;
++	/* 0131 hardware: presents averaged 15-66ms (max 247ms) once submits were
++	 * cheap; split them so the remaining cap is measured. */
++	uint64_t      fStatsGateUs, fStatsAcquireUs, fStatsCopyUs, fStatsSwaps;
++	uint32_t      fPendingFence, fPresentFence;   /* newest GPU fence when SwapEnd recorded the frame */
+ 	void rearmVsync(void);
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -573,9 +578,14 @@ AppleCLCD::rearmVsync(void)
+ 		const uint64_t present_us = __atomic_exchange_n(&fStatsPresentUs, 0, __ATOMIC_RELAXED);
+ 		const uint64_t present_max = __atomic_exchange_n(&fStatsPresentMaxUs, 0, __ATOMIC_RELAXED);
+ 		const uint64_t coalesced = __atomic_exchange_n(&fStatsCoalesced, 0, __ATOMIC_RELAXED);
+-		IOLog("SWEET FB: timing window_ms=%llu callbacks=%llu present_calls=%llu missed_deadlines=%llu target=%u Hz present_avg_us=%llu present_max_us=%llu coalesced=%llu\n",
++		const uint64_t gate_us = __atomic_exchange_n(&fStatsGateUs, 0, __ATOMIC_RELAXED);
++		const uint64_t acquire_us = __atomic_exchange_n(&fStatsAcquireUs, 0, __ATOMIC_RELAXED);
++		const uint64_t copy_us = __atomic_exchange_n(&fStatsCopyUs, 0, __ATOMIC_RELAXED);
++		const uint64_t swaps = __atomic_exchange_n(&fStatsSwaps, 0, __ATOMIC_RELAXED);
++		IOLog("SWEET FB: timing window_ms=%llu callbacks=%llu present_calls=%llu missed_deadlines=%llu target=%u Hz present_avg_us=%llu present_max_us=%llu coalesced=%llu swaps=%llu gate_avg_us=%llu acquire_avg_us=%llu copy_avg_us=%llu\n",
+ 		    elapsed / NSEC_PER_MSEC, fStatsCallbacks, presents,
+-		    fStatsMissed, fPresentHz, presents ? present_us / presents : 0, present_max, coalesced);
++		    fStatsMissed, fPresentHz, presents ? present_us / presents : 0, present_max, coalesced, swaps,
++		    presents ? gate_us / presents : 0, presents ? acquire_us / presents : 0, presents ? copy_us / presents : 0);
+ 		fStatsStart = now;
+ 		fStatsCallbacks = fStatsMissed = 0;
+ 	}
+@@ -630,6 +640,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (flush && !fb->fPresentThreaded) {
+ 		/* Previous behaviour: this tick waits for the GPU and copies. */
+ 		memcpy(fb->fPresentRec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++			fb->fPresentFence = fb->fPendingFence;
+ 		fb->fDirty = false;
+ 	}
+ 	IOLockUnlock(fb->fLock);
+@@ -683,6 +694,7 @@ AppleCLCD::presentThread(void *arg, wait_result_t result)
+ 		IOLockLock(fb->fLock);
+ 		if (fb->fDirty && !fb->fPowerOff) {
+ 			memcpy(fb->fPresentRec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++			fb->fPresentFence = fb->fPendingFence;
+ 			fb->fDirty = false;
+ 			take = true;
+ 		}
+@@ -744,10 +756,13 @@ static uint64_t sweet_fb_swap_count;
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	const uint32_t fence = sweet_native_adreno_last_fence();
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++	fPendingFence = fence;
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
++	__atomic_add_fetch(&fStatsSwaps, 1, __ATOMIC_RELAXED);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+@@ -780,9 +795,14 @@ AppleCLCD::present(const uint8_t *rec)
+ 	 * is held while waiting for GPU completion. Zero keeps early CPU boots. */
+ 	struct PresentGate {
+ 		int state;
+-		PresentGate():state(sweet_native_adreno_cpu_present_begin()) {}
++		explicit PresentGate(uint32_t fence):state(sweet_native_adreno_cpu_present_begin(fence)) {}
+ 		~PresentGate(){if(state>0)sweet_native_adreno_cpu_present_end(state);}
+-	} gate;
++	};
++	const uint64_t gate_began = mach_absolute_time();
++	PresentGate gate(fPresentFence);
++	uint64_t gate_ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - gate_began, &gate_ns);
++	__atomic_add_fetch(&fStatsGateUs, gate_ns / NSEC_PER_USEC, __ATOMIC_RELAXED);
+ 	if(gate.state<0) {
+ 		IOLockLock(fLock);fDirty=true;IOLockUnlock(fLock);
+ 		return; // retain the last complete panel frame after a GPU fault
+@@ -868,7 +888,10 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		if (src != 0 && bpe == 4 && gate.state>0) {
+ 			const uint64_t first=(uint64_t)s->offset+(uint64_t)sy*s->bytesPerRow+(uint64_t)sx*4;
++			const uint64_t acquire_began=mach_absolute_time();
+ 			const IOReturn result=sweet_fb_acquire(s,first,last);
++			uint64_t acquire_ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-acquire_began,&acquire_ns);
++			__atomic_add_fetch(&fStatsAcquireUs,acquire_ns/NSEC_PER_USEC,__ATOMIC_RELAXED);
+ 			if(result) {
+ 				static unsigned refusals=0;
+ 				if(++refusals<=4 || refusals%120==0)
+@@ -878,11 +901,15 @@ AppleCLCD::present(const uint8_t *rec)
+ 			}
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			const uint64_t copy_began = mach_absolute_time();
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
++			uint64_t copy_ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time() - copy_began, &copy_ns);
++			__atomic_add_fetch(&fStatsCopyUs, copy_ns / NSEC_PER_USEC, __ATOMIC_RELAXED);
+ 		}
+ 		s->release();
+ 	}
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+index 1f13c87..376cc6e 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -36,6 +36,7 @@ struct Backend {
+  bool published=false,opened=false,lost=false,cpu_present=false;
+  bool pipeline=true;   // sweetpipeline=0 restores a full drain before every submit/map
+  bool present_locked=false;   // sweetpresentlock=1: present holds the lock across drain and copy
++ bool present_swap_fence=false;   // sweetpresentfence=1: wait for the SwapEnd-time fence
+  /* Slot 0 is backboardd's original window. Extra slots are separate 256 MiB
+   * windows of the same 2 GiB arena above it, each with its own queue range,
+   * so one client's IOVAs can never collide with another's. */
+@@ -99,7 +100,17 @@ IOReturn quiesce()
+  * after the frame's render output, and present() still does the physical
+  * cache acquire. 0127 hardware: holding the lock 15-22ms per present
+  * serialized CoreAnimation's submissions behind the copy. */
+-extern "C" int sweet_native_adreno_cpu_present_begin()
++/* Newest fence handed out (0 before publication); read without the lock:
++ * a monotonic counter, used only to pick a wait target. */
++extern "C" uint32_t sweet_native_adreno_last_fence(void)
++{
++ if(!__atomic_load_n(&presentation_ready,__ATOMIC_ACQUIRE) || !backend.ring)return 0;
++ return backend.ring->lastSubmitted();
++}
++/* swap_fence: sweet_native_adreno_last_fence() when SwapEnd recorded the frame.
++ * sweetpresentfence=1 waits for that one (the frame being shown) instead of
++ * the newest fence, which may belong to CoreAnimation's next frame. */
++extern "C" int sweet_native_adreno_cpu_present_begin(uint32_t swap_fence)
+ {
+  if(!__atomic_load_n(&presentation_ready,__ATOMIC_ACQUIRE) || !backend.cpu_present)return 0;
+  const uint64_t began=backend.clock.now_us(backend.clock.cookie);
+@@ -115,7 +126,8 @@ extern "C" int sweet_native_adreno_cpu_present_begin()
+  }
+  IOLockLock(backend.lock);
+  const bool ok=healthy();
+- const uint32_t target=ok?backend.ring->lastSubmitted():0;
++ const uint32_t newest=ok?backend.ring->lastSubmitted():0;
++ const uint32_t target=backend.present_swap_fence && swap_fence && swap_fence-newest>0x80000000u?swap_fence:newest;
+  IOLockUnlock(backend.lock);
+  IOReturn result=ok?kIOReturnSuccess:kIOReturnIOError;
+  while(ok && target) {
+@@ -422,6 +434,8 @@ extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit
+  int import_sync=0;PE_parse_boot_argn("sweetimportsync",&import_sync,sizeof(import_sync));
+  native_adreno_import_sync=import_sync!=0;
+  IOLog("SWEET RENDER: imported BO cache sync by %s (sweetimportsync=%d)\n",import_sync?"kernel at every submit/completion":"client per command",import_sync);
++ int swap_fence=0;PE_parse_boot_argn("sweetpresentfence",&swap_fence,sizeof(swap_fence));
++ backend.present_swap_fence=swap_fence!=0;
+  int present_locked=0;PE_parse_boot_argn("sweetpresentlock",&present_locked,sizeof(present_locked));
+  backend.present_locked=present_locked!=0;
+  int pipeline=1;PE_parse_boot_argn("sweetpipeline",&pipeline,sizeof(pipeline));

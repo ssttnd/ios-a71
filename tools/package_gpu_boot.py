@@ -33,13 +33,18 @@ with open(kernel_path, 'rb') as f:
     kdata = f.read()
 
 assert b'Samsung S6SY771' in kdata, "Touch driver signature missing!"
-assert b'Qualcomm Adreno 618' in kdata, "GPU driver signature missing!"
-print("Verified Touch (Samsung S6SY771) and GPU (Qualcomm Adreno 618) signatures in kernel!")
+assert b'SWEET GPU: GPUCC audit v2' in kdata, "GPU driver signature missing!"
+print("Verified Touch (Samsung S6SY771) and GPU driver signatures in kernel!")
 
 # Same arguments as the A71 boot image known to reach the lock screen, except
 # sweetusb: 3 powers the controller up and offers the console as a serial port.
 sweetusb = os.environ.get('SWEETUSB', '3')
 cmdline = f"debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=60 sweettouchdelay=3 sweettouchbitbang=1 sweetusb={sweetusb} sweetfb_noconsole=1"
+# Fork drivers with Redmi values stay off on the A71 until ported: real battery (A71 has
+# s2mu106/107), DSI backlight (A71 is a command-mode panel), display register dump, page flip.
+# sweetgpu is the GPU bring-up stage: 1 read-only ... 9 commands. Override with SWEETGPU.
+cmdline += " sweetbattery=0 sweetbacklight=0 sweetfbdpudump=0 sweetfbflip=0 sweetfbbeam=0"
+cmdline += f" sweetgpu={int(os.environ.get('SWEETGPU', '1'))}"
 # The A71 RTC does not hold the real date. a71-flash-boot computes PC time minus RTC.
 if os.environ.get('SWEETRTCOFFSET'):
     cmdline += f" sweetrtcoffset={int(os.environ['SWEETRTCOFFSET'])}"

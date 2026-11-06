@@ -1,0 +1,26 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 86ff823..638a4d5 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -230,13 +230,19 @@ static const struct { uint32_t khz, level; } sweet_gpu_opps[] = {
+ 	{ 355000u, 128u },      /* SVS */
+ 	{ 430000u, 192u },      /* SVS_L1 */
+ 	{ 565000u, 256u },      /* NOM */
++	/* 0132 telemetry: blur-heavy CoreAnimation commits are GPU-bound (13-14
++	 * passes, up to 15.5Mpx, 51-182ms at ~557MHz). OrangeFox KGSL on this
++	 * phone lists 650 and 800MHz; the pinned table pairs them with NOM_L1 and
++	 * TURBO (opp-supported-hw 0x1d / 0x19). */
++	{ 650000u, 320u },      /* NOM_L1 */
++	{ 800000u, 384u },      /* TURBO */
+ };
+-static unsigned sweet_gpu_opp_mx[4];
++static unsigned sweet_gpu_opp_mx[6];
+ 
+ static void
+ sweet_gpu_levels_prepare(void)
+ {
+-	uint32_t target = 565000u;
++	uint32_t target = 800000u;
+ 	PE_parse_boot_argn("sweetgpukhz", &target, sizeof(target));
+ 	a618_gpu_level_count = 0;
+ 	unsigned count = 0;

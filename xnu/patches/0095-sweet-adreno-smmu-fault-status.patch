@@ -1,0 +1,51 @@
+diff --git a/bsd/dev/sweet_adreno_smmu.c b/bsd/dev/sweet_adreno_smmu.c
+--- a/bsd/dev/sweet_adreno_smmu.c
++++ b/bsd/dev/sweet_adreno_smmu.c
+@@ -11,6 +11,8 @@
+ #include "sweet_adreno_dma.h"
+ #define CB1 0x9000u
+ #define ASID 0x61u
++/* FSR.Format[10:9] is read-only metadata, not a W1C fault. */
++#define FSR_FAULT 0xc00001feu
+ static int
+ put(const struct a618_io *io, uint32_t offset, uint32_t value,
+  uint32_t mask, struct a618_smmu_result *r)
+@@ -137,9 +139,11 @@
+  }
+  r->fault = io->read(io->cookie, CB1 + 0x58);
+  if (r->fault == 0xffffffffu) return EIO;
+- if (r->fault) {
+-  io->write(io->cookie, CB1 + 0x58, r->fault);
+-  if (io->read(io->cookie, CB1 + 0x58)) return EIO;
++ if (r->fault & (1u << 30)) return EBUSY; /* Never resume an unknown stall. */
++ if (r->fault & FSR_FAULT) {
++  io->write(io->cookie, CB1 + 0x58, r->fault & (FSR_FAULT & ~(1u << 30)));
++  uint32_t after = io->read(io->cookie, CB1 + 0x58);
++  if (after == 0xffffffffu || (after & FSR_FAULT)) return EIO;
+  }
+  /* Only GMU kernel stream 5: route first, VALID last. Never program
+   * GMU user stream 4, GPU stream 0, broad masks or a bypass entry.
+@@ -148,6 +152,6 @@
+  SET(0x800 + 4 * r->slot, 0x80000005u, 0xffffffffu);
+  r->fault = io->read(io->cookie, CB1 + 0x58);
+  #undef SET
+- return 0;
++ return r->fault == 0xffffffffu || (r->fault & FSR_FAULT) ? EIO : 0;
+ }
+ #endif
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -265,6 +265,12 @@
+       sweet_adreno_read((void *)gmu, A618_GMU_SYSRESET));
+   if (error) return error;
+   if (stage >= 8) {
++   printf("SWEET ADRENO: GPU context baseline SCTLR0=%#x\n",
++       sweet_adreno_read((void *)smmu, 0x8000));
++   for (unsigned slot = 0; slot < 5; ++slot)
++    printf("SWEET ADRENO: stream slot=%u SMR=%#x S2CR=%#x\n", slot,
++        sweet_adreno_read((void *)smmu, 0x800 + slot * 4),
++        sweet_adreno_read((void *)smmu, 0xc00 + slot * 4));
+    uint32_t gpu_vote = 0, gmu_vote = 0;
+    error = sweet_rpmh_adreno_votes(&gpu_vote, &gmu_vote);
+    printf("SWEET ADRENO: MIN_SVS votes errno=%d GPU=%#x GMU=%#x\n",

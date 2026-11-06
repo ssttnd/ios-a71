@@ -1,0 +1,30 @@
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+index aed4efa..1f13c87 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -76,7 +76,15 @@ IOReturn quiesce()
+  if(!healthy())return kIOReturnIOError;
+  IOReturn result=backend.submit->waitAll(&backend.clock,1000000);
+  if(!result)result=backend.ring->drainA6xx(&backend.clock,1000000);
+- if(result) {backend.lost=true;backend.status.noteFault();}
++ if(result) {
++  // 0130 hardware: the backend was lost here (no faulted() term) right after
++  // an AegirPoster instance was killed; say so with the CP state.
++  backend.lost=true;backend.status.noteFault();
++  char why[96];
++  snprintf(why,sizeof why,"quiesce %#x last_submit=%s fence=%u/%u",result,last_submitter,
++    backend.ring->completedFence(),backend.ring->lastSubmitted());
++  sweet_native_adreno_fault_report(why);
++ }
+  return result;
+ }
+ }
+@@ -350,6 +358,8 @@ IOReturn AGXDeviceUserClient::clientClose()
+  if(!error && mounted_)error=core_->releaseAll(&backend.clock,1000000);
+  if(error) {
+   backend.lost=true;
++  char why[64];snprintf(why,sizeof why,"client close %#x slot=%u",error,slot_);
++  sweet_native_adreno_fault_report(why);
+   // Keep uncertain GPU resources and their bookkeeping alive for this boot.
+   retain();
+  } else {

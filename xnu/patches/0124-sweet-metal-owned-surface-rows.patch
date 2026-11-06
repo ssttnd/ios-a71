@@ -1,0 +1,40 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -39,6 +39,7 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <pexpert/pexpert.h>
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -310,6 +311,29 @@
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
++    /* Sunfish0159 adaptation: align only allocations owned by this driver.
++     * A caller's IOSurfaceAddress/plane layout is an external memory contract.
++     * Turnip requires at least64-byte linear rows; 8-byte texels need128-byte
++     * rows for A6xx's16-pixel GMEM store block. Logical width stays unchanged. */
++    uint32_t metal=0,gles=0,alignment=64;
++    PE_parse_boot_argn("sweetmtl",&metal,sizeof metal);
++    PE_parse_boot_argn("sweetgles",&gles,sizeof gles);
++    PE_parse_boot_argn("sweetsurfalign",&alignment,sizeof alignment);
++    if(metal==2 && gles!=1 && alignment>=64 && alignment<=4096 &&
++       !(alignment&(alignment-1)) && !props->getObject("IOSurfaceAddress") &&
++       !props->getObject("IOSurfacePlaneInfo") && s->elementWidth==1 &&
++       s->elementHeight==1 && s->bytesPerElement && s->bytesPerElement<=8 &&
++       !(s->bytesPerElement&(s->bytesPerElement-1))) {
++        if(alignment<16u*s->bytesPerElement)alignment=16u*s->bytesPerElement;
++        const uint64_t row=((uint64_t)s->bytesPerRow+alignment-1)&~((uint64_t)alignment-1);
++        if(row>0xffffffffu)return kIOReturnBadArgument;
++        s->bytesPerRow=(uint32_t)row;
++        static bool logged=false;
++        if(!logged) {
++            logged=true;
++            IOLog("SWEET SURF: Metal owned rows align %u; caller layouts preserved\n",alignment);
++        }
++    }
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+ 	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));

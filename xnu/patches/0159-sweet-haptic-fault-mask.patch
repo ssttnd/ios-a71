@@ -1,0 +1,33 @@
+diff --git a/bsd/dev/sweet_haptic.c b/bsd/dev/sweet_haptic.c
+index 35d9576..e86671b 100644
+--- a/bsd/dev/sweet_haptic.c
++++ b/bsd/dev/sweet_haptic.c
+@@ -422,9 +422,14 @@ aw_status(const char *when)
+ 		return false;
+ 	}
+ 	printf("SWEET HAPTIC: %s: SYSST %#04x SYSINT %#04x GLB_STATE %#04x\n", when, sysst, sysint, glb);
+-	/* SYSINT: UVLO bit 5, over-current bit 3, over-temperature bit 2 (aw8624_reg.h) */
+-	if (sysint & 0x2cu) {
+-		printf("SWEET HAPTIC: fault bits %#04x: stop, chip back into reset\n", sysint & 0x2cu);
++	/*
++	 * SYSINT (clear on read): OV bit 6, UVLO bit 5, FIFO bits 4/3, OCD bit 2, OT bit 1, done bit 0
++	 * (aw8624_reg.h). 0151 hardware read SYSST/SYSINT 0x30 after reset: UVLO is latched at power-up
++	 * and reads live in standby, where the vendor driver masks it and only logs it. Stop on
++	 * over-voltage, over-current and over-temperature.
++	 */
++	if (sysint & 0x46u) {
++		printf("SWEET HAPTIC: fault bits %#04x: stop, chip back into reset\n", sysint & 0x46u);
+ 		hs.dead = true;
+ 		return false;
+ 	}
+@@ -457,8 +462,10 @@ static bool
+ aw_cont_start(void)
+ {
+ 	const unsigned f0_reg = 1000000000u / (2080u * 260u);   /* f0_pre 208.0 Hz, f0_coeff 260 */
++	uint8_t clr = 0;
+ 	return aw_bits(0x04, (uint8_t)~(3u << 2), (2u << 2)) &&       /* SYSCTRL: play mode CONT */
+ 	    aw_bits(0x04, (uint8_t)~(1u << 0), 0) &&                   /* active */
++	    aw_rd(0x02, &clr) == 0 &&                                  /* clear SYSINT (aw8624_haptic_active) */
+ 	    aw_bits(0x03, (uint8_t)~(1u << 5), 0) &&                   /* UVLO interrupt on */
+ 	    aw_wr(0x49, (uint8_t)(f0_reg >> 8)) && aw_wr(0x4a, (uint8_t)f0_reg) &&
+ 	    aw_bits(0x2b, (uint8_t)~(1u << 6), (3u << 6)) &&           /* DATCTRL: 1000 Hz LPF (vendor masks) */

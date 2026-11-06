@@ -1,0 +1,50 @@
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+index d66da6a..85b7f6b 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -159,7 +159,14 @@ MethodStat method_stats[NativeAdrenoMethodSubmitResources+1];
+ uint64_t lock_wait_us,lock_wait_max_us,lock_takes,wait_polls;
+ unsigned busy_samples,idle_samples,locked_samples;
+ uint64_t window_began_us;
++/* 0171: which blocks of the GPU are busy while a fence is outstanding (RBBM_STATUS, a6xx.xml bit names). Read only then,
++ * so the core is awake; a statistical profile of the 10 s window, not a count of cycles. */
++unsigned rbbm_samples,rbbm_idle,rbbm_bits[24];
++volatile uint32_t *rbbm_status;
++const char *const rbbm_names[24]={"CXM","CPM","CP","DBGC","VBIF","TSE","RAS","RB","CCU","A2D","LRZ","DCOM","DCALL","VSD","TESS",
++ "VFD","VPC","UCHE","SP","TPL1","VSC","HLSQ","IGNCP","IGN"};
+ }
++extern "C" vm_offset_t ml_io_map(vm_offset_t,vm_size_t);
+ extern "C" void sweet_native_adreno_sample_busy(void)
+ {
+  if(!__atomic_load_n(&presentation_ready,__ATOMIC_ACQUIRE) || !backend.ring)return;
+@@ -167,6 +174,15 @@ extern "C" void sweet_native_adreno_sample_busy(void)
+  const uint32_t newest=healthy()?backend.ring->lastSubmitted():0;
+  const IOReturn state=newest?backend.submit->observeFence(newest,&backend.clock,0):kIOReturnSuccess;
+  if(state==kIOReturnTimeout)++busy_samples;else ++idle_samples;
++  if(state==kIOReturnTimeout) {
++  if(!rbbm_status) {const vm_offset_t core=ml_io_map(0x05000000,0x40000);if(core)rbbm_status=(volatile uint32_t *)(core+0x840);}
++  const uint32_t st=rbbm_status?*rbbm_status:0xffffffffu;
++  if(st!=0xffffffffu) {
++   ++rbbm_samples;
++   if(!(st&~1u))++rbbm_idle;
++   for(unsigned b=0;b<24;b++)if(st&(1u<<b))++rbbm_bits[b];
++  }
++ }
+  IOLockUnlock(backend.lock);
+ }
+ /* Called with the lock held after each method; prints once per 10 s. */
+@@ -189,6 +205,14 @@ static void method_window(void)
+    (now-window_began_us)/1000,sampled?busy_samples*100/sampled:0,sampled,locked_samples,
+    lock_takes?lock_wait_us/lock_takes:0,lock_wait_max_us,wait_polls,native_adreno_pool_stats[3],native_adreno_pool_stats[4],
+    native_adreno_pool_stats[1],native_adreno_pool_stats[2],line);
++ if(rbbm_samples) {
++  char blocks[400];size_t n=0;
++  for(unsigned b=0;b<24 && n<sizeof blocks-16;b++)if(rbbm_bits[b]*100/rbbm_samples>=3)
++   n+=snprintf(blocks+n,sizeof blocks-n," %s=%u",rbbm_names[b],rbbm_bits[b]*100/rbbm_samples);
++  blocks[n]=0;
++  IOLog("SWEET RENDER: rbbm samples=%u (fence outstanding) idle=%u%% busy blocks%%:%s\n",rbbm_samples,rbbm_idle*100/rbbm_samples,blocks);
++ }
++ rbbm_samples=rbbm_idle=0;memset(rbbm_bits,0,sizeof rbbm_bits);
+  memset(method_stats,0,sizeof method_stats);
+  lock_wait_us=lock_wait_max_us=lock_takes=wait_polls=0;busy_samples=idle_samples=locked_samples=0;
+  window_began_us=now;

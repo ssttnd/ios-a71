@@ -1,0 +1,37 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 031be6f..1b5bd07 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -959,12 +959,11 @@ out:
+ static void
+ sweet_smmu_probe_thread(void *arg, wait_result_t wr)
+ {
+-	(void)arg; (void)wr;
++	(void)wr;
+ 	extern void IOSleep(unsigned);
+-	IOSleep(20000);
+-	const int sn = sweet_rpmh_bcm_vote("SN15", 1, 1), cn = sweet_rpmh_bcm_vote("CN0", 1, 1);
+-	printf("SWEET SMMU: votes SN15=%d CN0=%d; reading apps SMMU sCR0/ID0/ID1 next\n", sn, cn);
+-	IOSleep(50);
++	const int votes = (int)(uintptr_t)arg;
++	IOSleep(1000);
++	printf("SWEET SMMU: votes %s; reading apps SMMU sCR0/ID0/ID1 next\n", votes ? "failed" : "held");
+ 	volatile uint32_t *smmu = (volatile uint32_t *)ml_io_map(0x15000000, 0x1000);
+ 	if (!smmu) {
+ 		printf("SWEET SMMU: map failed\n");
+@@ -985,9 +984,13 @@ sweet_smmu_probe_start(void)
+ 	if (!on) {
+ 		return;
+ 	}
++	/* 0150: vote now, in bsd init, so the path is up before launchd can start
++	 * wland (0139: the 20 s-later votes made the first apps-SMMU reads work). */
++	const int sn = sweet_rpmh_bcm_vote("SN15", 1, 1), cn = sweet_rpmh_bcm_vote("CN0", 1, 1);
++	printf("SWEET SMMU: votes SN15=%d CN0=%d\n", sn, cn);
+ 	thread_t thread = THREAD_NULL;
+-	if (kernel_thread_start(sweet_smmu_probe_thread, NULL, &thread) == KERN_SUCCESS) {
++	if (kernel_thread_start(sweet_smmu_probe_thread, (void *)(uintptr_t)(sn || cn), &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+-		printf("SWEET SMMU: apps SMMU probe armed (20 s after boot)\n");
++		printf("SWEET SMMU: apps SMMU probe armed (1 s)\n");
+ 	}
+ }

@@ -1,0 +1,493 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -3,8 +3,9 @@
+  * sweetgpu=2 adds deferred RPMh ARC READ transactions after touch power.
+  * sweetgpu=3 additionally raises only gfx.lvl and verifies the readback.
+  * sweetgpu=4 uses the new A618 core to power CX after fresh rail checks.
+- * sweetgpu=5 is disabled pending the GX clock/reset and GMU backend.
+- * No core aperture reads, GMU, SMMU or command submission at any stage.
++ * sweetgpu=5 enables GMU/bus clocks and reads CX-side GMU/SMMU status.
++ * sweetgpu=6 additionally stages firmware while the M3 remains in reset.
++ * GX is firmware controlled. No GPU core access or command submission.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -16,6 +17,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int sweet_rpmh_arc_probe(const char *res);
+@@ -30,8 +32,12 @@
+ 
+ #define SWEET_GPUCC_PA       0x05090000u
+ #define SWEET_GPUCC_SIZE     0x00009000u
+-#define SWEET_GPU_PA         0x05000000u
+-#define SWEET_GPU_SIZE       0x00040000u
++#define SWEET_GCC_PA         0x00100000u
++#define SWEET_GCC_SIZE       0x00072000u
++#define SWEET_GMU_PA         0x0506a000u
++#define SWEET_GMU_SIZE       0x00031000u
++#define SWEET_SMMU_PA        0x05040000u
++#define SWEET_SMMU_SIZE      0x00010000u
+ #define GPU_CC_GX_BCR        0x1008u
+ #define GPU_CC_GX_GDSCR      0x100cu
+ #define GPU_CC_CX_GDSCR      0x106cu
+@@ -75,22 +81,22 @@
+ 	return value;
+ }
+ 
+-/* XNU adapter for the portable A618 power controller. */
++/* XNU adapter: cookie is the mapped aperture base. */
+ static uint32_t
+ sweet_adreno_read(void *cookie, uint32_t offset)
+ {
+-	(void)cookie;
+-	return sweet_gpucc_read(offset);
++	uint32_t value = *(volatile uint32_t *)((vm_offset_t)cookie + offset);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return value;
+ }
+ 
+ static void
+ sweet_adreno_write(void *cookie, uint32_t offset, uint32_t value)
+ {
+-	(void)cookie;
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(sweet_gpucc + offset) = value;
++	*(volatile uint32_t *)((vm_offset_t)cookie + offset) = value;
+ 	__asm__ volatile("dsb oshst" ::: "memory");
+-	(void)sweet_gpucc_read(offset);
++	(void)sweet_adreno_read(cookie, offset);
+ }
+ 
+ static void
+@@ -127,7 +133,7 @@
+ {
+ 	struct a618_power_result result;
+ 	const struct a618_io io = {
+-		.cookie = NULL,
++		.cookie = (void *)sweet_gpucc,
+ 		.read = sweet_adreno_read,
+ 		.write = sweet_adreno_write,
+ 		.delay_us = sweet_adreno_delay,
+@@ -145,6 +151,68 @@
+ 	return error;
+ }
+ 
++/* Matches postmarketOS SM7150: GMU firmware owns GX power-up. */
++static int
++sweet_gpu_gmu_prepare(int stage)
++{
++	vm_offset_t gcc = ml_io_map(SWEET_GCC_PA, SWEET_GCC_SIZE);
++	if (!gcc)
++		return ENOMEM;
++	const struct a618_io gpucc_io = { (void *)sweet_gpucc,
++	    sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay };
++	const struct a618_io gcc_io = { (void *)gcc,
++	    sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay };
++	struct a618_clock_result result;
++	printf("SWEET ADRENO: postmarketOS SM7150 GMU clocks v1 starting\n");
++	int error = a618_enable_gmu_clocks(&gpucc_io, &gcc_io, &result);
++	printf("SWEET ADRENO: GMU clocks errno=%d block=%u offset=%#x value=%#x completed=%u\n",
++	    error, result.block, result.offset, result.value, result.completed);
++	if (error)
++		return error;
++	vm_offset_t gmu = ml_io_map(SWEET_GMU_PA, SWEET_GMU_SIZE);
++	vm_offset_t smmu = ml_io_map(SWEET_SMMU_PA, SWEET_SMMU_SIZE);
++	if (!gmu || !smmu)
++		return ENOMEM;
++	const struct a618_io gmu_io = { (void *)gmu,
++	    sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay };
++	uint32_t reset = sweet_adreno_read((void *)gmu, A618_GMU_SYSRESET);
++	uint32_t power = sweet_adreno_read((void *)gmu, A618_GMU_POWER_STATUS);
++	uint32_t fence = sweet_adreno_read((void *)gmu, A618_GMU_AHB_FENCE_STATUS);
++	printf("SWEET ADRENO: GMU SYSRESET=%#x POWER_STATUS=%#x AHB_FENCE_STATUS=%#x\n",
++	    reset, power, fence);
++	if (reset == 0xffffffffu || power == 0xffffffffu || fence == 0xffffffffu)
++		return EIO;
++	/* ID registers only: do not alter SMMU contexts or stream routing. */
++	uint32_t id0 = sweet_adreno_read((void *)smmu, 0x20);
++	uint32_t id1 = sweet_adreno_read((void *)smmu, 0x24);
++	uint32_t id2 = sweet_adreno_read((void *)smmu, 0x28);
++	printf("SWEET ADRENO: SMMU IDR0=%#x IDR1=%#x IDR2=%#x\n", id0, id1, id2);
++	if (id0 == 0xffffffffu || id1 == 0xffffffffu || id2 == 0xffffffffu || !id0)
++		return EIO;
++	if (stage == 6) {
++		DTEntry node;
++		const unsigned char *firmware = NULL;
++		const uint32_t *crc = NULL;
++		unsigned int size = 0, crc_size = 0;
++		if (SecureDTLookupEntry(NULL, "/sweet-adreno", &node) != kSuccess ||
++		    SecureDTGetProperty(node, "gmu-firmware", (const void **)&firmware,
++		    &size) != kSuccess ||
++		    SecureDTGetProperty(node, "gmu-crc32", (const void **)&crc,
++		    &crc_size) != kSuccess || crc_size != sizeof(*crc)) {
++			printf("SWEET ADRENO: missing GMU firmware properties; no TCM write\n");
++			return ENOENT;
++		}
++		unsigned verified = 0;
++		error = a618_gmu_stage_legacy(&gmu_io, firmware, size, *crc, &verified);
++		printf("SWEET ADRENO: GMU TCM staging errno=%d verified_bytes=%u; M3 not released\n",
++		    error, verified);
++		if (error)
++			return error;
++	}
++	printf("SWEET ADRENO: GMU preparation complete; GX remains firmware controlled, no submission\n");
++	return 0;
++}
++
+ static void
+ sweet_gpu_arc_thread(void *arg, wait_result_t result)
+ {
+@@ -160,13 +228,14 @@
+ 	(void)assert_wait_deadline(&sleep_chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+ 	if (stage >= 4) {
+-		if (stage == 5) {
+-			printf("SWEET ADRENO: GX unavailable: root clock, GMU and reset sequencing incomplete; no writes\n");
+-			goto out;
+-		}
+ 		printf("SWEET ADRENO: CX controller v2 starting; no GPU core access\n");
+ 		int error = sweet_gpu_power_cx();
+ 		printf("SWEET ADRENO: CX controller finished errno=%d; rendering unavailable\n", error);
++		if (!error && stage >= 5) {
++			error = sweet_gpu_gmu_prepare(stage);
++			printf("SWEET ADRENO: GMU stage=%d finished errno=%d; rendering unavailable\n",
++			    stage, error);
++		}
+ 		goto out;
+ 	}
+ 	if (stage == 3) {
+@@ -216,12 +285,12 @@
+ 	}
+ 	sweet_gpu_probe_attempted = 1;
+ 	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
+-	if (enabled < 1 || enabled > 5) {
+-		printf("SWEET GPU: audit disabled; sweetgpu=1 read-only, 2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 disabled\n");
+-		return;
+-	}
+-
+-	printf("SWEET GPU: GPUCC audit v2 at %#x; stage=%d, no GMU access\n",
++	if (enabled < 1 || enabled > 6) {
++		printf("SWEET GPU: audit disabled; sweetgpu=1 read-only, 2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 GMU clocks/status, 6 firmware staging\n");
++		return;
++	}
++
++	printf("SWEET GPU: GPUCC audit v2 at %#x; stage=%d; GMU access requires clock checks\n",
+ 	    SWEET_GPUCC_PA, enabled);
+ 	sweet_gpucc = ml_io_map(SWEET_GPUCC_PA, SWEET_GPUCC_SIZE);
+ 	if (sweet_gpucc == 0) {
+@@ -260,7 +329,7 @@
+ 		return;
+ 	}
+ 	if (enabled == 1) {
+-		printf("SWEET GPU: read-only audit complete; sweetgpu=2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 disabled\n");
++		printf("SWEET GPU: read-only audit complete; sweetgpu=2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 GMU clocks/status, 6 firmware staging\n");
+ 		return;
+ 	}
+ 	sweet_gpu_stage = enabled;
+@@ -268,8 +337,8 @@
+ 	kern_return_t kr = kernel_thread_start(sweet_gpu_arc_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+-		if (enabled == 5) {
+-			printf("SWEET ADRENO: GX request will be refused; no complete GX backend\n");
++		if (enabled >= 5) {
++			printf("SWEET ADRENO: GMU stage=%d scheduled in 60 s; CX and clock gates first\n", enabled);
+ 		} else if (enabled == 4) {
+ 			printf("SWEET ADRENO: CX controller v2 scheduled in 60 s; fresh rail checks required\n");
+ 		} else if (enabled == 3) {
+--- a/bsd/dev/sweet_adreno.h
++++ b/bsd/dev/sweet_adreno.h
+@@ -9,7 +9,7 @@
+ #include <stdint.h>
+ #endif
+ 
+-/* All offsets passed to these callbacks are GPUCC byte offsets.
++/* Offsets are bytes relative to the aperture supplied in cookie.
+  * write() must order prior stores and complete the MMIO store before return.
+  * The caller serializes device operations and keeps the rails voted on.
+  */
+@@ -58,4 +58,27 @@
+ int a618_ring_init(struct a618_ring *, uint32_t *, unsigned, void *,
+     int (*)(void *, unsigned *), int (*)(void *, unsigned));
+ int a618_ring_submit(struct a618_ring *, const struct a618_commands *);
++
++/* postmarketOS SM7150 clock path; GX remains controlled by GMU firmware.
++ * Requires live CX power and parent MX/CX votes maintained by the caller.
++ * PLL0 must already be running at 600 MHz. Its rate is never changed.
++ * A failure leaves enabled clocks held and stops further operations.
++ */
++struct a618_clock_result {
++	unsigned block; /* 0 = GPUCC, 1 = GCC */
++	uint32_t offset;
++	uint32_t value;
++	unsigned completed;
++};
++int a618_enable_gmu_clocks(const struct a618_io *, const struct a618_io *,
++    struct a618_clock_result *);
++
++/* GMU-relative byte offsets, adjusted from Freedreno DWORD register IDs. */
++#define A618_GMU_SYSRESET 0x14000u
++#define A618_GMU_FW_INIT_RESULT 0x14070u
++#define A618_GMU_POWER_STATUS 0x14340u
++#define A618_GMU_AHB_FENCE_STATUS 0x24c4cu
++#define A618_GMU_ITCM 0x3000u
++int a618_gmu_stage_legacy(const struct a618_io *, const unsigned char *,
++    unsigned, uint32_t, unsigned *);
+ #endif
+--- /dev/null
++++ b/bsd/dev/sweet_adreno_clock.c
+@@ -0,0 +1,238 @@
++/* SPDX-License-Identifier: MIT
++ * Copyright (c) 2026 ios-sweet contributors
++ *
++ * SM7150 clock and firmware-staging implementation using public Qualcomm
++ * interfaces. Source references: docs/adreno-port.md (postmarketOS section).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(KERNEL)
++#include <sys/errno.h>
++#else
++#include <errno.h>
++#endif
++#include "sweet_adreno.h"
++
++static int
++io_valid(const struct a618_io *io)
++{
++	return io && io->read && io->write && io->delay_us;
++}
++
++static int
++read_checked(const struct a618_io *io, unsigned block, uint32_t offset,
++    struct a618_clock_result *result)
++{
++	result->block = block;
++	result->offset = offset;
++	result->value = io->read(io->cookie, offset);
++	return result->value == 0xffffffffu ? EIO : 0;
++}
++
++static int
++update(const struct a618_io *io, unsigned block, uint32_t offset,
++    uint32_t mask, uint32_t value, struct a618_clock_result *result)
++{
++	int error = read_checked(io, block, offset, result);
++	if (error)
++		return error;
++	io->write(io->cookie, offset, (result->value & ~mask) | value);
++	error = read_checked(io, block, offset, result);
++	if (error)
++		return error;
++	return (result->value & mask) == value ? 0 : EIO;
++}
++
++static int
++poll(const struct a618_io *io, unsigned block, uint32_t offset,
++    uint32_t mask, uint32_t expected, struct a618_clock_result *result)
++{
++	for (unsigned elapsed = 0; elapsed < 500; ++elapsed) {
++		int error = read_checked(io, block, offset, result);
++		if (error)
++			return error;
++		if ((result->value & mask) == expected)
++			return 0;
++		io->delay_us(io->cookie, 1);
++	}
++	return ETIMEDOUT;
++}
++
++static int
++branch(const struct a618_io *io, unsigned block, uint32_t offset,
++    struct a618_clock_result *result)
++{
++	int error = update(io, block, offset, 1, 1, result);
++	if (error)
++		return error;
++	/* A running NOC FSM may report bit31 set; match Linux branch2 semantics. */
++	for (unsigned elapsed = 0; elapsed < 500; ++elapsed) {
++		error = read_checked(io, block, offset, result);
++		if (error)
++			return error;
++		if (!(result->value & (1u << 31)) ||
++		    ((result->value >> 28) & 7u) == 2) {
++			++result->completed;
++			return 0;
++		}
++		io->delay_us(io->cookie, 1);
++	}
++	return ETIMEDOUT;
++}
++
++int
++a618_enable_gmu_clocks(const struct a618_io *gpucc,
++    const struct a618_io *gcc, struct a618_clock_result *result)
++{
++	int error;
++	if (!result || !io_valid(gpucc) || !io_valid(gcc))
++		return EINVAL;
++	result->block = result->completed = 0;
++	result->offset = result->value = 0;
++	/* CX power and software control must still be established. */
++	error = read_checked(gpucc, 0, 0x106c, result);
++	if (error)
++		return error;
++	if (result->value & 3u)
++		return EAGAIN;
++	error = read_checked(gpucc, 0, 0x1540, result);
++	if (error)
++		return error;
++	if (!(result->value & (1u << 31)))
++		return EAGAIN;
++
++	/* GPLL0 is a shared, fixed FABIA PLL. Check 19.2 MHz * 31.25 = 600 MHz
++	 * before voting its output. Never reprogram this system PLL.
++	 */
++	error = read_checked(gcc, 1, 0x4, result);
++	if (error)
++		return error;
++	if (result->value != 31)
++		return ERANGE;
++	error = read_checked(gcc, 1, 0x38, result);
++	if (error)
++		return error;
++	if (result->value != 0x4000)
++		return ERANGE;
++	error = read_checked(gcc, 1, 0, result);
++	if (error)
++		return error;
++	if (result->value & (1u << 20)) {
++		/* FABIA in vote-FSM mode: Linux waits for ACTIVE, not LOCK_DET. */
++		error = update(gcc, 1, 0x52000, 1, 1, result);
++		if (!error)
++			error = poll(gcc, 1, 0, 1u << 30, 1u << 30, result);
++	} else {
++		/* Preserve an already running direct-control PLL. Its rate was
++		 * checked above; do not change MODE/OPMODE or pretend a vote
++		 * can start a PLL which is not under vote-FSM control.
++		 */
++		if ((result->value & ((1u << 31) | 1u)) != ((1u << 31) | 1u))
++			return EBUSY;
++		error = read_checked(gcc, 1, 0x2c, result);
++		if (!error && result->value != 1)
++			error = EBUSY;
++	}
++	if (error)
++		return error;
++	/* GCC_GPU_GPLL0_DIV_CLK_SRC: fixed divide by two, 300 MHz. */
++	error = update(gcc, 1, 0x52004, 1u << 16, 1u << 16, result);
++	if (error)
++		return error;
++	gcc->delay_us(gcc->cookie, 10);
++	/* Bus clocks named by the postmarketOS GMU and SMMU DT nodes. */
++	static const uint32_t bus[] = { 0x4452c, 0x7100c, 0x71018 };
++	for (unsigned i = 0; i < sizeof(bus) / sizeof(bus[0]); ++i) {
++		error = branch(gcc, 1, bus[i], result);
++		if (error)
++			return error;
++	}
++	/* CXO and AHB first; no GX clock or PLL0/PLL1 register is touched. */
++	error = branch(gpucc, 0, 0x1004, result);
++	if (!error)
++		error = branch(gpucc, 0, 0x109c, result);
++	if (!error)
++		error = branch(gpucc, 0, 0x1078, result);
++	if (!error)
++		error = branch(gpucc, 0, 0x108c, result);
++	if (error)
++		return error;
++	/* RCG2 force-enable while selecting/dividing the existing GCC parent. */
++	error = update(gpucc, 0, 0x1120, 2, 2, result);
++	if (error)
++		return error;
++	error = poll(gpucc, 0, 0x1120, 1u << 31, 0, result);
++	if (error)
++		return error;
++	/* SRC_SEL=6, HID_DIV=2: 300 MHz * 2 / (2+1) = 200 MHz. */
++	error = update(gpucc, 0, 0x1124, 0x10371fu, 0x602, result);
++	if (error)
++		return error;
++	/* UPDATE is self-clearing; do not require immediate readback of bit0. */
++	error = read_checked(gpucc, 0, 0x1120, result);
++	if (error)
++		return error;
++	gpucc->write(gpucc->cookie, 0x1120, result->value | 1u);
++	error = poll(gpucc, 0, 0x1120, 1, 0, result);
++	if (error)
++		return error;
++	error = read_checked(gpucc, 0, 0x1124, result);
++	if (error)
++		return error;
++	if ((result->value & 0x10371fu) != 0x602)
++		return EIO;
++	/* Source probe recommends all four WAKE/SLEEP bits before GMU enable. */
++	error = update(gpucc, 0, 0x1098, 0xff0, 0xff0, result);
++	if (!error)
++		error = branch(gpucc, 0, 0x1098, result);
++	/* Leave the root held on for staging; shutdown belongs to the runtime
++	 * state machine once firmware and SMMU execution are implemented.
++	 */
++	return error;
++}
++
++static uint32_t
++little_word(const unsigned char *data)
++{
++	return (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
++	    ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
++}
++
++int
++a618_gmu_stage_legacy(const struct a618_io *gmu, const unsigned char *firmware,
++    unsigned size, uint32_t expected_crc, unsigned *verified)
++{
++	uint32_t crc = 0xffffffffu, sp, pc, reset;
++	if (!verified)
++		return EINVAL;
++	*verified = 0;
++	if (!io_valid(gmu) || !firmware || size != 0x8000)
++		return EINVAL;
++	/* Validate all data before issuing any MMIO. */
++	sp = little_word(firmware);
++	pc = little_word(firmware + 4);
++	if ((sp & 7) || sp < 0x40000 || sp > 0x44000 || !(pc & 1) ||
++	    (pc & ~1u) >= size)
++		return EINVAL;
++	for (unsigned i = 0; i < size; ++i) {
++		crc ^= firmware[i];
++		for (unsigned bit = 0; bit < 8; ++bit)
++			crc = (crc >> 1) ^ ((0u - (crc & 1u)) & 0xedb88320u);
++	}
++	if ((crc ^ 0xffffffffu) != expected_crc)
++		return EIO;
++	reset = gmu->read(gmu->cookie, A618_GMU_SYSRESET);
++	if (reset == 0xffffffffu)
++		return EIO;
++	if (!(reset & 1))
++		return EBUSY; /* Never overwrite a potentially running processor. */
++	for (unsigned offset = 0; offset < size; offset += 4) {
++		uint32_t word = little_word(firmware + offset);
++		gmu->write(gmu->cookie, A618_GMU_ITCM + offset, word);
++		if (gmu->read(gmu->cookie, A618_GMU_ITCM + offset) != word)
++			return EIO;
++		*verified += 4;
++	}
++	reset = gmu->read(gmu->cookie, A618_GMU_SYSRESET);
++	return reset != 0xffffffffu && (reset & 1) ? 0 : EIO;
++}
++#endif
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,7 +112,8 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_adreno.c			standard
++bsd/dev/sweet_adreno_clock.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard

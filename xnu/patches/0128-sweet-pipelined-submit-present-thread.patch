@@ -1,0 +1,253 @@
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+index 8ff3654..eea02c9 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -28,6 +28,7 @@ struct Backend {
+  NativeAdrenoAbiDeviceInfo info{};
+  int (*health)(void *)=nullptr;
+  bool published=false,opened=false,lost=false,cpu_present=false;
++ bool pipeline=true;   // sweetpipeline=0 restores a full drain before every submit/map
+ } backend;
+ // Release/acquire publishes the completed backend to the framebuffer workloop.
+ static bool presentation_ready=false;
+@@ -195,9 +196,16 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
+  const uint64_t began=backend.clock.now_us(backend.clock.cookie);
+  uint64_t quiesce_us=0;
+  IOReturn result=kIOReturnSuccess;
+- // The single shared context must be idle through EVERY table edit and cache
+- // publication; completion is the actual CP fence, not a job-count estimate.
+- if(selector==NativeAdrenoMethodBoMap || selector==NativeAdrenoMethodBoFree || selector==NativeAdrenoMethodSubmit || selector==NativeAdrenoMethodSubmitResources)
++ // BoFree must not unmap while legacy jobs (which hold only their IBs) may
++ // still reference the buffer, so it waits for the actual CP fences. Submit
++ // and BoMap only append: a new mapping uses previously unmapped IOVAs, the
++ // TLB invalidate and the full clean are safe beside running work, and every
++ // job keeps its own fence and references. Pipelining is what lets the CPU
++ // encode frame N+1 while the A618 executes frame N.
++ const bool drains=selector==NativeAdrenoMethodBoFree ||
++     (!backend.pipeline && (selector==NativeAdrenoMethodBoMap || selector==NativeAdrenoMethodSubmit ||
++      selector==NativeAdrenoMethodSubmitResources));
++ if(drains)
+  {
+   result=quiesce();
+   quiesce_us=backend.clock.now_us(backend.clock.cookie)-began;
+@@ -216,6 +224,19 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
+     (unsigned long)backend.vm->objectCount(),(unsigned long)backend.vm->spanCount(),
+     (unsigned long)backend.vm->spanCapacity(),backend.clock.now_us(backend.clock.cookie)-began,result);
+  }
++ if(selector==NativeAdrenoMethodSubmit) {
++  // Window of 120 legacy submits: kernel time per call and jobs still in
++  // flight after it, i.e. whether the CPU actually ran ahead of the GPU.
++  static unsigned submits=0,busy=0;static uint64_t window_us=0,max_us=0,in_flight=0;
++  const uint64_t spent=backend.clock.now_us(backend.clock.cookie)-began;
++  window_us+=spent;if(spent>max_us)max_us=spent;
++  in_flight+=result?0:backend.submit->outstanding();if(result==kIOReturnBusy)++busy;
++  if(++submits%120==0) {
++   IOLog("SWEET RENDER: legacy submits %u avg_us=%llu max_us=%llu avg_in_flight_x100=%llu busy=%u drain=%d\n",submits,
++     window_us/120,max_us,in_flight*100/120,busy,drains);
++   window_us=max_us=in_flight=0;busy=0;
++  }
++ }
+  if(selector==NativeAdrenoMethodSubmitResources) {
+   static unsigned submissions=0;
+   if(++submissions<=8 || submissions%120==0) {
+@@ -289,6 +310,9 @@ extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit
+  } else IOLog("SWEET GLES: native A618 transport published; Metal discovery disabled for GLES boot\n");
+  provider->setProperty("model","Adreno 618");
+  provider->setProperty("NativeAdrenoABI",NativeAdrenoAbiVersion,32);
++ int pipeline=1;PE_parse_boot_argn("sweetpipeline",&pipeline,sizeof(pipeline));
++ backend.pipeline=pipeline!=0;
++ IOLog("SWEET RENDER: submission pipelining %s (BoFree/close still drain)\n",backend.pipeline?"enabled":"disabled");
+  int present_wait=0;PE_parse_boot_argn("sweetpresentwait",&present_wait,sizeof(present_wait));
+  backend.cpu_present=mtl==2 && gles!=1 && present_wait==1;
+  __atomic_store_n(&presentation_ready,true,__ATOMIC_RELEASE);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 764e2c2..a25116d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -49,6 +49,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
+ #include <sys/proc.h>
+ #include "unixnu/NativeAdrenoMemory.h"
+ extern "C" int sweet_native_adreno_cpu_present_begin();
+@@ -101,6 +102,8 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	uint64_t            fVsyncCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	static void presentThread(void *arg, wait_result_t result);
++	void requestPresent(void);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -119,6 +122,12 @@ public:
+ 	uint32_t      fPresentHz, fTimerHz, fPresentPhase;
+ 	uint64_t      fVsyncPeriod, fNextVsync;
+ 	uint64_t      fStatsStart, fStatsCallbacks, fStatsPresents, fStatsMissed;
++	/* The present thread owns copying; vsync only requests it. */
++	IOLock       *fPresentLock;
++	bool          fPresentRequested;
++	bool          fPresentThreaded;       /* sweetfb_thread=0: present inline on the vsync tick */
++	uint8_t       fPresentRec[SWEET_FB_SWAP_REC_SIZE];
++	uint64_t      fStatsPresentUs, fStatsPresentMaxUs, fStatsCoalesced;
+ 	void rearmVsync(void);
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -187,12 +196,25 @@ AppleCLCD::start(IOService *provider)
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+-	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
++	fPresentLock = IOLockAlloc();
++	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL || fPresentLock == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+ 		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
++	int threaded = 1;
++	PE_parse_boot_argn("sweetfb_thread", &threaded, sizeof(threaded));
++	fPresentThreaded = threaded != 0;
++	if (fPresentThreaded) {
++		thread_t presenter = THREAD_NULL;
++		if (kernel_thread_start(&AppleCLCD::presentThread, this, &presenter) != KERN_SUCCESS) {
++			IOLog("SWEET FB: no present thread; presenting on the vsync tick\n");
++			fPresentThreaded = false;
++		} else {
++			thread_deallocate(presenter);
++		}
++	}
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+@@ -210,10 +232,12 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fStatsStart = mach_absolute_time();
+ 	fStatsCallbacks = fStatsPresents = fStatsMissed = 0;
++	fStatsPresentUs = fStatsPresentMaxUs = fStatsCoalesced = 0;
++	fPresentRequested = false;
+ 	fNextVsync = fStatsStart + fVsyncPeriod;
+ 	fVsync->wakeAtTime(fNextVsync);
+-	IOLog("SWEET FB: scheduler v2 requested=%u present=%u timer=%u Hz; software timing, panel mode unchanged\n",
+-	    hz, fPresentHz, fTimerHz);
++	IOLog("SWEET FB: scheduler v3 requested=%u present=%u timer=%u Hz; present %s, software timing, panel mode unchanged\n",
++	    hz, fPresentHz, fTimerHz, fPresentThreaded ? "thread" : "inline");
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -238,11 +262,15 @@ AppleCLCD::rearmVsync(void)
+ 	uint64_t elapsed;
+ 	absolutetime_to_nanoseconds(now - fStatsStart, &elapsed);
+ 	if (elapsed >= 10ULL * NSEC_PER_SEC) {
+-		IOLog("SWEET FB: timing window_ms=%llu callbacks=%llu present_calls=%llu missed_deadlines=%llu target=%u Hz\n",
+-		    elapsed / NSEC_PER_MSEC, fStatsCallbacks, fStatsPresents,
+-		    fStatsMissed, fPresentHz);
++		const uint64_t presents = __atomic_exchange_n(&fStatsPresents, 0, __ATOMIC_RELAXED);
++		const uint64_t present_us = __atomic_exchange_n(&fStatsPresentUs, 0, __ATOMIC_RELAXED);
++		const uint64_t present_max = __atomic_exchange_n(&fStatsPresentMaxUs, 0, __ATOMIC_RELAXED);
++		const uint64_t coalesced = __atomic_exchange_n(&fStatsCoalesced, 0, __ATOMIC_RELAXED);
++		IOLog("SWEET FB: timing window_ms=%llu callbacks=%llu present_calls=%llu missed_deadlines=%llu target=%u Hz present_avg_us=%llu present_max_us=%llu coalesced=%llu\n",
++		    elapsed / NSEC_PER_MSEC, fStatsCallbacks, presents,
++		    fStatsMissed, fPresentHz, presents ? present_us / presents : 0, present_max, coalesced);
+ 		fStatsStart = now;
+-		fStatsCallbacks = fStatsPresents = fStatsMissed = 0;
++		fStatsCallbacks = fStatsMissed = 0;
+ 	}
+ 	fVsync->wakeAtTime(fNextVsync);
+ }
+@@ -292,23 +320,83 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && presentDue;
+-	uint8_t *rec = NULL;
+-	if (flush) {
+-		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+-		if (rec != NULL) {
+-			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+-			fb->fDirty = false;
+-		}
++	if (flush && !fb->fPresentThreaded) {
++		/* Previous behaviour: this tick waits for the GPU and copies. */
++		memcpy(fb->fPresentRec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++		fb->fDirty = false;
+ 	}
+ 	IOLockUnlock(fb->fLock);
+-	if (rec != NULL) {
+-		++fb->fStatsPresents;
+-		fb->present(rec);
+-		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++	if (flush && fb->fPresentThreaded) {
++		fb->requestPresent();
++	} else if (flush) {
++		const uint64_t began = mach_absolute_time();
++		fb->present(fb->fPresentRec);
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++		const uint64_t us = ns / NSEC_PER_USEC;
++		__atomic_add_fetch(&fb->fStatsPresents, 1, __ATOMIC_RELAXED);
++		__atomic_add_fetch(&fb->fStatsPresentUs, us, __ATOMIC_RELAXED);
++		if (us > fb->fStatsPresentMaxUs) {
++			fb->fStatsPresentMaxUs = us;
++		}
+ 	}
+ 	fb->rearmVsync();
+ }
+ 
++/* A request while the thread is still copying is coalesced: the thread then
++ * presents the latest pending swap once, instead of queuing stale frames. */
++void
++AppleCLCD::requestPresent(void)
++{
++	IOLockLock(fPresentLock);
++	if (fPresentRequested) {
++		__atomic_add_fetch(&fStatsCoalesced, 1, __ATOMIC_RELAXED);
++	}
++	fPresentRequested = true;
++	IOLockWakeup(fPresentLock, &fPresentRequested, true);
++	IOLockUnlock(fPresentLock);
++}
++
++/* GPU-gate waits and the panel copy run here, never in the vsync timer, so
++ * CoreAnimation keeps receiving vsync at the timer cadence while a frame is
++ * being waited for or copied. */
++void
++AppleCLCD::presentThread(void *arg, wait_result_t result)
++{
++	(void)result;
++	AppleCLCD *fb = (AppleCLCD *)arg;
++	for (;;) {
++		IOLockLock(fb->fPresentLock);
++		while (!fb->fPresentRequested) {
++			IOLockSleep(fb->fPresentLock, &fb->fPresentRequested, THREAD_UNINT);
++		}
++		fb->fPresentRequested = false;
++		IOLockUnlock(fb->fPresentLock);
++		bool take = false;
++		IOLockLock(fb->fLock);
++		if (fb->fDirty && !fb->fPowerOff) {
++			memcpy(fb->fPresentRec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++			fb->fDirty = false;
++			take = true;
++		}
++		IOLockUnlock(fb->fLock);
++		if (!take) {
++			continue;
++		}
++		const uint64_t began = mach_absolute_time();
++		fb->present(fb->fPresentRec);
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++		const uint64_t us = ns / NSEC_PER_USEC;
++		__atomic_add_fetch(&fb->fStatsPresents, 1, __ATOMIC_RELAXED);
++		__atomic_add_fetch(&fb->fStatsPresentUs, us, __ATOMIC_RELAXED);
++		uint64_t max = __atomic_load_n(&fb->fStatsPresentMaxUs, __ATOMIC_RELAXED);
++		while (us > max && !__atomic_compare_exchange_n(&fb->fStatsPresentMaxUs, &max, us,
++		    false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++		}
++	}
++}
++
+ void
+ AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
+ {

@@ -1,0 +1,523 @@
+diff --git a/bsd/dev/sweet_adreno_dma.h b/bsd/dev/sweet_adreno_dma.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_adreno_dma.h
+@@ -0,0 +1,55 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef SWEET_ADRENO_DMA_H
++#define SWEET_ADRENO_DMA_H
++#include "sweet_adreno.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++#define A618_DMA_BYTES 0x14000u
++#define A618_TABLE_BYTES 0x4000u
++#define A618_SHARED_IOVA 0x60000000u
++#define A618_HFI_IOVA 0x60004000u
++#define A618_DEBUG_IOVA 0x60008000u
++#define A618_LOG_IOVA 0x6000c000u
++struct a618_dma_region {
++ unsigned char *cpu;
++ uint64_t physical;
++ unsigned bytes;
++ unsigned uncached;
++};
++struct a618_smmu_io {
++ struct a618_io registers;
++ uint64_t (*read64)(void *, uint32_t);
++ void (*write64)(void *, uint32_t, uint64_t);
++ void (*barrier)(void *);
++};
++struct a618_smmu_result {
++ unsigned context, slot, translated;
++ uint32_t control, fault, offset, value;
++ uint64_t par;
++};
++/* Permanent wired allocation: retain on failure once hardware can reference it. */
++int sweet_adreno_dma_allocate(struct a618_dma_region *);
++/* Caller holds GMU reset, GX off, clocks/rails on. CB0 is never touched.
++ * Only the measured SMMU profile is accepted. No reset-all or bypass domain.
++ * Full DMA readiness requires all 16 translation checks and the guard fault.
++ */
++int a618_smmu_prepare(const struct a618_smmu_io *,
++ const struct a618_dma_region *, struct a618_smmu_result *);
++/* Legacy HFI v1, single host producer/consumer, uncached shared storage.
++ * barrier orders device-visible RAM. All caller messages are trusted kernel
++ * data, <=255 DWORDs. These APIs do not start firmware or touch MMIO.
++ */
++struct a618_hfi {
++ volatile uint32_t *table;
++ void (*barrier)(void *);
++ void *cookie;
++};
++int a618_hfi_init(struct a618_hfi *, const struct a618_dma_region *,
++ void (*)(void *), void *);
++int a618_hfi_write(struct a618_hfi *, const uint32_t *, unsigned);
++int a618_hfi_read(struct a618_hfi *, unsigned, uint32_t *, unsigned, unsigned *);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/bsd/dev/sweet_adreno_smmu.c b/bsd/dev/sweet_adreno_smmu.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_adreno_smmu.c
+@@ -0,0 +1,153 @@
++/* SPDX-License-Identifier: MIT
++ * Original bounded SMMUv2 backend using the ARM architecture and public
++ * Linux/Qualcomm register protocols. See docs/adreno-port.md for source pins.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(KERNEL)
++#include <sys/errno.h>
++#else
++#include <errno.h>
++#endif
++#include "sweet_adreno_dma.h"
++#define CB1 0x9000u
++#define ASID 0x61u
++static int
++put(const struct a618_io *io, uint32_t offset, uint32_t value,
++ uint32_t mask, struct a618_smmu_result *r)
++{
++ io->write(io->cookie, offset, value);
++ r->offset = offset; r->value = io->read(io->cookie, offset);
++ return r->value != 0xffffffffu && (r->value & mask) == (value & mask) ? 0 : EIO;
++}
++static int
++wait_clear(const struct a618_io *io, uint32_t offset, unsigned mask,
++ struct a618_smmu_result *r)
++{
++ for (unsigned i = 0; i < 500; ++i) {
++  r->offset = offset; r->value = io->read(io->cookie, offset);
++  if (r->value == 0xffffffffu) return EIO;
++  if (!(r->value & mask)) return 0;
++  io->delay_us(io->cookie, 1);
++ }
++ return ETIMEDOUT;
++}
++int
++a618_smmu_prepare(const struct a618_smmu_io *ops,
++ const struct a618_dma_region *memory, struct a618_smmu_result *r)
++{
++ if (!ops || !memory || !r || !ops->registers.read ||
++     !ops->registers.write || !ops->registers.delay_us ||
++     !ops->read64 || !ops->write64 || !ops->barrier || !memory->cpu ||
++     !memory->uncached || memory->bytes != A618_DMA_BYTES ||
++     (memory->physical & 0x3fff) || !memory->physical ||
++     memory->physical > (1ull << 36) - A618_DMA_BYTES ||
++     ((uintptr_t)memory->cpu & 7)) return EINVAL;
++ const struct a618_io *io = &ops->registers;
++ *r = (struct a618_smmu_result){ .context = 1, .slot = 0xffffffffu };
++ /* Measured 0091 profile: 4 KiB register pages, 0x8000 CB base, five
++  * stream match slots and context banks, 36-bit PA. 16K PT granules are
++  * intentionally not used (Qualcomm advertises broken 16K support).
++  */
++ const uint32_t identity[] = {0x48016605, 0x20008005, 0x7511};
++ for (unsigned i = 0; i < 3; ++i) {
++  r->offset = 0x20 + 4 * i; r->value = io->read(io->cookie, r->offset);
++  if (r->value != identity[i]) return ENOTSUP;
++ }
++ /* Do not steal an active bank or matching stream, even if its firmware
++  * owner appears idle. CB0 and all protected banks are left alone.
++  */
++ r->offset = CB1; r->value = io->read(io->cookie, CB1);
++ if (r->value == 0xffffffffu) return EIO;
++ if (r->value & 1) return EBUSY; /* M=0 is disabled; other reset bits may be UNKNOWN. */
++ for (unsigned i = 0; i < 5; ++i) {
++  r->offset = 0x800 + 4 * i;
++  uint32_t smr = r->value = io->read(io->cookie, r->offset);
++  if (smr == 0xffffffffu) return EIO;
++  if (!(smr & 0x80000000u)) {
++   if (r->slot == 0xffffffffu) r->slot = i;
++  } else if (((smr ^ 5u) & ~((smr >> 16) & 0x7fffu) & 0xffffu) == 0) {
++   r->slot = i; return EBUSY;
++  }
++ }
++ if (r->slot == 0xffffffffu) return ENOSPC;
++ r->control = io->read(io->cookie, 0);
++ if (r->control == 0xffffffffu) return EIO;
++ /* Three 4K tables inside a 16K host page; no mapping of the table arena.
++  * L1[1] -> L2[256] -> L3[0..15]: shared 64K at 0x60000000.
++  * All other entries fault. Both privileged/unprivileged data R/W, NX,
++  * Normal NC and outer shareable match the uncached CPU mapping.
++  */
++ volatile uint64_t *l1 = (volatile uint64_t *)memory->cpu;
++ volatile uint64_t *l2 = (volatile uint64_t *)(memory->cpu + 0x1000);
++ volatile uint64_t *l3 = (volatile uint64_t *)(memory->cpu + 0x2000);
++ for (unsigned i = 0; i < 512; ++i) l1[i] = l2[i] = l3[i] = 0;
++ l1[1] = (memory->physical + 0x1000) | 3;
++ l2[256] = (memory->physical + 0x2000) | 3;
++ for (unsigned i = 0; i < 16; ++i)
++  l3[i] = (memory->physical + A618_TABLE_BYTES + 0x1000 * i) |
++      (3ull << 53) | (1u << 11) | (1u << 10) | (2u << 8) | (1u << 6) | 3;
++ ops->barrier(io->cookie);
++ int error;
++ #define SET(o,v,m) do { error = put(io, (o), (v), (m), r); if (error) return error; } while (0)
++ SET(0x1804, 1, 1); /* GR1 CBA2R(1): AArch64. */
++ SET(0x1004, 0x1f300, 0x3f3ff); /* Stage1, stage2 bypass, weak upstream attributes. */
++ SET(CB1 + 0x10, 0x38011, 0x38077); /* TCR2: SEP upstream, 36-bit output, AArch64 ASID. */
++ SET(CB1 + 0x30, 0x00802020u, 0x00c0ffbfu); /* EPD1, OSH, NC walks, T0SZ=32; AArch64, no EAE. */
++ uint64_t ttbr = memory->physical | ((uint64_t)ASID << 48);
++ ops->write64(io->cookie, CB1 + 0x20, ttbr);
++ r->offset = CB1 + 0x20;
++ r->par = ops->read64(io->cookie, r->offset);
++ if ((r->par & 0xffff000ffffff000ull) != ttbr) return EIO;
++ ops->write64(io->cookie, CB1 + 0x28, 0);
++ SET(CB1 + 0x38, 0x44, 0xff); /* MAIR[0]: Normal NC. */
++ /* MAIR1 is unused: every data PTE references MAIR0[0]. */
++ /* Fault reporting enabled, IRQ/stalling disabled until an IRQ handler
++  * exists; HUPCF continues other transactions after an abort.
++  */
++ /* AFE/TRE are UNK/SBOP for long descriptors: write ones, do not
++  * compare their readback. Check M, E, fault controls, WXN and ASIDPNE.
++  */
++ SET(CB1, 0x1127, 0x17f1);
++ /* Block unmatched streams and enable this device. Preserve other controls;
++  * do not enable interrupt sources without handlers. No reset-all/TLBI-all.
++  */
++ SET(0, (r->control | 0x1c12u) & ~0xe025u, 0xfc37);
++ io->write(io->cookie, CB1 + 0x610, ASID);
++ io->write(io->cookie, CB1 + 0x7f0, 0);
++ error = wait_clear(io, CB1 + 0x7f4, 1, r);
++ if (error) return error;
++ /* Hardware translation probes, not a software table walk: every shared
++  * page plus a guard fault must match before the stream is published.
++  */
++ for (unsigned i = 0; i <= 16; ++i) {
++  uint64_t va = (uint64_t)A618_SHARED_IOVA + i * 0x1000u;
++  ops->write64(io->cookie, CB1 + 0x800, va);
++  error = wait_clear(io, CB1 + 0x8f0, 1, r);
++  if (error) return error;
++  r->par = ops->read64(io->cookie, CB1 + 0x50);
++  if (r->par == 0xffffffffffffffffull) return EIO;
++  if (i == 16) {
++   if (!(r->par & 1)) return EFAULT;
++  } else {
++   uint64_t expected = memory->physical + A618_TABLE_BYTES + i * 0x1000u;
++   if ((r->par & 1) || (r->par & 0x0000000ffffff000ull) != expected)
++    return EFAULT;
++   ++r->translated;
++  }
++ }
++ r->fault = io->read(io->cookie, CB1 + 0x58);
++ if (r->fault == 0xffffffffu) return EIO;
++ if (r->fault) {
++  io->write(io->cookie, CB1 + 0x58, r->fault);
++  if (io->read(io->cookie, CB1 + 0x58)) return EIO;
++ }
++ /* Only GMU kernel stream 5: route first, VALID last. Never program
++  * GMU user stream 4, GPU stream 0, broad masks or a bypass entry.
++  */
++ SET(0xc00 + 4 * r->slot, 1, 0x030300ff);
++ SET(0x800 + 4 * r->slot, 0x80000005u, 0xffffffffu);
++ r->fault = io->read(io->cookie, CB1 + 0x58);
++ #undef SET
++ return 0;
++}
++#endif
+diff --git a/bsd/dev/sweet_adreno_hfi.c b/bsd/dev/sweet_adreno_hfi.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_adreno_hfi.c
+@@ -0,0 +1,98 @@
++/* SPDX-License-Identifier: MIT
++ * Legacy GMU HFI v1 wire format, original bounded host transport.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(KERNEL)
++#include <sys/errno.h>
++#else
++#include <errno.h>
++#endif
++#include "sweet_adreno_dma.h"
++#define QUEUE_WORDS 1024u
++#define HEADER_WORDS 12u
++static volatile uint32_t *
++queue_header(struct a618_hfi *hfi, unsigned queue)
++{
++ return hfi->table + 6 + queue * HEADER_WORDS;
++}
++static int
++indices(struct a618_hfi *hfi, unsigned queue, unsigned *read, unsigned *write)
++{
++ volatile uint32_t *header = queue_header(hfi, queue);
++ hfi->barrier(hfi->cookie);
++ if (header[0] != 1 || header[3] != QUEUE_WORDS) return EIO;
++ *read = header[10]; *write = header[11];
++ if (*read >= QUEUE_WORDS || *write >= QUEUE_WORDS) return EIO;
++ hfi->barrier(hfi->cookie);
++ return 0;
++}
++int
++a618_hfi_init(struct a618_hfi *hfi, const struct a618_dma_region *memory,
++ void (*barrier)(void *), void *cookie)
++{
++ if (!hfi || !memory || !memory->cpu || !memory->uncached || !barrier ||
++     memory->bytes != A618_DMA_BYTES || ((uintptr_t)memory->cpu & 3))
++  return EINVAL;
++ hfi->table = (volatile uint32_t *)(memory->cpu + A618_TABLE_BYTES +
++     (A618_HFI_IOVA - A618_SHARED_IOVA));
++ hfi->barrier = barrier; hfi->cookie = cookie;
++ for (unsigned i = 0; i < 4096; ++i) hfi->table[i] = 0;
++ hfi->table[0] = 0;
++ hfi->table[1] = 24 + 3 * 48; /* size in bytes; offsets below in DWORDs */
++ hfi->table[2] = 6; hfi->table[3] = 12;
++ hfi->table[4] = hfi->table[5] = 3;
++ const unsigned id[] = {0, 4, 5};
++ for (unsigned q = 0; q < 3; ++q) {
++  volatile uint32_t *header = queue_header(hfi, q);
++  header[0] = 1;
++  header[1] = A618_HFI_IOVA + (q + 1) * 4096;
++  header[2] = (10u << 8) | id[q];
++  header[3] = QUEUE_WORDS;
++  header[6] = header[7] = header[8] = 1;
++ }
++ barrier(cookie);
++ return 0;
++}
++int
++a618_hfi_write(struct a618_hfi *hfi, const uint32_t *words, unsigned count)
++{
++ if (!hfi || !hfi->table || !hfi->barrier || !words || !count || count > 255 ||
++     ((words[0] >> 8) & 255) != count || (words[0] & 0xf0000u)) return EINVAL;
++ unsigned read, write;
++ int error = indices(hfi, 0, &read, &write);
++ if (error) return error;
++ unsigned free_words = (read + QUEUE_WORDS - write - 1) % QUEUE_WORDS;
++ if (count > free_words) return ENOSPC;
++ volatile uint32_t *data = hfi->table + QUEUE_WORDS;
++ for (unsigned i = 0; i < count; ++i) data[(write + i) % QUEUE_WORDS] = words[i];
++ hfi->barrier(hfi->cookie);
++ queue_header(hfi, 0)[11] = (write + count) % QUEUE_WORDS;
++ hfi->barrier(hfi->cookie);
++ return 0;
++}
++int
++a618_hfi_read(struct a618_hfi *hfi, unsigned queue, uint32_t *words,
++ unsigned capacity, unsigned *count)
++{
++ if (!count) return EINVAL;
++ *count = 0;
++ if (!hfi || !hfi->table || !hfi->barrier || !words || !capacity ||
++     queue < 1 || queue > 2) return EINVAL;
++ unsigned read, write;
++ int error = indices(hfi, queue, &read, &write);
++ if (error) return error;
++ unsigned available = (write + QUEUE_WORDS - read) % QUEUE_WORDS;
++ if (!available) return EAGAIN;
++ volatile uint32_t *data = hfi->table + (queue + 1) * QUEUE_WORDS;
++ unsigned size = (data[read] >> 8) & 255;
++ if (!size) return EIO;
++ if (size > available) return EAGAIN;
++ if (size > capacity) return EMSGSIZE;
++ for (unsigned i = 0; i < size; ++i) words[i] = data[(read + i) % QUEUE_WORDS];
++ hfi->barrier(hfi->cookie);
++ queue_header(hfi, queue)[10] = (read + size) % QUEUE_WORDS;
++ hfi->barrier(hfi->cookie);
++ *count = size;
++ return 0;
++}
++#endif
+diff --git a/iokit/Kernel/arm/SweetAdrenoDMA.cpp b/iokit/Kernel/arm/SweetAdrenoDMA.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAdrenoDMA.cpp
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: MIT
++ * Wired, uncached memory for the Adreno SMMU and legacy GMU HFI.
++ */
++#if defined(SWEET) || defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOLib.h>
++#include <mach/mach_types.h>
++#include <kern/task.h>
++#include <sys/errno.h>
++#include "../../../bsd/dev/sweet_adreno_dma.h"
++
++static IOBufferMemoryDescriptor *sweet_adreno_storage;
++extern "C" int
++sweet_adreno_dma_allocate(struct a618_dma_region *region)
++{
++ if (!region) return EINVAL;
++ if (sweet_adreno_storage) return EALREADY;
++ IOBufferMemoryDescriptor *storage = IOBufferMemoryDescriptor::inTaskWithOptions(
++     kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous |
++     kIOMemoryMapperNone | kIOMapInhibitCache, A618_DMA_BYTES, 0x4000);
++ if (!storage) return ENOMEM;
++ if (storage->prepare(kIODirectionInOut) != kIOReturnSuccess) {
++  storage->release(); return EIO;
++ }
++ IOByteCount contiguous = 0;
++ uint64_t physical = storage->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone);
++ void *cpu = storage->getBytesNoCopy();
++ if (!cpu || !physical || (physical & 0x3fff) || contiguous < A618_DMA_BYTES ||
++     physical > (1ull << 36) - A618_DMA_BYTES) {
++  storage->complete(kIODirectionInOut); storage->release(); return ERANGE;
++ }
++ /* Do not free this allocation after publishing any SMMU mapping, including
++  * on timeout: hardware ownership may be uncertain. One allocation per boot.
++  */
++ sweet_adreno_storage = storage;
++ region->cpu = (unsigned char *)cpu;
++ region->physical = physical;
++ region->bytes = A618_DMA_BYTES;
++ region->uncached = 1;
++ /* Cache-inhibited mappings may be Device memory: avoid bzero/DC ZVA
++  * and vectorized stores. Use naturally aligned volatile word stores. */
++ volatile uint32_t *words = (volatile uint32_t *)cpu;
++ for (unsigned i = 0; i < A618_DMA_BYTES / 4; ++i) words[i] = 0;
++ __asm__ volatile("dsb sy" ::: "memory");
++ return 0;
++}
++#endif
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -5,12 +5,14 @@
+  * sweetgpu=4 uses the new A618 core to power CX after fresh rail checks.
+  * sweetgpu=5 enables GMU/bus clocks and reads CX-side GMU/SMMU status.
+  * sweetgpu=6 additionally stages firmware while the M3 remains in reset.
++ * sweetgpu=7 additionally validates SMMU mappings and prepares HFI RAM.
+  * GX is firmware controlled. No GPU core access or command submission.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/errno.h>
+ #include "sweet_adreno.h"
++#include "sweet_adreno_dma.h"
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+@@ -97,6 +99,27 @@
+ 	*(volatile uint32_t *)((vm_offset_t)cookie + offset) = value;
+ 	__asm__ volatile("dsb oshst" ::: "memory");
+ 	(void)sweet_adreno_read(cookie, offset);
++}
++
++static uint64_t
++sweet_adreno_read64(void *cookie, uint32_t offset)
++{
++ uint64_t value = *(volatile uint64_t *)((vm_offset_t)cookie + offset);
++ __asm__ volatile("dmb oshld" ::: "memory");
++ return value;
++}
++static void
++sweet_adreno_write64(void *cookie, uint32_t offset, uint64_t value)
++{
++ __asm__ volatile("dmb oshst" ::: "memory");
++ *(volatile uint64_t *)((vm_offset_t)cookie + offset) = value;
++ __asm__ volatile("dsb oshst" ::: "memory");
++}
++static void
++sweet_adreno_barrier(void *cookie)
++{
++ (void)cookie;
++ __asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
+ static void
+@@ -189,7 +212,7 @@
+ 	printf("SWEET ADRENO: SMMU IDR0=%#x IDR1=%#x IDR2=%#x\n", id0, id1, id2);
+ 	if (id0 == 0xffffffffu || id1 == 0xffffffffu || id2 == 0xffffffffu || !id0)
+ 		return EIO;
+-	if (stage == 6) {
++	if (stage >= 6) {
+ 		DTEntry node;
+ 		const unsigned char *firmware = NULL;
+ 		const uint32_t *crc = NULL;
+@@ -209,6 +232,38 @@
+ 		if (error)
+ 			return error;
+ 	}
++	if (stage >= 7) {
++  (void)sweet_rpmh_arc_probe("xo.lvl");
++  /* Still no M3 release: verify the actual hardware translations first. */
++  if (sweet_adreno_read((void *)gmu, A618_GMU_SYSRESET) != 1 ||
++      !(sweet_gpucc_read(GPU_CC_GX_GDSCR) & GDSC_SW_COLLAPSE) ||
++      !(sweet_gpucc_read(GPU_CC_GX_DOMAIN) & GX_DOMAIN_CLAMP)) {
++   printf("SWEET ADRENO: DMA precondition failed: require M3 reset, GX collapse/clamp\n");
++   return EBUSY;
++  }
++  static struct a618_dma_region memory;
++  static struct a618_hfi hfi;
++  error = sweet_adreno_dma_allocate(&memory);
++  printf("SWEET ADRENO: DMA allocate errno=%d bytes=%u PA=%#llx uncached=%u\n",
++      error, memory.bytes, memory.physical, memory.uncached);
++  if (error) return error;
++  error = a618_hfi_init(&hfi, &memory, sweet_adreno_barrier, NULL);
++  printf("SWEET ADRENO: legacy HFI table errno=%d IOVA=%#x queues=3; firmware not executing\n",
++      error, A618_HFI_IOVA);
++  if (error) return error;
++  const struct a618_smmu_io ops = {
++   { (void *)smmu, sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay },
++   sweet_adreno_read64, sweet_adreno_write64, sweet_adreno_barrier };
++  struct a618_smmu_result result;
++  bzero(&result, sizeof(result));
++  error = a618_smmu_prepare(&ops, &memory, &result);
++  printf("SWEET ADRENO: SMMU map errno=%d CB=%u slot=%u translated=%u offset=%#x value=%#x PAR=%#llx FSR=%#x\n",
++      error, result.context, result.slot, result.translated, result.offset,
++      result.value, result.par, result.fault);
++  printf("SWEET ADRENO: SMMU mapping check complete; SYSRESET=%#x; no firmware execution\n",
++      sweet_adreno_read((void *)gmu, A618_GMU_SYSRESET));
++  if (error) return error;
++ }
+ 	printf("SWEET ADRENO: GMU preparation complete; GX remains firmware controlled, no submission\n");
+ 	return 0;
+ }
+@@ -285,8 +340,8 @@
+ 	}
+ 	sweet_gpu_probe_attempted = 1;
+ 	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
+-	if (enabled < 1 || enabled > 6) {
+-		printf("SWEET GPU: audit disabled; sweetgpu=1 read-only, 2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 GMU clocks/status, 6 firmware staging\n");
++	if (enabled < 1 || enabled > 7) {
++		printf("SWEET GPU: audit disabled; sweetgpu=1 read-only, 2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 GMU clocks/status, 6 firmware staging, 7 DMA/SMMU/HFI mappings\n");
+ 		return;
+ 	}
+ 
+@@ -329,7 +384,7 @@
+ 		return;
+ 	}
+ 	if (enabled == 1) {
+-		printf("SWEET GPU: read-only audit complete; sweetgpu=2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 GMU clocks/status, 6 firmware staging\n");
++		printf("SWEET GPU: read-only audit complete; sweetgpu=2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 GMU clocks/status, 6 firmware staging, 7 DMA/SMMU/HFI mappings\n");
+ 		return;
+ 	}
+ 	sweet_gpu_stage = enabled;
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,8 @@
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_adreno.c			standard
+ bsd/dev/sweet_adreno_clock.c		standard
++bsd/dev/sweet_adreno_smmu.c		standard
++bsd/dev/sweet_adreno_hfi.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetAdrenoDMA.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -470,7 +470,8 @@
+ int
+ sweet_rpmh_arc_probe(const char *res)
+ {
+-	if (!rh_arc_name(res)) {
++	/* XO inspection only: write APIs retain the original resource whitelist. */
++	if (!rh_arc_name(res) && (!res || strcmp(res, "xo.lvl"))) {
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {

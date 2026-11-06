@@ -1,0 +1,355 @@
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.cpp b/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.cpp
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.cpp
+@@ -245,6 +245,18 @@
+ failed:
+     (void)release();return status;
+ }
++IOReturn NativeAdrenoMemory::borrowBootStorage(void *mapping,uint64_t physical,size_t bytes,unsigned bits)
++{
++    if(backed() || spans_ || owned_spans_ || quarantined_)return kIOReturnBusy;
++    if(!mapping || !physical || !bytes || (bytes&4095) || (physical&4095) ||
++        ((uintptr_t)mapping&4095) || !outputWidth(bits) || bytes>UINTPTR_MAX-(uintptr_t)mapping ||
++        physical>=(UINT64_C(1)<<bits) || bytes>(UINT64_C(1)<<bits)-physical)return kIOReturnBadArgument;
++    spans_=IONew(NativeAdrenoPhysicalSpan,1);
++    if(!spans_)return kIOReturnNoMemory;
++    spans_[0]={0,physical,bytes};span_count_=span_capacity_=1;
++    mapping_=mapping;bytes_=allocated_bytes_=bytes;borrowed_nc_=prepared_=true;
++    return kIOReturnSuccess;
++}
+ IOReturn NativeAdrenoMemory::makeWriteCombined()
+ {
+     if(write_combined_ && prepared_ && !quarantined_ && !device_references_)return kIOReturnSuccess;
+@@ -292,7 +304,7 @@
+     if(spans_)IODelete(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
+     if(owned_spans_)IODelete(owned_spans_,NativeAdrenoPhysicalSpan,owned_capacity_);
+     owned_spans_=nullptr;owned_count_=owned_capacity_=0;
+-    mapping_=nullptr;spans_=nullptr;bytes_=allocated_bytes_=span_count_=span_capacity_=0;read_only_=false;
++    prepared_=false;borrowed_nc_=false;mapping_=nullptr;spans_=nullptr;bytes_=allocated_bytes_=span_count_=span_capacity_=0;read_only_=false;
+     return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoMemory::holdForDevice()
+@@ -311,6 +323,7 @@
+ {
+     if(!backed() || !prepared_ || quarantined_)return kIOReturnNotReady;
+     if(!bytes || ((offset|bytes)&4095) || offset>bytes_ || bytes>bytes_-offset)return kIOReturnBadArgument;
++    if(borrowed_nc_) {__asm__ volatile("dsb sy":::"memory");return kIOReturnSuccess;}
+     if(imported_)return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
+     if(write_combined_)   /* no CPU mapping should cache these pages; if one does, reach its lines through the physical pages */
+         return include_write_combined?maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean):kIOReturnSuccess;
+@@ -322,6 +335,7 @@
+     if(!backed() || !prepared_ || quarantined_)return kIOReturnNotReady;
+     if(!bytes || ((offset|bytes)&4095) || offset>bytes_ || bytes>bytes_-offset)return kIOReturnBadArgument;
+     /* Imported pages may hold the owner's unrelated dirty lines next to the GPU's writes: clean as well as invalidate. */
++    if(borrowed_nc_) {__asm__ volatile("dsb sy":::"memory");return kIOReturnSuccess;}
+     if(imported_)return maintainImported(offset,bytes,NativeAdrenoCleanInvalidate);
+     if(write_combined_)return kIOReturnSuccess;
+     return NativeAdrenoMaintainOwnedPages(static_cast<unsigned char *>(mapping_)+offset,bytes,NativeAdrenoInvalidate);
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.h b/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.h
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.h
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.h
+@@ -43,7 +43,7 @@
+     NativeAdrenoPhysicalSpan *owned_spans_=nullptr;
+     size_t owned_count_=0,owned_capacity_=0;
+     uint32_t device_references_=0;
+-    bool prepared_=false,quarantined_=false,write_combined_=false,pooled_=false;
++    bool prepared_=false,quarantined_=false,write_combined_=false,pooled_=false,borrowed_nc_=false;
+     size_t pool_offset_=0;
+     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
+ public:
+@@ -86,7 +86,10 @@
+      * 1280 submissions, while walking the pool's pages took 0.65 ms of each). The submissions' line audit still covers every object. */
+     IOReturn reassertWriteCombined(uint32_t *reset) const
+     {return write_combined_ && span_count_ && !pooled_?NativeAdrenoReassertWriteCombined(owned_spans_,owned_count_,reset):kIOReturnSuccess;}
+-    bool backed() const {return descriptor_ || imported_ || pooled_;}
++    /* Kernel board only: the boot owner permanently retains this exact NC
++     * mapping and raw physical allocation. Never changes attributes/frees it. */
++    IOReturn borrowBootStorage(void *mapping,uint64_t physical,size_t bytes,unsigned output_bits);
++    bool backed() const {return descriptor_ || imported_ || pooled_ || borrowed_nc_;}
+     /* Refuses device references/quarantine; only clears ownership after real
+      * descriptor complete() succeeds. No automatic reset or resource recycling. */
+     IOReturn release();
+diff --git a/iokit/Kernel/arm/unixnu/ArmSmmu4KContext.c b/iokit/Kernel/arm/unixnu/ArmSmmu4KContext.c
+--- a/iokit/Kernel/arm/unixnu/ArmSmmu4KContext.c
++++ b/iokit/Kernel/arm/unixnu/ArmSmmu4KContext.c
+@@ -28,7 +28,7 @@
+     out->cbar=out->cba2r=out->tcr=out->tcr2=out->mair0=out->mair1=out->sctlr=0;
+     out->reserved_zero=0;
+     out->ttbr0=out->ttbr1=0;
+-    if(!c || (!c->lower && !c->upper) || c->asid>65535 || c->coherent_walk>1 ||
++    if(!c || c->profile>1 || (!c->lower && !c->upper) || c->asid>65535 || c->coherent_walk>1 ||
+         c->stall_on_fault>1 || c->continue_after_fault>1 ||
+         !region_valid(c->lower,c->lower_tables,0) || !region_valid(c->upper,c->upper_tables,1))return ArmSmmu4KArgument;
+     unsigned va=width_bits((c->id2>>8)&15),pa=width_bits((c->id2>>4)&15);
+@@ -56,6 +56,14 @@
+     if(c->upper)v.ttbr1|=c->upper_tables->root_physical;
+     v.mair0=0xff44;v.mair1=0;
+     v.sctlr=0x1067|(c->stall_on_fault<<7)|(c->continue_after_fault<<8);
++    if(c->profile==1) {
++        if(c->id0!=0x48016605 || c->id2!=0x7511 || !c->lower || c->upper ||
++            c->lower->input_bits!=32 || c->lower->output_bits!=36 || c->asid!=0x62 ||
++            c->coherent_walk || c->stall_on_fault || !c->continue_after_fault)return ArmSmmu4KUnsupported;
++        /* Measured0106: EPD1 with unusedTG1 zero, TTBR1zero, CFIEdisabled.
++         * The board polls faults synchronously and never enables unhandled IRQs. */
++        v.tcr=0x802020;v.ttbr1=0;v.sctlr=0x1127;
++    }
+     v.reserved_zero=0;
+     *out=v;
+     return ArmSmmu4KSuccess;
+diff --git a/iokit/Kernel/arm/unixnu/ArmSmmu4KContext.h b/iokit/Kernel/arm/unixnu/ArmSmmu4KContext.h
+--- a/iokit/Kernel/arm/unixnu/ArmSmmu4KContext.h
++++ b/iokit/Kernel/arm/unixnu/ArmSmmu4KContext.h
+@@ -16,6 +16,9 @@
+     unsigned asid;          /* 0..65535, ownership managed by the caller. */
+     unsigned coherent_walk; /* Explicit: 1=inner WBWA, 0=outer NC. */
+     unsigned stall_on_fault, continue_after_fault; /* Each 0 or 1. */
++    /* 0: upstream profile; 1: measured sweet A618 CB0 polling profile.
++     * Profile1 is restricted to its exact hardware IDs and lower-only32/36. */
++    unsigned profile;
+ } ArmSmmu4KContextConfig;
+ typedef struct {
+     uint32_t cbar, cba2r, tcr, tcr2, mair0, mair1, sctlr, reserved_zero;
+diff --git a/iokit/Kernel/arm/unixnu/ArmSmmu4KProgram.h b/iokit/Kernel/arm/unixnu/ArmSmmu4KProgram.h
+--- a/iokit/Kernel/arm/unixnu/ArmSmmu4KProgram.h
++++ b/iokit/Kernel/arm/unixnu/ArmSmmu4KProgram.h
+@@ -17,6 +17,7 @@
+     int (*write32)(void *,size_t,uint32_t);
+     int (*write64)(void *,size_t,uint64_t);
+     int (*barrier)(void *);
++    unsigned polling_faults; /*1: board owns synchronous fault polling; no GFIE requirement.*/
+ } ArmSmmu4KIo;
+ typedef struct {
+     uint64_t context_offset;
+diff --git a/iokit/Kernel/arm/unixnu/ArmSmmu4KStreams.c b/iokit/Kernel/arm/unixnu/ArmSmmu4KStreams.c
+--- a/iokit/Kernel/arm/unixnu/ArmSmmu4KStreams.c
++++ b/iokit/Kernel/arm/unixnu/ArmSmmu4KStreams.c
+@@ -19,7 +19,7 @@
+      * policy (USFCFG). Configuration-access fault reporting (GCFGFRE/GCFGFIE) is not required: Linux sets
+      * it only in its own global reset, and firmware that owns sCR0 may leave it clear (an Adreno SMMU read
+      * 0x002f0406). It reports bad register accesses, it does not change translation or bypass. */
+-    if((r->scr0&0x407)!=0x406 || !!(r->scr0&8)!=exids(r->id0))return ArmSmmu4KStateMismatch;
++    if(io->polling_faults>1 || (r->scr0&0x407)!=(io->polling_faults?0x402u:0x406u) || !!(r->scr0&8)!=exids(r->id0))return ArmSmmu4KStateMismatch;
+     return r->global_fault?ArmSmmu4KFault:ArmSmmu4KSuccess;
+ }
+ static ArmSmmu4KStatus scan(const ArmSmmu4KIo *io,const ArmSmmu4KStream *s,unsigned n,
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -264,7 +264,9 @@
+   sweet_adreno_read64, sweet_adreno_write64, sweet_adreno_barrier};
+  struct a618_smmu_result map;
+  bzero(&map, sizeof(map));
+- error = a618_smmu_prepare_cp(&smmu_io, &memory, &map);
++ extern int sweet_native_adreno_prepare_vm(const struct a618_smmu_io *,
++     const struct a618_dma_region *, struct a618_smmu_result *);
++ error = sweet_native_adreno_prepare_vm(&smmu_io, &memory, &map);
+  printf("SWEET ADRENO: CP SMMU errno=%d CB=%u slot=%u pages=%u offset=%#x value=%#x PAR=%#llx FSR=%#x\n",
+      error, map.context, map.slot, map.translated, map.offset, map.value, map.par, map.fault);
+  if (error) return error;
+diff --git a/iokit/Kernel/arm/SweetNativeAdreno.cpp b/iokit/Kernel/arm/SweetNativeAdreno.cpp
+--- a/iokit/Kernel/arm/SweetNativeAdreno.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdreno.cpp
+@@ -10,6 +10,7 @@
+ #include "../../../bsd/dev/sweet_adreno_cp.h"
+ #include "unixnu/NativeAdrenoRing.h"
+ 
++extern "C" int sweet_native_adreno_connect_vm(NativeAdrenoRing *);
+ static NativeAdrenoRing native_ring;
+ static IOLock *native_lock;
+ static struct {
+@@ -89,9 +90,10 @@
+  if(!native_lock)return ENOMEM;
+  const NativeAdrenoRingIo io={nullptr,io_write,io_read,io_barrier};
+  const NativeAdrenoRingCache cache={nullptr,publish,acquire};
+- const IOReturn result=native_ring.adoptA6xx(&io,&cache,memory->cpu+A618_CP_RING_OFFSET,0x8000,A618_CP_RING_IOVA,
++ IOReturn result=native_ring.adoptA6xx(&io,&cache,memory->cpu+A618_CP_RING_OFFSET,0x8000,A618_CP_RING_IOVA,
+      memory->cpu+A618_CP_FENCE_OFFSET,4,A618_CP_FENCE_IOVA,
+      reinterpret_cast<volatile uint32_t *>(memory->cpu+A618_CP_SHADOW_OFFSET),A618_CP_SHADOW_IOVA,seed);
++ if(result==kIOReturnSuccess && sweet_native_adreno_connect_vm(&native_ring))result=kIOReturnIOError;
+  board.mounted=result==kIOReturnSuccess;
+  IOLog("SWEET NATIVE ADRENO: A618 ring adopt status=%#x ready=%u; kernel-only, no renderer\n",result,board.mounted);
+  return board.mounted?0:EIO;
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp b/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp
+@@ -0,0 +1,168 @@
++/* SPDX-License-Identifier: MIT
++ * sweet/A618 live BO arena. Called before SQE release, under the boot GPU
++ * owner's lease. Never replaces an enabled CB0 or touches GMU CB1.
++ */
++#include <IOKit/IOLib.h>
++#include <sys/errno.h>
++#include "../../../bsd/dev/sweet_adreno_cp.h"
++#include "unixnu/NativeAdrenoVm.h"
++#include "unixnu/NativeAdrenoSubmit.h"
++
++namespace {
++constexpr unsigned PollBudget=100000, TableBytes=0x404000;
++constexpr uint64_t ArenaStart=0x40000000, ArenaBytes=0x80000000;
++struct BootVm {
++ NativeAdrenoMemory tables,firmware,ring,fence;
++ NativeAdrenoVm vm;
++ NativeAdrenoSubmit submit;
++ ArmSmmu4KLiveArena arena{};
++ ArmSmmu4KLiveState live{};
++ ArmSmmu4KLiveVisibility visibility{};
++ ArmSmmu4KContextConfig config{};
++ ArmSmmu4KStreamState streams{};
++ ArmSmmu4KIo io{};
++ a618_smmu_io hardware{};
++ uint64_t handles[3]{};
++ bool attempted=false,ready=false,connected=false;
++} state;
++int read32(void *,size_t offset,uint32_t *value)
++{
++ if(!value || (offset&3) || offset>0xfffc)return 1;
++ *value=state.hardware.registers.read(state.hardware.registers.cookie,(uint32_t)offset);
++ return *value==UINT32_MAX;
++}
++int read64(void *,size_t offset,uint64_t *value)
++{
++ if(!value || (offset&7) || offset>0xfff8)return 1;
++ *value=state.hardware.read64(state.hardware.registers.cookie,(uint32_t)offset);
++ return *value==UINT64_MAX;
++}
++int write32(void *,size_t offset,uint32_t value)
++{
++ /* Restrict the helper to its leased CB0 and one stream slot. The SMMU
++  * core does no global writes, and never accesses the GMU context bank. */
++ const unsigned slot=state.streams.streams[0].slot;
++ if((offset&3) || !((offset>=0x8000 && offset<=0x8ffc) || offset==0x1000 ||
++     offset==0x1800 || offset==0x800+4*slot || offset==0xc00+4*slot))return 1;
++ state.hardware.registers.write(state.hardware.registers.cookie,(uint32_t)offset,value);
++ return 0;
++}
++int write64(void *,size_t offset,uint64_t value)
++{
++ if((offset&7) || offset<0x8000 || offset>0x8ff8)return 1;
++ state.hardware.write64(state.hardware.registers.cookie,(uint32_t)offset,value);
++ return 0;
++}
++int barrier(void *)
++{state.hardware.barrier(state.hardware.registers.cookie);return 0;}
++int failed(const char *where,IOReturn error)
++{
++ /* All descriptor and VM storage is retained on an uncertain failure. There
++  * is no fallback that clears active tables or restarts an already-run SQE. */
++ IOLog("SWEET NATIVE VM: %s failed=%#x; all resources retained\n",where,error);
++ state.ready=false;return EIO;
++}
++int translate(uint64_t iova,uint64_t *physical)
++{
++ if(write64(nullptr,0x8800,iova) || barrier(nullptr))return EIO;
++ for(unsigned i=0;i<1000;++i) {
++  uint32_t status=0;
++  if(read32(nullptr,0x88f0,&status))return EIO;
++  if(!(status&1))return read64(nullptr,0x8050,physical)?EIO:0;
++  state.hardware.registers.delay_us(state.hardware.registers.cookie,1);
++ }
++ return ETIMEDOUT;
++}
++}
++extern "C" int sweet_native_adreno_prepare_vm(const a618_smmu_io *hardware,
++    const a618_dma_region *memory,a618_smmu_result *result)
++{
++ if(!hardware || !memory || !result || !hardware->registers.read || !hardware->registers.write ||
++    !hardware->registers.delay_us || !hardware->read64 || !hardware->write64 || !hardware->barrier ||
++    !memory->cpu || !memory->uncached || memory->bytes!=A618_CP_DMA_BYTES ||
++    (memory->physical&0x3fff) || memory->physical>=(UINT64_C(1)<<36) ||
++    memory->bytes>(UINT64_C(1)<<36)-memory->physical)return EINVAL;
++ if(state.attempted)return EBUSY;
++ state.attempted=true;state.hardware=*hardware;*result={};result->slot=UINT32_MAX;
++ state.io={nullptr,0x10000,read32,read64,write32,write64,barrier,1};
++ uint32_t id0=0,id1=0,id2=0,control=0,sctlr=0,fsr=0;
++ if(read32(nullptr,0x20,&id0) || read32(nullptr,0x24,&id1) || read32(nullptr,0x28,&id2) ||
++    read32(nullptr,0,&control) || read32(nullptr,0x8000,&sctlr) || read32(nullptr,0x8058,&fsr))return EIO;
++ if(fsr&(1u<<30))return EBUSY;
++ if(id0!=0x48016605 || id1!=0x20008005 || id2!=0x7511 || (sctlr&1))return ENOTSUP;
++ /* Claim only an invalid slot. An active SID0 or any live CB0 route is a
++  * foreign owner, regardless of its apparent idle state. */
++ unsigned slot=UINT32_MAX;
++ for(unsigned i=0;i<5;++i) {
++  uint32_t smr=0,s2cr=0;
++  if(read32(nullptr,0x800+4*i,&smr) || read32(nullptr,0xc00+4*i,&s2cr))return EIO;
++  if(smr&(1u<<31)) {
++   const uint32_t mask=(smr>>16)&0x7fff;
++   if(((smr&0xffff)&~mask)==0 || (!(s2cr&(3u<<16)) && !(s2cr&255)))return EBUSY;
++  } else if(slot==UINT32_MAX)slot=i;
++ }
++ if(slot==UINT32_MAX)return ENOSPC;
++ result->slot=slot;result->context=0;result->control=control;
++ /* The boot GMU owner has already established enable/fault-on-unmatched,
++  * with global IRQ disabled. Preserve that policy and every other route. */
++ if((control&0x407)!=0x402)return ENOTSUP;
++ state.streams.streams[0]={slot,0};
++ if(write32(nullptr,0xc00+4*slot,2u<<16) || barrier(nullptr))return EIO;
++ const ArmSmmu4KStream stream={slot,0};ArmSmmu4KStreamResult routes{};
++ ArmSmmu4KStatus status=ArmSmmu4KCheckFaultedStreams(&state.io,&stream,1,0,&routes);
++ if(status)return failed("route preflight",(IOReturn)status);
++ IOReturn error=state.tables.allocate(TableBytes,36,true,8u*1024u*1024u);
++ if(error)return failed("table allocation",error);
++ error=NativeAdrenoPrepareSmmuMemory(&state.tables,32,36,ArenaStart,ArenaBytes,0,
++     ArenaBytes/4096,&state.arena,&state.live,&state.visibility);
++ if(error)return failed("table preparation",error);
++ state.config={&state.arena.config,nullptr,&state.live.tables,nullptr,id0,id2,0x62,0,0,1,1};
++ ArmSmmu4KProgramResult programmed{};
++ status=ArmSmmu4KProgramDisabledContext(&state.io,0,&state.config,PollBudget,&programmed);
++ if(status)return failed("context programming",(IOReturn)status);
++ status=ArmSmmu4KAttachStreams(&state.io,&state.streams,&stream,1,0,&state.config,&routes);
++ if(status)return failed("stream attachment",(IOReturn)status);
++ NativeAdrenoVmRegion region={&state.tables,&state.arena,&state.live};
++ error=state.vm.attach(&state.io,&state.config,&state.streams,&region,nullptr,65536,PollBudget);
++ if(error)return failed("VM attachment",error);
++ NativeAdrenoMemory *objects[]={&state.firmware,&state.ring,&state.fence};
++ const unsigned offsets[]={A618_CP_SQE_OFFSET,A618_CP_RING_OFFSET,A618_CP_FENCE_OFFSET};
++ const unsigned sizes[]={0x8000,0x8000,0x4000};
++ const uint64_t addresses[]={A618_CP_IOVA,A618_CP_RING_IOVA,A618_CP_FENCE_IOVA};
++ for(unsigned i=0;i<3;++i) {
++  error=objects[i]->borrowBootStorage(memory->cpu+offsets[i],memory->physical+offsets[i],sizes[i],36);
++  if(!error)error=state.vm.map(objects[i],0,addresses[i],ArmSmmu4KRead|
++      (i?ArmSmmu4KWrite:ArmSmmu4KExecute),0,2,&state.handles[i]);
++  if(error)return failed("bootstrap mapping",error);
++ }
++ /* Prove real translations for the unchanged firmware/ring/fence IOVAs,
++  * including the immediately following unmapped guard, before SQE starts. */
++ for(unsigned i=0;i<=20;++i) {
++  uint64_t translated=0;
++  const int failure=translate(A618_CP_IOVA+4096ull*i,&translated);
++  result->par=translated;
++  if(failure)return failure;
++  if(i==20) {if(!(translated&1))return EFAULT;}
++  else {
++   const uint64_t expected=memory->physical+A618_CP_SQE_OFFSET+4096ull*i;
++   if((translated&1) || (translated&UINT64_C(0xffffff000))!=expected)return EFAULT;
++   ++result->translated;
++  }
++ }
++ if(read32(nullptr,0x8058,&result->fault) || (result->fault&0xc00001feu))return EIO;
++ result->offset=0x800+4*slot;
++ if(read32(nullptr,result->offset,&result->value))return EIO;
++ state.ready=true;
++ IOLog("SWEET NATIVE VM: CB0 active ASID62 4K GPU /16K host, aperture=%#llx+%#llx tablePA=%#llx pages=%lu bootstrap=%u\n",
++     ArenaStart,ArenaBytes,state.tables.spans()[0].physical,state.live.tables.table_pages,result->translated);
++ return 0;
++}
++extern "C" int sweet_native_adreno_connect_vm(NativeAdrenoRing *ring)
++{
++ if(!state.ready || state.connected || !ring)return ENXIO;
++ const IOReturn error=state.submit.attach(&state.vm,ring);
++ if(error)return failed("submit attachment",error);
++ state.connected=true;
++ IOLog("SWEET NATIVE VM: live BO/IB submission manager connected; frontend not published\n");
++ return 0;
++}
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetAdrenoDMA.cpp                              optional iokitcpp
++iokit/Kernel/arm/SweetNativeAdrenoVM.cpp                          optional iokitcpp
+ iokit/Kernel/arm/SweetNativeAdreno.cpp                            optional iokitcpp
+ iokit/Kernel/arm/unixnu/NativeAdrenoRing.cpp                       optional iokitcpp
+ iokit/Kernel/arm/unixnu/AdrenoPM4.cpp                              optional iokitcpp

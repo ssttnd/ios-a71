@@ -1,0 +1,43 @@
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+index a40c87f..aed4efa 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -17,6 +17,8 @@
+ #include "unixnu/NativeAdrenoUserClient.h"
+ extern "C" void proc_selfname(char *,int);
+ extern "C" volatile uint32_t native_adreno_wc_enabled;
++extern "C" volatile uint32_t native_adreno_wc_audit[6];
++extern "C" volatile uint32_t native_adreno_wc_distrusted;
+ extern "C" uint64_t native_adreno_publish_stats[3];
+ extern "C" volatile uint32_t native_adreno_import_sync;
+ extern "C" void sweet_native_adreno_fault_report(const char *why);
+@@ -313,8 +315,10 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
+    const uint64_t bytes=__atomic_exchange_n(&native_adreno_publish_stats[1],0,__ATOMIC_RELAXED);
+    const uint64_t objects=__atomic_exchange_n(&native_adreno_publish_stats[2],0,__ATOMIC_RELAXED);
+    uint64_t publish_ns=0;absolutetime_to_nanoseconds(ticks,&publish_ns);
+-   IOLog("SWEET RENDER: legacy submits %u avg_us=%llu max_us=%llu avg_in_flight_x100=%llu busy=%u drain=%d publish_avg_us=%llu publish_avg_kib=%llu publish_avg_objects=%llu\n",submits,
+-     window_us/120,max_us,in_flight*100/120,busy,drains,publish_ns/1000/120,bytes/1024/120,objects/120);
++   IOLog("SWEET RENDER: legacy submits %u avg_us=%llu max_us=%llu avg_in_flight_x100=%llu busy=%u drain=%d publish_avg_us=%llu publish_avg_kib=%llu publish_avg_objects=%llu wc_audits=%u dirty=%u stale=%u fail=%#x reasserted=%u distrusted_at=%u\n",submits,
++     window_us/120,max_us,in_flight*100/120,busy,drains,publish_ns/1000/120,bytes/1024/120,objects/120,
++     native_adreno_wc_audit[0],native_adreno_wc_audit[2],native_adreno_wc_audit[3],native_adreno_wc_audit[4],
++     native_adreno_wc_audit[5],native_adreno_wc_distrusted);
+    window_us=max_us=in_flight=0;busy=0;
+   }
+  }
+@@ -377,7 +381,15 @@ extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit
+  backend.clock=*clock;backend.health=health;backend.info=*info;
+  const NativeAdrenoTimeIo timerIo={nullptr,read};
+  if(backend.timer.attach(&timerIo,NativeAdrenoTimeCp)!=kIOReturnSuccess || !healthy())return 1;
+- native_adreno_wc_enabled=0; // explicit cache maintenance until page modes are qualified
++ /* Turnip maps every owned BO kIOMapWriteCombineCache, so CPU writes never sit
++  * dirty in a cache; the owned pages are made write-combined to match (the
++  * UniXNU/Sunfish contract). The per-submit IB audit stays armed and on any
++  * dirty line distrusts WC for the rest of the boot (full maintenance again).
++  * 0130 hardware: with WC off the full-VM publish of owned BOs alone grew to
++  * 5.6ms/80MiB per submit. sweetwc=0 restores cacheable owned BOs. */
++ int wc=1;PE_parse_boot_argn("sweetwc",&wc,sizeof(wc));
++ native_adreno_wc_enabled=wc!=0;
++ IOLog("SWEET RENDER: owned BOs %s (sweetwc=%d)\n",wc?"write-combined, IB audit armed":"cacheable with full maintenance",wc);
+  auto provider=new AGXAccelerator;
+  if(!provider || !provider->init() || !provider->attach(IOService::getPlatform())) {
+   if(provider)provider->release();return 1;

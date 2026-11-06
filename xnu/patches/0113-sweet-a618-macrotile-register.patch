@@ -1,0 +1,23 @@
+--- a/iokit/Kernel/arm/SweetNativeAdrenoRender.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoRender.cpp
+@@ -23,13 +23,18 @@
+   {0x9e00,0x00180000,0x00180000},
+   /* UBWC2: bank14 (hbb_lo1), min32B, four channels, levels2+3 swizzle. */
+   {0x8e08,2,0xffffffff}, {0xb604,2,0xffffffff}, {0xae02,2,0xffffffff},
+-  {0x0e01,1u<<21,(1u<<23)|(3u<<21)}, {0x0534,0,1}, {0x0e19,0x81,0x81},
++  {0x0e01,1u<<21,(1u<<23)|(3u<<21)}, {0x0e19,0x81,0x81},
++  /* A618 has no eight-channel macrotiling override. Downstream a6xx_start
++   * accesses RBBM_NC_MODE_CNTL only for channel==8. Preserve its reset
++   * setting here; 0112 hardware reads 0xdeafbead from 0x534. */
+  };
+  for(const auto &entry:setup) {
+   core[entry.reg]=entry.value;
+   __asm__ volatile("dsb sy":::"memory");
+   const uint32_t value=core[entry.reg];
+-  if(value==UINT32_MAX && entry.value!=UINT32_MAX)return 1;
++  if(value==0xdeafbead || (value==UINT32_MAX && entry.value!=UINT32_MAX)) {
++   IOLog("SWEET RENDER: invalid readback reg=%#x value=%#x\n",entry.reg,value);return 1;
++  }
+   if((value&entry.mask)!=(entry.value&entry.mask)) {
+    IOLog("SWEET RENDER: reg=%#x expected=%#x read=%#x\n",entry.reg,entry.value,value);return 1;
+   }

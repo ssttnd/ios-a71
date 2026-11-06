@@ -1,0 +1,770 @@
+diff --git a/bsd/dev/sweet_adreno_cp.c b/bsd/dev/sweet_adreno_cp.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_adreno_cp.c
+@@ -0,0 +1,254 @@
++/* SPDX-License-Identifier: MIT
++ * Bounded kernel-only A618 SQE/CP bring-up from pinned public PM4/register
++ * protocols. No userspace PM4, scheduling, 3D context or graphics advertising.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(KERNEL)
++#include <sys/errno.h>
++#else
++#include <errno.h>
++#endif
++#include "sweet_adreno_cp.h"
++#define CP_RB_BASE 0x2000u
++#define CP_RB_CNTL 0x2008u
++#define CP_RB_RPTR 0x2018u
++#define CP_RB_WPTR 0x201cu
++#define CP_SQE_CNTL 0x2020u
++#define CP_SQE_INSTR_BASE 0x20c0u
++#define CP_ADDR_MODE_CNTL 0x2108u
++#define CP_ROQ_THRESHOLDS_1 0x2304u
++#define CP_ROQ_THRESHOLDS_2 0x2308u
++#define CP_MEM_POOL_SIZE 0x230cu
++#define CP_AHB_CNTL 0x2634u
++#define CP_PROTECT_CNTL 0x213cu
++#define RBBM_STATUS 0x840u
++#define RBBM_INT_0_STATUS 0x804u
++#define RBBM_INT_0_MASK 0xe0u
++#define CP_HW_FAULT 0x2084u
++#define UCHE_FILTER_CNTL 0x3860u
++#define UCHE_CACHE_WAYS 0x385cu
++#define UCHE_WRITE_RANGE_MAX 0x3814u
++#define UCHE_TRAP_BASE 0x3824u
++#define UCHE_WRITE_THRU_BASE 0x381cu
++#define GMU_HOST_SET 0x14650u
++#define GMU_HOST_INFO 0x14648u
++#define GMU_HOST_CLEAR 0x14644u
++#define CP_IRQ_FAULT ((1u << 1) | (1u << 9) | (1u << 23))
++static int
++valid_io(const struct a618_io *io)
++{
++ return io && io->read && io->write && io->delay_us;
++}
++static void
++write_address(const struct a618_io *io, unsigned offset, uint64_t address)
++{
++ io->write(io->cookie, offset, (uint32_t)address);
++ io->write(io->cookie, offset + 4, (uint32_t)(address >> 32));
++}
++static unsigned
++odd_parity(uint32_t value)
++{
++ value ^= value >> 16; value ^= value >> 8; value ^= value >> 4;
++ value &= 15;
++ return 1 ^ ((0x6996 >> value) & 1);
++}
++static uint32_t
++packet7(unsigned opcode, unsigned count)
++{
++ return 0x70000000u | count | (odd_parity(count) << 15) |
++     (opcode << 16) | (odd_parity(opcode) << 23);
++}
++static int
++cp_fault(const struct a618_io *gpu, const struct a618_io *gmu,
++ struct a618_cp_result *result)
++{
++ result->interrupt = gpu->read(gpu->cookie, RBBM_INT_0_STATUS);
++ result->hw_fault = gpu->read(gpu->cookie, CP_HW_FAULT);
++ uint32_t info = gmu->read(gmu->cookie, GMU_HOST_INFO);
++ return result->interrupt == 0xffffffffu || result->hw_fault == 0xffffffffu ||
++     (result->interrupt & CP_IRQ_FAULT) || result->hw_fault ||
++     info == 0xffffffffu || (info & (1u << 23));
++}
++static int
++publish(const struct a618_io *gpu, const struct a618_io *gmu,
++ const struct a618_dma_region *memory, const uint32_t *words, unsigned count,
++ void (*barrier)(void *), void *cookie, struct a618_cp_result *result)
++{
++ if (result->poisoned || !count || count >= 8192) return EINVAL;
++ result->rptr = gpu->read(gpu->cookie, CP_RB_RPTR);
++ if (result->rptr >= 8192 || result->wptr >= 8192) return EIO;
++ unsigned available = (result->rptr + 8192 - result->wptr - 1) % 8192;
++ if (count > available) return ENOSPC;
++ volatile uint32_t *ring = (volatile uint32_t *)(memory->cpu + A618_CP_RING_OFFSET);
++ for (unsigned i = 0; i < count; ++i) ring[(result->wptr + i) % 8192] = words[i];
++ barrier(cookie);
++ result->wptr = (result->wptr + count) % 8192;
++ gpu->write(gpu->cookie, CP_RB_WPTR, result->wptr);
++ result->submitted += count;
++ /* GMU may drop a GX write when its fence is closed: bounded retry, not a
++  * read of CP_WPTR as an assumed proof of command execution. */
++ for (unsigned us = 0; us < 1000; us += 10) {
++  uint32_t fence = gmu->read(gmu->cookie, A618_GMU_AHB_FENCE_STATUS);
++  if (fence == 0xffffffffu) goto failed;
++  if (!(fence & 1)) break;
++  if (us == 990) goto failed;
++  gmu->delay_us(gmu->cookie, 10);
++  gpu->write(gpu->cookie, CP_RB_WPTR, result->wptr);
++ }
++ for (unsigned us = 0; us < 10000; us += 10) {
++  if (cp_fault(gpu, gmu, result)) goto failed;
++  result->rptr = gpu->read(gpu->cookie, CP_RB_RPTR);
++  result->status = gpu->read(gpu->cookie, RBBM_STATUS);
++  if (result->rptr == result->wptr && !(result->status & ~1u)) {
++   result->completed += count; return 0;
++  }
++  gpu->delay_us(gpu->cookie, 10);
++ }
++ result->poisoned = 1;
++ return ETIMEDOUT;
++failed:
++ result->poisoned = 1;
++ return EIO;
++}
++int
++a618_cp_start(const struct a618_io *gpu, const struct a618_io *gmu,
++ const struct a618_dma_region *memory, const unsigned char *firmware,
++ unsigned bytes, void (*barrier)(void *), void *cookie,
++ struct a618_cp_result *result)
++{
++ if (!valid_io(gpu) || !valid_io(gmu) || !memory || !memory->cpu ||
++     memory->bytes != A618_CP_DMA_BYTES || !memory->uncached || !firmware ||
++     bytes != 32136 || !barrier || !result) return EINVAL;
++ *result = (struct a618_cp_result){0};
++ /* Firmware version excludes the container DWORD. Require patched A630 SQE
++  * at least as new as the pinned Linux driver requires for WHERE_AM_I. */
++ uint32_t version = 0, patch = 0;
++ for (unsigned i = 0; i < 4; ++i) {
++  version |= (uint32_t)firmware[4 + i] << (i * 8);
++  patch |= (uint32_t)firmware[12 + i] << (i * 8);
++ }
++ if (!(((version & 15) == 10 && (patch & 15) >= 1) ||
++     (version & 0xfff) >= 0x190)) return ENOTSUP;
++ volatile uint32_t *sqe = (volatile uint32_t *)(memory->cpu + A618_CP_SQE_OFFSET);
++ for (unsigned i = 0; i < (bytes - 4) / 4; ++i) {
++  uint32_t word = 0;
++  for (unsigned b = 0; b < 4; ++b) word |= (uint32_t)firmware[4 + i * 4 + b] << (8 * b);
++  sqe[i] = word;
++ }
++ barrier(cookie);
++ result->phase = 1;
++ /* GX access is permitted only after the firmware acknowledges GPU_SET. */
++ gmu->write(gmu->cookie, GMU_HOST_SET, 1u << 16);
++ unsigned us;
++ for (us = 0; us < 10000; us += 10) {
++  uint32_t info = gmu->read(gmu->cookie, GMU_HOST_INFO);
++  if (info == 0xffffffffu || (info & (1u << 23))) goto failed;
++  if (info & (1u << 24)) break;
++  gmu->delay_us(gmu->cookie, 10);
++ }
++ if (us == 10000) { result->poisoned = 1; return ETIMEDOUT; }
++ gmu->write(gmu->cookie, GMU_HOST_CLEAR, 1u << 24);
++ result->phase = 2;
++ /* Fresh engine only. Never overwrite an already running command processor. */
++ if (gpu->read(gpu->cookie, CP_RB_RPTR) || gpu->read(gpu->cookie, CP_RB_WPTR))
++  goto failed;
++ gpu->write(gpu->cookie, 0xf114, 0);
++ (void)gpu->read(gpu->cookie, 0xf114);
++ gpu->write(gpu->cookie, 0x58, 0);
++ (void)gpu->read(gpu->cookie, 0x58);
++ gpu->write(gpu->cookie, 0x3800, 1);
++ gpu->write(gpu->cookie, RBBM_INT_0_MASK, 0); /* no unhandled host IRQ */
++ gpu->write(gpu->cookie, CP_SQE_CNTL, 3);
++ gpu->write(gpu->cookie, CP_ADDR_MODE_CNTL, 1);
++ gpu->write(gpu->cookie, CP_ROQ_THRESHOLDS_2, 0x010000c0);
++ gpu->write(gpu->cookie, CP_ROQ_THRESHOLDS_1, 0x8040362c);
++ gpu->write(gpu->cookie, CP_MEM_POOL_SIZE, 128);
++ gpu->write(gpu->cookie, CP_AHB_CNTL, 1);
++ gpu->write(gpu->cookie, UCHE_FILTER_CNTL, 0x804);
++ gpu->write(gpu->cookie, UCHE_CACHE_WAYS, 4);
++ write_address(gpu, UCHE_WRITE_RANGE_MAX, 0x1ffffffffffc0ull);
++ write_address(gpu, UCHE_TRAP_BASE, 0x1fffffffff000ull);
++ write_address(gpu, UCHE_WRITE_THRU_BASE, 0x1fffffffff000ull);
++ /* Hardware protections remain enabled; only kernel-built PM4 is submitted. */
++ static const uint32_t protect[32] = {
++  0x13fc0000,
++  0x00140501,
++  0x0bd0050b,
++  0x8000050e,
++  0x80000510,
++  0x80000534,
++  0x82080800,
++  0x802008a0,
++  0x809008ab,
++  0x02b808de,
++  0x81340900,
++  0x89c8098d,
++  0x80040e00,
++  0x80300e03,
++  0x830c3c00,
++  0x7ffc3cc4,
++  0x873c8630,
++  0x80008e00,
++  0x80008e08,
++  0x807c8e50,
++  0x876c9624,
++  0x80049e70,
++  0x861c9e78,
++  0x873ca630,
++  0x8000ae02,
++  0x8cbcae50,
++  0x8000b604,
++  0x8004be02,
++  0xdf7cbe20,
++  0xaffcf000,
++  0x7ffcfc00,
++  0x80011c00,
++ };
++ for (unsigned i = 0; i < 32; ++i) gpu->write(gpu->cookie, (0x850 + i) * 4, protect[i]);
++ gpu->write(gpu->cookie, CP_PROTECT_CNTL, 0xb);
++ write_address(gpu, CP_SQE_INSTR_BASE, A618_CP_IOVA);
++ write_address(gpu, CP_RB_BASE, A618_CP_RING_IOVA);
++ gpu->write(gpu->cookie, CP_RB_CNTL, (1u << 27) | (2u << 8) | 12u);
++ gpu->write(gpu->cookie, CP_SQE_CNTL, 1);
++ uint32_t init[] = {packet7(0x48, 8), 0x2f, 3, 0x20000000, 0, 0, 0, 0, 0};
++ int error = publish(gpu, gmu, memory, init, 9, barrier, cookie, result);
++ if (error) return error;
++ result->phase = 3; /* SQE consumed ME_INIT; secure transition still required. */
++ return 0;
++failed:
++ result->poisoned = 1;
++ return EIO;
++}
++int
++a618_cp_leave_secure(const struct a618_io *gpu, const struct a618_io *gmu,
++ const struct a618_dma_region *memory, void (*barrier)(void *), void *cookie,
++ struct a618_cp_result *result)
++{
++ if (!valid_io(gpu) || !valid_io(gmu) || !memory || !memory->cpu || !barrier ||
++     !result || result->phase != 3 || result->poisoned) return EINVAL;
++ uint32_t secure[] = {packet7(0x66, 1), 0};
++ result->phase = 4;
++ int error = publish(gpu, gmu, memory, secure, 2, barrier, cookie, result);
++ if (error) return error;
++ volatile uint32_t *fence = (volatile uint32_t *)(memory->cpu + A618_CP_FENCE_OFFSET);
++ fence[0] = fence[1] = 0;
++ barrier(cookie);
++ uint32_t words[9];
++ struct a618_commands commands = {words, 9, 0};
++ error = a618_emit_memory_write(&commands, A618_CP_FENCE_IOVA + 4, 0x0618c0de);
++ if (!error) error = a618_emit_fence(&commands, A618_CP_FENCE_IOVA, 1);
++ if (error) return error;
++ result->phase = 5;
++ error = publish(gpu, gmu, memory, words, commands.used, barrier, cookie, result);
++ if (error) return error;
++ barrier(cookie);
++ result->fence = fence[0]; result->value = fence[1];
++ if (result->fence != 1 || result->value != 0x0618c0de) {
++  result->poisoned = 1; return EIO;
++ }
++ result->phase = 6;
++ /* Keep GPU_SET held: fault recovery and runtime power management are not
++  * implemented. No iOS accelerator is registered by a self-test completion. */
++ return 0;
++}
++#endif
+diff --git a/bsd/dev/sweet_adreno_cp.h b/bsd/dev/sweet_adreno_cp.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_adreno_cp.h
+@@ -0,0 +1,42 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef SWEET_ADRENO_CP_H
++#define SWEET_ADRENO_CP_H
++#include "sweet_adreno_dma.h"
++#define A618_CP_DMA_BYTES 0x18000u
++#define A618_CP_SQE_OFFSET 0x4000u
++#define A618_CP_RING_OFFSET 0xc000u
++#define A618_CP_FENCE_OFFSET 0x14000u
++#define A618_CP_IOVA 0x70000000u
++#define A618_CP_RING_IOVA (A618_CP_IOVA + 0x8000u)
++#define A618_CP_FENCE_IOVA (A618_CP_IOVA + 0x10000u)
++#ifdef __cplusplus
++extern "C" {
++#endif
++int sweet_adreno_cp_allocate(struct a618_dma_region *);
++int sweet_adreno_pas_allocate(struct a618_dma_region *);
++int a618_smmu_prepare_cp(const struct a618_smmu_io *,
++ const struct a618_dma_region *, struct a618_smmu_result *);
++struct a618_cp_result {
++ unsigned phase, submitted, completed;
++ uint32_t rptr, wptr, status, interrupt, hw_fault, fence, value;
++ int poisoned;
++};
++/* Trusted kernel commands only. The caller verified SQE blob CRC, GPU stream
++ * mappings, GMU/HFI completion and live clocks/rails. Failure retains OOB and
++ * wired memory; no speculative reset/powerdown or retry. No userspace PM4. */
++int a618_cp_start(const struct a618_io *, const struct a618_io *,
++ const struct a618_dma_region *, const unsigned char *, unsigned,
++ void (*)(void *), void *, struct a618_cp_result *);
++struct a618_pas_result { unsigned phase; int64_t status; uint64_t response; };
++/* Signed device ZAP only, live reserved range must match the device DT.
++ * Metadata lives in its own permanently retained, cache-inhibited host page.
++ * No security-register fallback if firmware authorization fails. */
++int a618_zap_authenticate(volatile uint32_t *, uint64_t,
++ const struct a618_dma_region *, const unsigned char *, unsigned,
++ const unsigned char *, unsigned, struct a618_pas_result *);
++int a618_cp_leave_secure(const struct a618_io *, const struct a618_io *,
++ const struct a618_dma_region *, void (*)(void *), void *, struct a618_cp_result *);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/bsd/dev/sweet_adreno_cp_smmu.c b/bsd/dev/sweet_adreno_cp_smmu.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_adreno_cp_smmu.c
+@@ -0,0 +1,156 @@
++/* SPDX-License-Identifier: MIT
++ * Original bounded SMMUv2 backend using the ARM architecture and public
++ * Linux/Qualcomm register protocols. See docs/adreno-port.md for source pins.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(KERNEL)
++#include <sys/errno.h>
++#else
++#include <errno.h>
++#endif
++#include "sweet_adreno_cp.h"
++#define CP_CB 0x8000u
++#define ASID 0x62u
++/* FSR.Format[10:9] is read-only metadata, not a W1C fault. */
++#define FSR_FAULT 0xc00001feu
++static int
++put(const struct a618_io *io, uint32_t offset, uint32_t value,
++ uint32_t mask, struct a618_smmu_result *r)
++{
++ io->write(io->cookie, offset, value);
++ r->offset = offset; r->value = io->read(io->cookie, offset);
++ return r->value != 0xffffffffu && (r->value & mask) == (value & mask) ? 0 : EIO;
++}
++static int
++wait_clear(const struct a618_io *io, uint32_t offset, unsigned mask,
++ struct a618_smmu_result *r)
++{
++ for (unsigned i = 0; i < 500; ++i) {
++  r->offset = offset; r->value = io->read(io->cookie, offset);
++  if (r->value == 0xffffffffu) return EIO;
++  if (!(r->value & mask)) return 0;
++  io->delay_us(io->cookie, 1);
++ }
++ return ETIMEDOUT;
++}
++int
++a618_smmu_prepare_cp(const struct a618_smmu_io *ops,
++ const struct a618_dma_region *memory, struct a618_smmu_result *r)
++{
++ if (!ops || !memory || !r || !ops->registers.read ||
++     !ops->registers.write || !ops->registers.delay_us ||
++     !ops->read64 || !ops->write64 || !ops->barrier || !memory->cpu ||
++     !memory->uncached || memory->bytes != A618_CP_DMA_BYTES ||
++     (memory->physical & 0x3fff) || !memory->physical ||
++     memory->physical > (1ull << 36) - A618_CP_DMA_BYTES ||
++     ((uintptr_t)memory->cpu & 7)) return EINVAL;
++ const struct a618_io *io = &ops->registers;
++ *r = (struct a618_smmu_result){ .context = 0, .slot = 0xffffffffu };
++ /* Measured 0091 profile: 4 KiB register pages, 0x8000 CB base, five
++  * stream match slots and context banks, 36-bit PA. 16K PT granules are
++  * intentionally not used (Qualcomm advertises broken 16K support).
++  */
++ const uint32_t identity[] = {0x48016605, 0x20008005, 0x7511};
++ for (unsigned i = 0; i < 3; ++i) {
++  r->offset = 0x20 + 4 * i; r->value = io->read(io->cookie, r->offset);
++  if (r->value != identity[i]) return ENOTSUP;
++ }
++ /* Do not steal an active bank or matching stream, even if its firmware
++  * owner appears idle. CB1 and protected banks are left alone.
++  */
++ r->offset = CP_CB; r->value = io->read(io->cookie, CP_CB);
++ if (r->value == 0xffffffffu) return EIO;
++ if (r->value & 1) return EBUSY; /* M=0 is disabled; other reset bits may be UNKNOWN. */
++ for (unsigned i = 0; i < 5; ++i) {
++  r->offset = 0x800 + 4 * i;
++  uint32_t smr = r->value = io->read(io->cookie, r->offset);
++  if (smr == 0xffffffffu) return EIO;
++  if (!(smr & 0x80000000u)) {
++   if (r->slot == 0xffffffffu) r->slot = i;
++  } else if (((smr ^ 0u) & ~((smr >> 16) & 0x7fffu) & 0xffffu) == 0) {
++   r->slot = i; return EBUSY;
++  }
++ }
++ if (r->slot == 0xffffffffu) return ENOSPC;
++ r->control = io->read(io->cookie, 0);
++ if (r->control == 0xffffffffu) return EIO;
++ /* Three 4K tables inside one host page: L1[1] -> L2[384] ->
++  * L3[0..19] at 0x70000000. SQE pages are RO/executable; ring/fence
++  * pages RW/NX. Tables are inaccessible to the GPU. Normal NC/OSH.
++  */
++ volatile uint64_t *l1 = (volatile uint64_t *)memory->cpu;
++ volatile uint64_t *l2 = (volatile uint64_t *)(memory->cpu + 0x1000);
++ volatile uint64_t *l3 = (volatile uint64_t *)(memory->cpu + 0x2000);
++ for (unsigned i = 0; i < 512; ++i) l1[i] = l2[i] = l3[i] = 0;
++ l1[1] = (memory->physical + 0x1000) | 3;
++ l2[384] = (memory->physical + 0x2000) | 3;
++ for (unsigned i = 0; i < 20; ++i)
++  l3[i] = (memory->physical + A618_TABLE_BYTES + 0x1000 * i) |
++      (i < 8 ? 0 : (3ull << 53)) | (1u << 11) | (1u << 10) |
++      (2u << 8) | ((i < 8 ? 3u : 1u) << 6) | 3;
++ ops->barrier(io->cookie);
++ int error;
++ #define SET(o,v,m) do { error = put(io, (o), (v), (m), r); if (error) return error; } while (0)
++ SET(0x1800, 1, 1); /* GR1 CBA2R(1): AArch64. */
++ SET(0x1000, 0x1f300, 0x3f3ff); /* Stage1, stage2 bypass, weak upstream attributes. */
++ SET(CP_CB + 0x10, 0x38011, 0x38077); /* TCR2: SEP upstream, 36-bit output, AArch64 ASID. */
++ SET(CP_CB + 0x30, 0x00802020u, 0x00c0ffbfu); /* EPD1, OSH, NC walks, T0SZ=32; AArch64, no EAE. */
++ uint64_t ttbr = memory->physical | ((uint64_t)ASID << 48);
++ ops->write64(io->cookie, CP_CB + 0x20, ttbr);
++ r->offset = CP_CB + 0x20;
++ r->par = ops->read64(io->cookie, r->offset);
++ if ((r->par & 0xffff000ffffff000ull) != ttbr) return EIO;
++ ops->write64(io->cookie, CP_CB + 0x28, 0);
++ SET(CP_CB + 0x38, 0x44, 0xff); /* MAIR[0]: Normal NC. */
++ /* MAIR1 is unused: every data PTE references MAIR0[0]. */
++ /* Fault reporting enabled, IRQ/stalling disabled until an IRQ handler
++  * exists; HUPCF continues other transactions after an abort.
++  */
++ /* AFE/TRE are UNK/SBOP for long descriptors: write ones, do not
++  * compare their readback. Check M, E, fault controls, WXN and ASIDPNE.
++  */
++ SET(CP_CB, 0x1127, 0x17f1);
++ /* Block unmatched streams and enable this device. Preserve other controls;
++  * do not enable interrupt sources without handlers. No reset-all/TLBI-all.
++  */
++ SET(0, (r->control | 0x1c12u) & ~0xe025u, 0xfc37);
++ io->write(io->cookie, CP_CB + 0x610, ASID);
++ io->write(io->cookie, CP_CB + 0x7f0, 0);
++ error = wait_clear(io, CP_CB + 0x7f4, 1, r);
++ if (error) return error;
++ /* Hardware translation probes, not a software table walk: all twenty pages
++  * plus a guard fault must match before the stream is published.
++  */
++ for (unsigned i = 0; i <= 20; ++i) {
++  uint64_t va = (uint64_t)A618_CP_IOVA + i * 0x1000u;
++  ops->write64(io->cookie, CP_CB + 0x800, va);
++  error = wait_clear(io, CP_CB + 0x8f0, 1, r);
++  if (error) return error;
++  r->par = ops->read64(io->cookie, CP_CB + 0x50);
++  if (r->par == 0xffffffffffffffffull) return EIO;
++  if (i == 20) {
++   if (!(r->par & 1)) return EFAULT;
++  } else {
++   uint64_t expected = memory->physical + A618_TABLE_BYTES + i * 0x1000u;
++   if ((r->par & 1) || (r->par & 0x0000000ffffff000ull) != expected)
++    return EFAULT;
++   ++r->translated;
++  }
++ }
++ r->fault = io->read(io->cookie, CP_CB + 0x58);
++ if (r->fault == 0xffffffffu) return EIO;
++ if (r->fault & (1u << 30)) return EBUSY; /* Never resume an unknown stall. */
++ if (r->fault & FSR_FAULT) {
++  io->write(io->cookie, CP_CB + 0x58, r->fault & (FSR_FAULT & ~(1u << 30)));
++  uint32_t after = io->read(io->cookie, CP_CB + 0x58);
++  if (after == 0xffffffffu || (after & FSR_FAULT)) return EIO;
++ }
++ /* Only exact GPU stream 0, route first and VALID last. CP_CB/stream5
++  * remain owned by the running GMU. No user stream or bypass entry. */
++ SET(0xc00 + 4 * r->slot, 0, 0x030300ff);
++ SET(0x800 + 4 * r->slot, 0x80000000u, 0xffffffffu);
++ r->fault = io->read(io->cookie, CP_CB + 0x58);
++ #undef SET
++ return r->fault == 0xffffffffu || (r->fault & FSR_FAULT) ? EIO : 0;
++}
++#endif
+diff --git a/bsd/dev/sweet_adreno_pas.c b/bsd/dev/sweet_adreno_pas.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_adreno_pas.c
+@@ -0,0 +1,95 @@
++/* SPDX-License-Identifier: MIT
++ * Restricted SM7150 signed-ZAP PAS transport (public Qualcomm SCM protocol).
++ * No generic SCM entry point, memory-assignment or security-register bypass.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include "sweet_adreno_cp.h"
++static uint32_t
++le32(const unsigned char *p)
++{
++ return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++     ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++static int
++scm(unsigned service, unsigned command, uint64_t arguments,
++ uint64_t arg0, uint64_t arg1, uint64_t arg2, struct a618_pas_result *result)
++{
++ uint64_t function = 0x42000000u | (service << 8) | command;
++ for (unsigned busy = 0; busy < 5; ++busy) {
++  uint64_t resume = function, quirk_a6 = 0;
++  for (unsigned interrupted = 0; interrupted < 32; ++interrupted) {
++   register uint64_t x0 __asm__("x0") = resume;
++   register uint64_t x1 __asm__("x1") = arguments;
++   register uint64_t x2 __asm__("x2") = arg0;
++   register uint64_t x3 __asm__("x3") = arg1;
++   register uint64_t x4 __asm__("x4") = arg2;
++   register uint64_t x5 __asm__("x5") = 0;
++   register uint64_t x6 __asm__("x6") = quirk_a6;
++   register uint64_t x7 __asm__("x7") = 0;
++   __asm__ volatile("dsb sy\n\tsmc #0\n\tdsb sy" :
++       "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3),
++       "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7) : :
++       "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
++       "x16", "x17", "memory", "cc");
++   result->status = (int64_t)x0;
++   result->response = x1;
++   if (x0 == 1) { resume = 1; quirk_a6 = x6; continue; }
++   if ((int64_t)x0 == -12) break; /* bounded busy retry */
++   if (x0) return x0 == (uint64_t)-1 ? ENOTSUP : EIO;
++   return 0;
++  }
++  if (result->status != -12) return ETIMEDOUT;
++  if (busy != 4) delay(30000);
++ }
++ return EBUSY;
++}
++int
++a618_zap_authenticate(volatile uint32_t *reserved, uint64_t physical,
++ const struct a618_dma_region *metadata, const unsigned char *mdt,
++ unsigned mdt_bytes, const unsigned char *code, unsigned code_bytes,
++ struct a618_pas_result *result)
++{
++ if (!result) return EINVAL;
++ *result = (struct a618_pas_result){0};
++ if (!reserved || physical != 0x97f15000ull || !metadata || !metadata->cpu ||
++     metadata->bytes != 0x4000 || !metadata->uncached ||
++     !metadata->physical || (metadata->physical & 0x3fff) ||
++     metadata->physical >= (1ull << 36) || !mdt || !code ||
++     mdt_bytes != 0x1acc || code_bytes != 0x7c0 ||
++     le32(mdt) != 0x464c457f || mdt[4] != 1 || mdt[5] != 1 ||
++     le32(mdt + 28) != 52 || (le32(mdt + 44) & 0xffff) != 3 || le32(mdt + 40) != 0x00200034 ||
++     le32(mdt + 52 + 2 * 32) != 1 ||
++     le32(mdt + 52 + 2 * 32 + 12) != 0x5000 ||
++     le32(mdt + 52 + 2 * 32 + 16) != code_bytes ||
++     le32(mdt + 52 + 2 * 32 + 20) != code_bytes ||
++     le32(mdt + 52 + 2 * 32 + 24) != 0x08000007) return EINVAL;
++ result->phase = 1;
++ const unsigned commands[] = {1, 2, 5};
++ for (unsigned i = 0; i < 3; ++i) {
++  int error = scm(6, 1, 1, 0x02000200u | commands[i], 0, 0, result);
++  if (error) return error;
++  if (!result->response) return ENOTSUP;
++ }
++ volatile uint32_t *words = (volatile uint32_t *)metadata->cpu;
++ for (unsigned i = 0; i < mdt_bytes / 4; ++i) words[i] = le32(mdt + i * 4);
++ __asm__ volatile("dsb sy" ::: "memory");
++ result->phase = 2;
++ int error = scm(2, 1, 0x82, 13, metadata->physical, 0, result);
++ if (error || result->response) return error ? error : EACCES;
++ /* TZ may now protect metadata. Retain its separate page and do not read,
++  * modify, free or reuse it, including on errors below. */
++ result->phase = 3;
++ error = scm(2, 2, 3, 13, physical, 0x1000, result);
++ if (error || result->response) return error ? error : EACCES;
++ for (unsigned i = 0; i < 0x1000 / 4; ++i) reserved[i] = 0;
++ for (unsigned i = 0; i < code_bytes / 4; ++i) reserved[i] = le32(code + i * 4);
++ __asm__ volatile("dsb sy" ::: "memory");
++ result->phase = 4;
++ error = scm(2, 5, 1, 13, 0, 0, result);
++ if (error || result->response) return error ? error : EACCES;
++ result->phase = 5;
++ return 0;
++}
++#endif
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -13,7 +13,7 @@
+ #include <sys/param.h>
+ #include <sys/errno.h>
+ #include "sweet_adreno.h"
+-#include "sweet_adreno_dma.h"
++#include "sweet_adreno_cp.h"
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+@@ -173,6 +173,95 @@
+ 	printf("SWEET ADRENO: CX result errno=%d control=%#x status=%#x waited_us=%u\n",
+ 	    error, result.control, result.status, result.waited_us);
+ 	return error;
++}
++
++static uint32_t
++sweet_gpu_crc(const unsigned char *bytes, unsigned length)
++{
++ uint32_t crc = 0xffffffffu;
++ for (unsigned i = 0; i < length; ++i) {
++  crc ^= bytes[i];
++  for (unsigned b = 0; b < 8; ++b) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1)));
++ }
++ return ~crc;
++}
++static int
++sweet_gpu_blob(DTEntry node, const char *name, const char *crc_name,
++ const unsigned char **bytes, unsigned *length)
++{
++ const uint32_t *crc;
++ unsigned size = 0;
++ if (SecureDTGetProperty(node, name, (const void **)bytes, length) != kSuccess ||
++     SecureDTGetProperty(node, crc_name, (const void **)&crc, &size) != kSuccess ||
++     size != 4 || *length > 0x8000 || !*length) return ENOENT;
++ return sweet_gpu_crc(*bytes, *length) == *crc ? 0 : EIO;
++}
++static int
++sweet_gpu_cp_start(vm_offset_t gmu, vm_offset_t smmu)
++{
++ DTEntry node;
++ if (SecureDTLookupEntry(NULL, "/sweet-adreno", &node) != kSuccess) return ENOENT;
++ const unsigned char *sqe = NULL, *mdt = NULL, *code = NULL;
++ unsigned sqe_size = 0, mdt_size = 0, code_size = 0;
++ int error = sweet_gpu_blob(node, "sqe-firmware", "sqe-firmware-crc32", &sqe, &sqe_size);
++ if (!error) error = sweet_gpu_blob(node, "zap-metadata", "zap-metadata-crc32", &mdt, &mdt_size);
++ if (!error) error = sweet_gpu_blob(node, "zap-code", "zap-code-crc32", &code, &code_size);
++ const uint64_t *reserved_base = NULL;
++ const uint32_t *reserved_size = NULL;
++ unsigned length = 0;
++ if (!error && (SecureDTGetProperty(node, "zap-reserved-base", (const void **)&reserved_base,
++     &length) != kSuccess || length != 8 || *reserved_base != 0x97f15000ull)) error = EINVAL;
++ if (!error && (SecureDTGetProperty(node, "zap-reserved-size", (const void **)&reserved_size,
++     &length) != kSuccess || length != 4 || *reserved_size != 0x2000)) error = EINVAL;
++ printf("SWEET ADRENO: CP firmware properties errno=%d SQE=%u MDT=%u ZAP=%u\n",
++     error, sqe_size, mdt_size, code_size);
++ if (error) return error;
++ static struct a618_dma_region memory, metadata;
++ error = sweet_adreno_cp_allocate(&memory);
++ printf("SWEET ADRENO: CP DMA errno=%d PA=%#llx bytes=%u\n", error,
++     memory.physical, memory.bytes);
++ if (error) return error;
++ const struct a618_smmu_io smmu_io = {
++  {(void *)smmu, sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay},
++  sweet_adreno_read64, sweet_adreno_write64, sweet_adreno_barrier};
++ struct a618_smmu_result map;
++ bzero(&map, sizeof(map));
++ error = a618_smmu_prepare_cp(&smmu_io, &memory, &map);
++ printf("SWEET ADRENO: CP SMMU errno=%d CB=%u slot=%u pages=%u offset=%#x value=%#x PAR=%#llx FSR=%#x\n",
++     error, map.context, map.slot, map.translated, map.offset, map.value, map.par, map.fault);
++ if (error) return error;
++ vm_offset_t core = ml_io_map(0x05000000, 0x40000);
++ if (!core) return ENOMEM;
++ const struct a618_io gpu_io = {(void *)core,
++     sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay};
++ const struct a618_io gmu_io = {(void *)gmu,
++     sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay};
++ struct a618_cp_result cp;
++ bzero(&cp, sizeof(cp));
++ error = a618_cp_start(&gpu_io, &gmu_io, &memory, sqe, sqe_size,
++     sweet_adreno_barrier, NULL, &cp);
++ printf("SWEET ADRENO: SQE ME_INIT errno=%d phase=%u submitted=%u completed=%u RPTR=%#x WPTR=%#x status=%#x IRQ=%#x fault=%#x\n",
++     error, cp.phase, cp.submitted, cp.completed, cp.rptr, cp.wptr, cp.status,
++     cp.interrupt, cp.hw_fault);
++ if (error) return error;
++ error = sweet_adreno_pas_allocate(&metadata);
++ if (error) return error;
++ vm_offset_t zap = ml_io_map(*reserved_base, *reserved_size);
++ if (!zap) return ENOMEM;
++ struct a618_pas_result pas;
++ bzero(&pas, sizeof(pas));
++ error = a618_zap_authenticate((volatile uint32_t *)zap, *reserved_base,
++     &metadata, mdt, mdt_size, code, code_size, &pas);
++ printf("SWEET ADRENO: ZAP PAS errno=%d phase=%u status=%lld response=%#llx\n",
++     error, pas.phase, pas.status, pas.response);
++ if (error) return error;
++ error = a618_cp_leave_secure(&gpu_io, &gmu_io, &memory,
++     sweet_adreno_barrier, NULL, &cp);
++ printf("SWEET ADRENO: CP fence errno=%d phase=%u submitted=%u completed=%u RPTR=%#x WPTR=%#x IRQ=%#x fault=%#x fence=%#x value=%#x\n",
++     error, cp.phase, cp.submitted, cp.completed, cp.rptr, cp.wptr, cp.interrupt,
++     cp.hw_fault, cp.fence, cp.value);
++ printf("SWEET ADRENO: CP bootstrap complete errno=%d; iOS rendering ABI unavailable\n", error);
++ return error;
+ }
+ 
+ /* Matches postmarketOS SM7150: GMU firmware owns GX power-up. */
+@@ -290,6 +379,7 @@
+        gpu_vote, gmu_vote, &boot);
+    printf("SWEET ADRENO: legacy GMU boot errno=%d phase=%u offset=%#x value=%#x FW=%#x; CP unavailable\n",
+        error, boot.phase, boot.offset, boot.value, boot.firmware_version);
++   if (!error && stage >= 9) return sweet_gpu_cp_start(gmu, smmu);
+    return error;
+   }
+  }
+@@ -369,8 +459,8 @@
+ 	}
+ 	sweet_gpu_probe_attempted = 1;
+ 	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
+-	if (enabled < 1 || enabled > 8) {
+-		printf("SWEET GPU: audit disabled; sweetgpu=1 read-only, 2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 GMU clocks/status, 6 firmware staging, 7 DMA/SMMU/HFI mappings, 8 legacy GMU/HFI startup\n");
++	if (enabled < 1 || enabled > 9) {
++		printf("SWEET GPU: audit disabled; sweetgpu=1 read-only, 2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 GMU clocks/status, 6 firmware staging, 7 DMA/SMMU/HFI mappings, 8 legacy GMU/HFI startup, 9 SQE/CP commands\n");
+ 		return;
+ 	}
+ 
+@@ -413,7 +503,7 @@
+ 		return;
+ 	}
+ 	if (enabled == 1) {
+-		printf("SWEET GPU: read-only audit complete; sweetgpu=2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 GMU clocks/status, 6 firmware staging, 7 DMA/SMMU/HFI mappings, 8 legacy GMU/HFI startup\n");
++		printf("SWEET GPU: read-only audit complete; sweetgpu=2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 GMU clocks/status, 6 firmware staging, 7 DMA/SMMU/HFI mappings, 8 legacy GMU/HFI startup, 9 SQE/CP commands\n");
+ 		return;
+ 	}
+ 	sweet_gpu_stage = enabled;
+diff --git a/iokit/Kernel/arm/SweetAdrenoDMA.cpp b/iokit/Kernel/arm/SweetAdrenoDMA.cpp
+--- a/iokit/Kernel/arm/SweetAdrenoDMA.cpp
++++ b/iokit/Kernel/arm/SweetAdrenoDMA.cpp
+@@ -7,7 +7,7 @@
+ #include <mach/mach_types.h>
+ #include <kern/task.h>
+ #include <sys/errno.h>
+-#include "../../../bsd/dev/sweet_adreno_dma.h"
++#include "../../../bsd/dev/sweet_adreno_cp.h"
+ 
+ static IOBufferMemoryDescriptor *sweet_adreno_storage;
+ extern "C" int
+@@ -44,4 +44,45 @@
+  __asm__ volatile("dsb sy" ::: "memory");
+  return 0;
+ }
++
++/* CP storage and PAS metadata have separate lifetimes and separate physical
++ * pages; TrustZone may protect the metadata page during authentication. */
++static IOBufferMemoryDescriptor *sweet_aux_storage[2];
++static int
++sweet_aux_allocate(unsigned index, unsigned bytes, struct a618_dma_region *region)
++{
++ if (!region || index > 1) return EINVAL;
++ if (sweet_aux_storage[index]) return EALREADY;
++ IOBufferMemoryDescriptor *storage = IOBufferMemoryDescriptor::inTaskWithOptions(
++     kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous |
++     kIOMemoryMapperNone | kIOMapInhibitCache, bytes, 0x4000);
++ if (!storage) return ENOMEM;
++ if (storage->prepare(kIODirectionInOut) != kIOReturnSuccess) {
++  storage->release(); return EIO;
++ }
++ IOByteCount contiguous = 0;
++ uint64_t physical = storage->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone);
++ void *cpu = storage->getBytesNoCopy();
++ if (!cpu || !physical || (physical & 0x3fff) || contiguous < bytes ||
++     physical > (1ull << 36) - bytes) {
++  storage->complete(kIODirectionInOut); storage->release(); return ERANGE;
++ }
++ sweet_aux_storage[index] = storage;
++ region->cpu = (unsigned char *)cpu;
++ region->physical = physical; region->bytes = bytes; region->uncached = 1;
++ volatile uint32_t *words = (volatile uint32_t *)cpu;
++ for (unsigned i = 0; i < bytes / 4; ++i) words[i] = 0;
++ __asm__ volatile("dsb sy" ::: "memory");
++ return 0;
++}
++extern "C" int
++sweet_adreno_cp_allocate(struct a618_dma_region *region)
++{
++ return sweet_aux_allocate(0, A618_CP_DMA_BYTES, region);
++}
++extern "C" int
++sweet_adreno_pas_allocate(struct a618_dma_region *region)
++{
++ return sweet_aux_allocate(1, 0x4000, region);
++}
+ #endif
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -119,2 +119,5 @@
+ bsd/dev/sweet_adreno_gmu.c			standard
++bsd/dev/sweet_adreno_cp.c			standard
++bsd/dev/sweet_adreno_cp_smmu.c		standard
++bsd/dev/sweet_adreno_pas.c			standard
+ bsd/dev/mem.c				standard

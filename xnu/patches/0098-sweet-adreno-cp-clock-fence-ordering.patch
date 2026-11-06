@@ -1,0 +1,59 @@
+diff --git a/bsd/dev/sweet_adreno_cp.c b/bsd/dev/sweet_adreno_cp.c
+--- a/bsd/dev/sweet_adreno_cp.c
++++ b/bsd/dev/sweet_adreno_cp.c
+@@ -137,6 +137,23 @@
+  }
+  barrier(cookie);
+  result->phase = 1;
++ /* Legacy DCVS selects the one nonzero performance-table entry (180MHz).
++  * An ARC voltage vote alone does not set the GX clock. */
++ gmu->write(gmu->cookie, 0x8ff0, 0); /* DCVS_ACK_OPTION */
++ gmu->write(gmu->cookie, 0x8ff4, 0x30000001); /* PERF_SETTING, index1 */
++ gmu->write(gmu->cookie, 0x8ff8, 0xff); /* FW chooses bandwidth vote */
++ gmu->write(gmu->cookie, GMU_HOST_SET, 1u << 23);
++ unsigned elapsed;
++ for (elapsed = 0; elapsed < 10000; elapsed += 10) {
++  uint32_t info = gmu->read(gmu->cookie, GMU_HOST_INFO);
++  if (info == 0xffffffffu || (info & (1u << 23))) goto failed;
++  if (info & (1u << 31)) break;
++  gmu->delay_us(gmu->cookie, 10);
++ }
++ gmu->write(gmu->cookie, GMU_HOST_CLEAR, 1u << 31);
++ gmu->write(gmu->cookie, GMU_HOST_SET, 1u << 31);
++ if (elapsed == 10000) { result->poisoned = 1; return ETIMEDOUT; }
++ if (gmu->read(gmu->cookie, 0x8ffc)) goto failed; /* DCVS_RETURN */
+  /* GX access is permitted only after the firmware acknowledges GPU_SET. */
+  gmu->write(gmu->cookie, GMU_HOST_SET, 1u << 16);
+  unsigned us;
+@@ -241,10 +258,16 @@
+  result->phase = 5;
+  error = publish(gpu, gmu, memory, words, commands.used, barrier, cookie, result);
+  if (error) return error;
+- barrier(cookie);
+- result->fence = fence[0]; result->value = fence[1];
++ /* A drained ring need not imply an AXI write is visible to the CPU yet. */
++ for (unsigned us = 0; us < 10000; us += 10) {
++  barrier(cookie);
++  result->fence = fence[0]; result->value = fence[1];
++  if (result->fence == 1 && result->value == 0x0618c0de) break;
++  if (cp_fault(gpu, gmu, result)) { result->poisoned = 1; return EIO; }
++  gpu->delay_us(gpu->cookie, 10);
++ }
+  if (result->fence != 1 || result->value != 0x0618c0de) {
+-  result->poisoned = 1; return EIO;
++  result->poisoned = 1; return ETIMEDOUT;
+  }
+  result->phase = 6;
+  /* Keep GPU_SET held: fault recovery and runtime power management are not
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -243,6 +243,8 @@
+  printf("SWEET ADRENO: SQE ME_INIT errno=%d phase=%u submitted=%u completed=%u RPTR=%#x WPTR=%#x status=%#x IRQ=%#x fault=%#x\n",
+      error, cp.phase, cp.submitted, cp.completed, cp.rptr, cp.wptr, cp.status,
+      cp.interrupt, cp.hw_fault);
++ printf("SWEET ADRENO: CP MMU CB0FSR=%#x CB1FSR=%#x\n",
++     sweet_adreno_read((void *)smmu, 0x8058), sweet_adreno_read((void *)smmu, 0x9058));
+  if (error) return error;
+  error = sweet_adreno_pas_allocate(&metadata);
+  if (error) return error;

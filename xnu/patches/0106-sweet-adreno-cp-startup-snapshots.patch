@@ -1,0 +1,245 @@
+--- a/bsd/dev/sweet_adreno_cp.h
++++ b/bsd/dev/sweet_adreno_cp.h
+@@ -11,6 +11,11 @@
+ #define A618_CP_RING_IOVA (A618_CP_IOVA + 0x8000u)
+ #define A618_CP_FENCE_IOVA (A618_CP_IOVA + 0x10000u)
+ #define A618_CP_SHADOW_IOVA (A618_CP_FENCE_IOVA + 0x100u)
++#define A618_CP_SNAPSHOT_COUNT 16
++struct a618_cp_snapshot {
++ const char *tag;
++ uint32_t irq, sqectl, instr_lo, instr_hi, rb_cntl, cp2gmu;
++};
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -24,6 +29,10 @@
+  uint32_t cp_interrupt;
+  uint32_t irq_after_power, irq_before_auth, irq_after_auth;
+  unsigned bootstrap_wait_us;
++ uint32_t initial_sqectl, initial_instr_lo, initial_instr_hi, initial_rb_cntl;
++ struct a618_cp_snapshot snapshot[A618_CP_SNAPSHOT_COUNT];
++ unsigned snapshots;
++ const char *first_fault;
+  unsigned sqe_started, secure_prepare_attempted;
+  int secure_prepare_error;
+  uint64_t initial_tsb_base;
+--- a/bsd/dev/sweet_adreno_cp.c
++++ b/bsd/dev/sweet_adreno_cp.c
+@@ -65,15 +65,37 @@
+ cp_fault(const struct a618_io *gpu, const struct a618_io *gmu,
+  struct a618_cp_result *result)
+ {
+- result->interrupt = gpu->read(gpu->cookie, RBBM_INT_0_STATUS);
++   result->interrupt = gpu->read(gpu->cookie, RBBM_INT_0_STATUS);
+  result->hw_fault = gpu->read(gpu->cookie, CP_HW_FAULT);
+  result->cp_interrupt = gpu->read(gpu->cookie, CP_INTERRUPT_STATUS);
+  uint32_t info = gmu->read(gmu->cookie, GMU_HOST_INFO);
++ if ((result->cp_interrupt == 0xffffffffu ||
++      (result->cp_interrupt & CP_LOCAL_ERRORS)) && !result->first_fault)
++  result->first_fault = "runtime";
+  return result->interrupt == 0xffffffffu || result->hw_fault == 0xffffffffu ||
+      result->cp_interrupt == 0xffffffffu || (result->cp_interrupt & CP_LOCAL_ERRORS) ||
+      (result->interrupt & CP_IRQ_FAULT) || result->hw_fault ||
+      info == 0xffffffffu || (info & (1u << 23));
+ }
++/* Bounded startup trace: identify the first setup write that latches a CP
++ * error instead of attributing an inherited fault to the later release. */
++static void
++cp_snapshot(const struct a618_io *gpu, struct a618_cp_result *result,
++ const char *tag)
++{
++ if (result->snapshots >= A618_CP_SNAPSHOT_COUNT) return;
++ struct a618_cp_snapshot *snapshot = &result->snapshot[result->snapshots++];
++ snapshot->tag = tag;
++ snapshot->irq = gpu->read(gpu->cookie, CP_INTERRUPT_STATUS);
++ snapshot->sqectl = gpu->read(gpu->cookie, CP_SQE_CNTL);
++ snapshot->instr_lo = gpu->read(gpu->cookie, CP_SQE_INSTR_BASE);
++ snapshot->instr_hi = gpu->read(gpu->cookie, CP_SQE_INSTR_BASE + 4);
++ snapshot->rb_cntl = gpu->read(gpu->cookie, CP_RB_CNTL);
++ snapshot->cp2gmu = gpu->read(gpu->cookie, 0x2048);
++ if ((snapshot->irq == 0xffffffffu ||
++      (snapshot->irq & CP_LOCAL_ERRORS)) && !result->first_fault)
++  result->first_fault = tag;
++}
+ static int
+ publish(const struct a618_io *gpu, const struct a618_io *gmu,
+  const struct a618_dma_region *memory, const uint32_t *words, unsigned count,
+@@ -208,6 +230,24 @@
+  gmu->write(gmu->cookie, GMU_HOST_CLEAR, 1u << 24);
+  result->phase = 2;
+  result->irq_after_power = gpu->read(gpu->cookie, CP_INTERRUPT_STATUS);
++ result->initial_sqectl = gpu->read(gpu->cookie, CP_SQE_CNTL);
++ result->initial_instr_lo = gpu->read(gpu->cookie, CP_SQE_INSTR_BASE);
++ result->initial_instr_hi = gpu->read(gpu->cookie, CP_SQE_INSTR_BASE + 4);
++ result->initial_rb_cntl = gpu->read(gpu->cookie, CP_RB_CNTL);
++ cp_snapshot(gpu, result, "phase2");
++ if (result->irq_after_power == 0xffffffffu ||
++     result->initial_sqectl == 0xffffffffu ||
++     result->initial_instr_lo == 0xffffffffu ||
++     result->initial_instr_hi == 0xffffffffu ||
++     result->initial_rb_cntl == 0xffffffffu) goto failed;
++ /* A cold SQE is already halted. Halt only an engine that ABL left enabled,
++  * and do it before the bus/clock release below so it cannot fetch from a
++  * stale instruction base. Do not write 3 to a halted engine: that write has
++  * not been proven inert here and currently precedes the observed fault. */
++ if (result->initial_sqectl & 1u) {
++  gpu->write(gpu->cookie, CP_SQE_CNTL, 3);
++  cp_snapshot(gpu, result, "early_halt");
++ }
+  /* Fresh engine only. Never overwrite an already running command processor. */
+  if (gpu->read(gpu->cookie, CP_RB_RPTR) || gpu->read(gpu->cookie, CP_RB_WPTR))
+   goto failed;
+@@ -215,6 +255,7 @@
+  (void)gpu->read(gpu->cookie, 0xf114);
+  gpu->write(gpu->cookie, 0x58, 0);
+  (void)gpu->read(gpu->cookie, 0x58);
++ cp_snapshot(gpu, result, "gbif");
+  /* Normal non-secure range setup from the A6xx startup protocol. Secure
+   * mode itself is still left only through the authenticated ZAP path. */
+  result->initial_tsb_control = gpu->read(gpu->cookie, 0x3e00c);
+@@ -232,9 +273,10 @@
+      gpu->read(gpu->cookie, 0x3e000) || gpu->read(gpu->cookie, 0x3e004) ||
+      gpu->read(gpu->cookie, 0x3e008) || gpu->read(gpu->cookie, 0x3e040) != 1)
+   goto failed;
++ cp_snapshot(gpu, result, "tsb");
+  gpu->write(gpu->cookie, 0x3800, 1);
+  gpu->write(gpu->cookie, RBBM_INT_0_MASK, 0); /* no unhandled host IRQ */
+- gpu->write(gpu->cookie, CP_SQE_CNTL, 3);
++ cp_snapshot(gpu, result, "uche");
+  gpu->write(gpu->cookie, CP_ADDR_MODE_CNTL, 1);
+  gpu->write(gpu->cookie, CP_ROQ_THRESHOLDS_2, 0x010000c0);
+  gpu->write(gpu->cookie, CP_ROQ_THRESHOLDS_1, 0x8040362c);
+@@ -245,6 +287,7 @@
+  write_address(gpu, UCHE_WRITE_RANGE_MAX, 0x1ffffffffffc0ull);
+  write_address(gpu, UCHE_TRAP_BASE, 0x1fffffffff000ull);
+  write_address(gpu, UCHE_WRITE_THRU_BASE, 0x1fffffffff000ull);
++ cp_snapshot(gpu, result, "config");
+  /* Hardware protections remain enabled; only kernel-built PM4 is submitted. */
+  static const uint32_t protect[32] = {
+   0x13fc0000,
+@@ -282,6 +325,7 @@
+  };
+  for (unsigned i = 0; i < 32; ++i) gpu->write(gpu->cookie, (0x850 + i) * 4, protect[i]);
+  gpu->write(gpu->cookie, CP_PROTECT_CNTL, 0xb);
++ cp_snapshot(gpu, result, "protect");
+  /* Match the optional firmware-owned CP SMMU aperture setup before SQE
+   * can access context-bank state. GX is held by GPU_SET at this point. */
+  struct a618_pas_result aperture;
+@@ -291,7 +335,9 @@
+  result->aperture_status = aperture.status;
+  result->aperture_response = aperture.response;
+  if (aperture_error) { result->poisoned = 1; return aperture_error; }
++ cp_snapshot(gpu, result, "aperture");
+  write_address(gpu, CP_SQE_INSTR_BASE, A618_CP_IOVA);
++ cp_snapshot(gpu, result, "instr_base");
+  write_address(gpu, CP_RB_BASE, A618_CP_RING_IOVA);
+  volatile uint32_t *shadow = (volatile uint32_t *)(memory->cpu + A618_CP_SHADOW_OFFSET);
+  *shadow = 0;
+@@ -300,12 +346,15 @@
+  /* Reject a truncated or dropped shadow-base write before SQE starts. */
+  if (gpu->read(gpu->cookie, CP_RB_RPTR_ADDR) != A618_CP_SHADOW_IOVA ||
+      gpu->read(gpu->cookie, CP_RB_RPTR_ADDR + 4)) goto failed;
++ cp_snapshot(gpu, result, "rb_base");
+  gpu->write(gpu->cookie, CP_RB_CNTL, (1u << 27) | (2u << 8) | 12u);
++ cp_snapshot(gpu, result, "rb_cntl");
+  /* Device vendor startup authenticates its signed ZAP before SQE release.
+   * The adapter callback is synchronous and cannot submit PM4. It runs only
+   * after GPU_SET, DCVS and base programming. Authorization failure retains
+   * resources and leaves SQE halted. */
+  result->irq_before_auth = gpu->read(gpu->cookie, CP_INTERRUPT_STATUS);
++ cp_snapshot(gpu, result, "preauth");
+  result->secure_prepare_attempted = 1;
+  result->secure_prepare_error = secure_prepare(secure_cookie);
+  if (result->secure_prepare_error) {
+@@ -313,11 +362,13 @@
+   return result->secure_prepare_error;
+  }
+  result->irq_after_auth = gpu->read(gpu->cookie, CP_INTERRUPT_STATUS);
++ cp_snapshot(gpu, result, "auth");
+  /* Attribute a pre-existing error to setup/authentication, rather than
+   * describing it as an SQE execution failure. Never clear unknown faults. */
+  if (cp_fault(gpu, gmu, result)) goto failed;
+  gpu->write(gpu->cookie, CP_SQE_CNTL, 1);
+  result->sqe_started = 1;
++ cp_snapshot(gpu, result, "release");
+  /* SQE bootstrap signals CP_CP2GMU_STATUS bit2 before entering waitin.
+   * Require that firmware handshake before publishing any ring commands;
+   * a timeout/fault here is distinct from a ME_INIT execution failure. */
+@@ -328,6 +379,7 @@
+   gpu->delay_us(gpu->cookie, 10);
+   if (waited == 9990) { result->poisoned = 1; return ETIMEDOUT; }
+  }
++ cp_snapshot(gpu, result, "bootstrap");
+  uint32_t init[] = {packet7(0x48, 8), 0x2f, 3, 0x20000000, 0, 0, 0, 0, 0};
+  int error = publish(gpu, gmu, memory, init, 9, barrier, cookie, result);
+  if (error) return error;
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -300,6 +300,14 @@
+  printf("SWEET ADRENO: CP startup IRQ power=%#x before_auth=%#x after_auth=%#x bootstrap_us=%u CP2GMU=%#x ACTLR=%#x\n",
+      cp.irq_after_power, cp.irq_before_auth, cp.irq_after_auth, cp.bootstrap_wait_us,
+      sweet_adreno_read((void *)core, 0x2048), sweet_adreno_read((void *)smmu, 0x8004));
++ printf("SWEET ADRENO: CP startup initial SQECTL=%#x INSTR=%#x%08x RB_CNTL=%#x snapshots=%u first_fault=%s\n",
++     cp.initial_sqectl, cp.initial_instr_hi, cp.initial_instr_lo,
++     cp.initial_rb_cntl, cp.snapshots, cp.first_fault ? cp.first_fault : "none");
++ for (unsigned i = 0; i < cp.snapshots; ++i)
++  printf("SWEET ADRENO: CP SNAP[%s] IRQ=%#x SQECTL=%#x INSTR=%#x%08x CNTL=%#x CP2GMU=%#x\n",
++      cp.snapshot[i].tag, cp.snapshot[i].irq, cp.snapshot[i].sqectl,
++      cp.snapshot[i].instr_hi, cp.snapshot[i].instr_lo,
++      cp.snapshot[i].rb_cntl, cp.snapshot[i].cp2gmu);
+  printf("SWEET ADRENO: CP execution status local_irq=%#x sqe_started=%u\n", cp.cp_interrupt, cp.sqe_started);
+  printf("SWEET ADRENO: CP MMU CB0FSR=%#x CB1FSR=%#x\n",
+      sweet_adreno_read((void *)smmu, 0x8058), sweet_adreno_read((void *)smmu, 0x9058));
+@@ -316,7 +324,7 @@
+      ((uint64_t)sweet_adreno_read((void *)core, 0x2004) << 32) | sweet_adreno_read((void *)core, 0x2000),
+      ((uint64_t)sweet_adreno_read((void *)core, 0x2014) << 32) | sweet_adreno_read((void *)core, 0x2010),
+      sweet_adreno_read((void *)core, 0x2008), sweet_adreno_read((void *)core, 0x2020));
+- if (error && cp.sqe_started) {
++ if (error && (cp.sqe_started || cp.first_fault)) {
+   /* Bounded failure-only indexed SQE state, same 0x33-word bank as A6xx
+    * Linux devcoredump. Each DATA read auto-increments the index. No resume
+    * follows a poisoned CP, so changing this diagnostic selector is harmless. */
+@@ -330,21 +338,28 @@
+       sweet_adreno_read((void *)core, 0x2018), sweet_adreno_read((void *)core, 0x2094),
+       sweet_adreno_read((void *)core, 0x208c));
+   /* Halt the poisoned engine before the bounded instruction-cache capture.
+-   * This does not reset it or attempt another submission. */
+-  sweet_adreno_write((void *)core, 0x2020, 3);
+-  uint32_t halt = sweet_adreno_read((void *)core, 0x2020);
+-  printf("SWEET ADRENO: SQE failure halt=%#x ACTLR=%#x HOST_AP=%#x SQE_AP=%#x\n",
+-      halt, sweet_adreno_read((void *)smmu, 0x8004),
+-      sweet_adreno_read((void *)core, 0x2800), sweet_adreno_read((void *)core, 0x2804));
+-  if (halt != 0xffffffffu && (halt & 3) == 3) {
+-   static uint32_t cache[1024];
+-   sweet_adreno_write((void *)core, 0x2440, 0);
+-   for (unsigned i = 0; i < 1024; ++i)
+-    cache[i] = sweet_adreno_read((void *)core, 0x2444);
+-   for (unsigned i = 0; i < 1024; i += 8)
+-    printf("SWEET ADRENO: SQE_CACHE[%u]=%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x\n",
+-        i, cache[i], cache[i + 1], cache[i + 2], cache[i + 3],
+-        cache[i + 4], cache[i + 5], cache[i + 6], cache[i + 7]);
++   * This does not reset it or attempt another submission. Never write a halt
++   * to an engine that did not start: 0106 tests whether that write itself
++   * launches a fetch from the current instruction base. */
++  if (cp.sqe_started) {
++   sweet_adreno_write((void *)core, 0x2020, 3);
++   uint32_t halt = sweet_adreno_read((void *)core, 0x2020);
++   printf("SWEET ADRENO: SQE failure halt=%#x ACTLR=%#x HOST_AP=%#x SQE_AP=%#x\n",
++       halt, sweet_adreno_read((void *)smmu, 0x8004),
++       sweet_adreno_read((void *)core, 0x2800), sweet_adreno_read((void *)core, 0x2804));
++   if (halt != 0xffffffffu && (halt & 3) == 3) {
++    static uint32_t cache[1024];
++    sweet_adreno_write((void *)core, 0x2440, 0);
++    for (unsigned i = 0; i < 1024; ++i)
++     cache[i] = sweet_adreno_read((void *)core, 0x2444);
++    for (unsigned i = 0; i < 1024; i += 8)
++     printf("SWEET ADRENO: SQE_CACHE[%u]=%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x\n",
++         i, cache[i], cache[i + 1], cache[i + 2], cache[i + 3],
++         cache[i + 4], cache[i + 5], cache[i + 6], cache[i + 7]);
++   }
++  } else {
++   printf("SWEET ADRENO: SQE halted=%#x; no pre-start halt write or cache capture\n",
++       sweet_adreno_read((void *)core, 0x2020));
+   }
+  }
+  if (error) return error;

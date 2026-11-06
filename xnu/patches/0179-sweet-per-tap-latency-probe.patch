@@ -1,0 +1,267 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 62abfe4..e3f8ce8 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -20,6 +20,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_sched_tap_mark(void); /* 0179 per-tap probe (sched_prim.c) */
+ void sweet_touch_init(void);
+ 
+ #define TOUCH_SE_PA      0x00a84000u
+@@ -380,6 +381,9 @@ touch_report(uint32_t mask, const int *x, const int *y)
+ 			sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
+ 		}
+ 	}
++	if (st.active != 0 && mask == 0) {
++		sweet_sched_tap_mark();         /* last finger lifted */
++	}
+ 	st.active = mask;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b097029..1b66817 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -59,6 +59,8 @@ extern "C" uint32_t sweet_native_adreno_last_fence(void);
+ extern "C" void sweet_native_adreno_cpu_present_end(int state);
+ extern "C" bool sweet_bind_current_thread(int cpu);
+ extern "C" void sweet_sched_take_stats(uint64_t *little_us, uint64_t *big_us, uint64_t *pulls, uint64_t *leaves);
++extern "C" void sweet_sched_tap_event(int kind);
++extern "C" bool sweet_sched_tap_report(char *buf, size_t len);
+ extern "C" void sweet_native_adreno_sample_busy(void);
+ extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+@@ -672,6 +674,11 @@ AppleCLCD::rearmVsync(void)
+ 		fStatsStart = now;
+ 		fStatsCallbacks = fStatsMissed = 0;
+ 	}
++	/* 0179: one line per tap window (sched_prim.c sweet_sched_tap_report). */
++	char tap[448];
++	if (sweet_sched_tap_report(tap, sizeof(tap))) {
++		IOLog("%s\n", tap);
++	}
+ 	fVsync->wakeAtTime(fNextVsync);
+ }
+ 
+@@ -736,6 +743,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		uint64_t ns = 0;
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+ 		const uint64_t us = ns / NSEC_PER_USEC;
++		sweet_sched_tap_event(1);
+ 		__atomic_add_fetch(&fb->fStatsPresents, 1, __ATOMIC_RELAXED);
+ 		__atomic_add_fetch(&fb->fStatsPresentUs, us, __ATOMIC_RELAXED);
+ 		if (us > fb->fStatsPresentMaxUs) {
+@@ -802,6 +810,7 @@ AppleCLCD::presentThread(void *arg, wait_result_t result)
+ 		uint64_t ns = 0;
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+ 		const uint64_t us = ns / NSEC_PER_USEC;
++		sweet_sched_tap_event(1);
+ 		__atomic_add_fetch(&fb->fStatsPresents, 1, __ATOMIC_RELAXED);
+ 		__atomic_add_fetch(&fb->fStatsPresentUs, us, __ATOMIC_RELAXED);
+ 		uint64_t max = __atomic_load_n(&fb->fStatsPresentMaxUs, __ATOMIC_RELAXED);
+@@ -858,6 +867,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+ 	__atomic_add_fetch(&fStatsSwaps, 1, __ATOMIC_RELAXED);
++	sweet_sched_tap_event(0);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 7a80d5a..5c10d0c 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -2098,6 +2098,7 @@ int sched_smt_balance = 1;
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ static bool sweet_big_balance(processor_t cprocessor, processor_set_t cpset);
+ static void sweet_account_ui(thread_t thread, processor_t processor, uint64_t slice);
++static void sweet_tap_latency(thread_t self, uint64_t now, uint64_t latency);
+ #endif
+ 
+ /* Invoked with pset locked, returns with pset unlocked */
+@@ -3733,6 +3734,9 @@ thread_dispatch(
+ 
+ 		latency = processor->last_dispatch - self->last_made_runnable_time;
+ 		assert(latency >= self->same_pri_latency);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		sweet_tap_latency(self, processor->last_dispatch, latency);
++#endif
+ 
+ 		urgency = thread_get_urgency(self, &arg1, &arg2);
+ 
+@@ -5151,10 +5155,173 @@ sweet_big_balance(processor_t cprocessor, processor_set_t cpset)
+ 	return true;
+ }
+ 
++/*
++ * SWEET 0179: per-tap probe. The user reports a delay between a tap and the app
++ * opening animation; 10 s aggregates cannot say where it goes. A finger release
++ * (sweet_touch) opens a SWEET_TAP_MS window. During it we sum SpringBoard's on-core
++ * time per core type, its runnable-but-not-running wait (dispatch latency), the
++ * offset of its last off-core switch, all UI-thread time per core type, and the
++ * offsets of the first swaps (CA frame handed to the framebuffer) and presents
++ * (frame copied to the panel). SweetFramebuffer prints one "SWEET TAP:" line per
++ * window. A new release during an open window is ignored. Statistics only; races
++ * between CPUs can only misattribute a slice at the window edges.
++ */
++#define SWEET_TAP_MS     600
++#define SWEET_TAP_EVENTS 8
++static uint32_t sweet_tap_state;        /* 0 idle, 3 arming, 1 open, 2 reporting */
++static uint64_t sweet_tap_start, sweet_tap_end;
++static uint64_t sweet_tap_sb_abs[2], sweet_tap_ui_abs[2];
++static uint64_t sweet_tap_sb_wait, sweet_tap_sb_wait_max, sweet_tap_sb_last;
++static uint32_t sweet_tap_sb_switches, sweet_tap_sb_on_big;
++static uint32_t sweet_tap_ev_n[2];
++static uint32_t sweet_tap_ev_ms[2][SWEET_TAP_EVENTS];
++static uint32_t sweet_tap_count;
++
++static inline bool
++sweet_tap_open_at(uint64_t now)
++{
++	return os_atomic_load(&sweet_tap_state, acquire) == 1 &&
++	       now >= sweet_tap_start && now < sweet_tap_end;
++}
++
++static bool
++sweet_is_springboard(thread_t thread)
++{
++	task_t task = get_threadtask(thread);
++	if (task == TASK_NULL || task == kernel_task) {
++		return false;
++	}
++	void *p = get_bsdtask_info(task);
++	if (p == NULL) {
++		return false;
++	}
++	const char *name = proc_name_address(p);
++	return name != NULL && strncmp(name, "SpringBoard", 12) == 0;
++}
++
++void sweet_sched_tap_mark(void);
++void
++sweet_sched_tap_mark(void)
++{
++	if (!os_atomic_cmpxchg(&sweet_tap_state, 0, 3, acquire)) {
++		return;
++	}
++	uint64_t now = mach_absolute_time(), span;
++	nanoseconds_to_absolutetime((uint64_t)SWEET_TAP_MS * NSEC_PER_MSEC, &span);
++	sweet_tap_sb_abs[0] = sweet_tap_sb_abs[1] = sweet_tap_ui_abs[0] = sweet_tap_ui_abs[1] = 0;
++	sweet_tap_sb_wait = sweet_tap_sb_wait_max = sweet_tap_sb_last = 0;
++	sweet_tap_sb_switches = sweet_tap_sb_on_big = 0;
++	sweet_tap_ev_n[0] = sweet_tap_ev_n[1] = 0;
++	sweet_tap_start = now;
++	sweet_tap_end = now + span;
++	os_atomic_store(&sweet_tap_state, 1, release);
++}
++
++/* kind 0 = swap, 1 = present; from SweetFramebuffer. */
++void sweet_sched_tap_event(int kind);
++void
++sweet_sched_tap_event(int kind)
++{
++	uint64_t now = mach_absolute_time(), ns;
++	if (kind < 0 || kind > 1 || !sweet_tap_open_at(now)) {
++		return;
++	}
++	uint32_t i = os_atomic_inc_orig(&sweet_tap_ev_n[kind], relaxed);
++	if (i < SWEET_TAP_EVENTS) {
++		absolutetime_to_nanoseconds(now - sweet_tap_start, &ns);
++		sweet_tap_ev_ms[kind][i] = (uint32_t)(ns / NSEC_PER_MSEC);
++	}
++}
++
++/* From thread_dispatch for the thread coming on core: its runnable wait. */
++static void
++sweet_tap_latency(thread_t self, uint64_t now, uint64_t latency)
++{
++	if (sweet_tap_open_at(now) && sweet_is_springboard(self)) {
++		os_atomic_add(&sweet_tap_sb_wait, latency, relaxed);
++		if (latency > sweet_tap_sb_wait_max) {
++			sweet_tap_sb_wait_max = latency;
++		}
++	}
++}
++
++static void
++sweet_tap_account(thread_t thread, processor_t processor, uint64_t slice)
++{
++	uint64_t now = processor->last_dispatch;
++	if (!sweet_tap_open_at(now)) {
++		return;
++	}
++	int big = processor->cpu_id >= 6 ? 1 : 0;
++	if (sweet_is_springboard(thread)) {
++		os_atomic_add(&sweet_tap_sb_abs[big], slice, relaxed);
++		os_atomic_inc(&sweet_tap_sb_switches, relaxed);
++		if (big) {
++			os_atomic_inc(&sweet_tap_sb_on_big, relaxed);
++		}
++		if (now - sweet_tap_start > sweet_tap_sb_last) {
++			sweet_tap_sb_last = now - sweet_tap_start;
++		}
++	}
++	if (sweet_is_ui_thread(thread)) {
++		os_atomic_add(&sweet_tap_ui_abs[big], slice, relaxed);
++	}
++}
++
++static uint32_t
++sweet_abs_ms(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return (uint32_t)(ns / NSEC_PER_MSEC);
++}
++
++static size_t
++sweet_tap_fmt_events(char *buf, size_t len, int kind)
++{
++	uint32_t n = MIN(sweet_tap_ev_n[kind], SWEET_TAP_EVENTS);
++	size_t used = 0;
++	buf[0] = '\0';
++	for (uint32_t i = 0; i < n && used + 1 < len; i++) {
++		used += (size_t)snprintf(buf + used, len - used, i ? ",%u" : "%u", sweet_tap_ev_ms[kind][i]);
++	}
++	if (n == 0) {
++		strlcpy(buf, "-", len);
++	}
++	return used;
++}
++
++/* From the framebuffer vsync tick: formats the finished window once, false otherwise. */
++bool sweet_sched_tap_report(char *buf, size_t len);
++bool
++sweet_sched_tap_report(char *buf, size_t len)
++{
++	if (os_atomic_load(&sweet_tap_state, acquire) != 1 || mach_absolute_time() < sweet_tap_end) {
++		return false;
++	}
++	if (!os_atomic_cmpxchg(&sweet_tap_state, 1, 2, acquire)) {
++		return false;
++	}
++	char swaps[64], presents[64];
++	sweet_tap_fmt_events(swaps, sizeof(swaps), 0);
++	sweet_tap_fmt_events(presents, sizeof(presents), 1);
++	snprintf(buf, len,
++	    "SWEET TAP: n=%u window_ms=%u sb_run_ms a55=%u a76=%u sb_switches=%u on_a76=%u sb_wait_ms=%u max=%u sb_last_off_ms=%u ui_run_ms a55=%u a76=%u swaps=%u at_ms=%s presents=%u at_ms=%s",
++	    ++sweet_tap_count, (unsigned)SWEET_TAP_MS,
++	    sweet_abs_ms(sweet_tap_sb_abs[0]), sweet_abs_ms(sweet_tap_sb_abs[1]),
++	    sweet_tap_sb_switches, sweet_tap_sb_on_big,
++	    sweet_abs_ms(sweet_tap_sb_wait), sweet_abs_ms(sweet_tap_sb_wait_max), sweet_abs_ms(sweet_tap_sb_last),
++	    sweet_abs_ms(sweet_tap_ui_abs[0]), sweet_abs_ms(sweet_tap_ui_abs[1]),
++	    sweet_tap_ev_n[0], swaps, sweet_tap_ev_n[1], presents);
++	os_atomic_store(&sweet_tap_state, 0, release);
++	return true;
++}
++
+ /* From thread_dispatch for the thread leaving the core. */
+ static void
+ sweet_account_ui(thread_t thread, processor_t processor, uint64_t slice)
+ {
++	sweet_tap_account(thread, processor, slice);
+ 	if (sweet_big_enabled > 0 && sweet_is_ui_thread(thread)) {
+ 		os_atomic_add(&sweet_ui_abs[processor->cpu_id >= 6 ? 1 : 0], slice, relaxed);
+ 	}

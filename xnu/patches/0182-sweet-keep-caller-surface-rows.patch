@@ -1,0 +1,33 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index adf727e..db94882 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -319,7 +319,27 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+     PE_parse_boot_argn("sweetmtl",&metal,sizeof metal);
+     PE_parse_boot_argn("sweetgles",&gles,sizeof gles);
+     PE_parse_boot_argn("sweetsurfalign",&alignment,sizeof alignment);
+-    if(metal==2 && gles!=1 && alignment>=64 && alignment<=4096 &&
++    /* 0182: a row length another process asked for is that process's layout:
++     * SpringBoard asks LA08 glyph surfaces for 210/224-byte rows and writes them
++     * so, whatever IOSurfaceGetBytesPerRow says, and the 64-byte rounding made
++     * backboardd sample them sheared (Control Centre icons, 0180 captures). Only
++     * backboardd's own surfaces (its render targets) are rounded here now; the
++     * native Metal driver reads any other unaligned surface through a shadow.
++     * sweetsurfalignall=1 restores rounding every caller's rows. */
++    const uint32_t asked = sweet_dict_u32(props, "IOSurfaceBytesPerRow", 0);
++    uint32_t roundall = 0;
++    PE_parse_boot_argn("sweetsurfalignall", &roundall, sizeof roundall);
++    char creator[32] = {0};
++    proc_selfname(creator, sizeof(creator));
++    const bool keep_asked = asked != 0 && !roundall && strcmp(creator, "backboardd") != 0;
++    if (keep_asked && (asked & 63)) {
++        static unsigned kept;
++        if (kept++ < 32) {
++            IOLog("SWEET SURF: %s keeps its %u-byte rows for %ux%u fmt %#x\n",
++                creator, asked, s->width, s->height, s->pixelFormat);
++        }
++    }
++    if(!keep_asked && metal==2 && gles!=1 && alignment>=64 && alignment<=4096 &&
+        !(alignment&(alignment-1)) && !props->getObject("IOSurfaceAddress") &&
+        !props->getObject("IOSurfacePlaneInfo") && s->elementWidth==1 &&
+        s->elementHeight==1 && s->bytesPerElement && s->bytesPerElement<=8 &&

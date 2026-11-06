@@ -1,0 +1,214 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b600f00..b097029 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -58,6 +58,7 @@ extern "C" int sweet_native_adreno_cpu_present_begin(uint32_t swap_fence);
+ extern "C" uint32_t sweet_native_adreno_last_fence(void);
+ extern "C" void sweet_native_adreno_cpu_present_end(int state);
+ extern "C" bool sweet_bind_current_thread(int cpu);
++extern "C" void sweet_sched_take_stats(uint64_t *little_us, uint64_t *big_us, uint64_t *pulls, uint64_t *leaves);
+ extern "C" void sweet_native_adreno_sample_busy(void);
+ extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+@@ -664,6 +665,10 @@ AppleCLCD::rearmVsync(void)
+ 		    fStatsMissed, fPresentHz, presents ? present_us / presents : 0, present_max, coalesced, swaps,
+ 		    presents ? gate_us / presents : 0, presents ? acquire_us / presents : 0, presents ? copy_us / presents : 0,
+ 		    presents ? beam_us / presents : 0, beam_skips);
++		uint64_t ui_little = 0, ui_big = 0, pulls = 0, leaves = 0;
++		sweet_sched_take_stats(&ui_little, &ui_big, &pulls, &leaves);
++		IOLog("SWEET SCHED: window_ms=%llu ui_run_us a55=%llu a76=%llu big_pulls=%llu big_leaves=%llu\n",
++		    elapsed / NSEC_PER_MSEC, ui_little, ui_big, pulls, leaves);
+ 		fStatsStart = now;
+ 		fStatsCallbacks = fStatsMissed = 0;
+ 	}
+diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
+index 3657d83..8a758b4 100644
+--- a/osfmk/kern/sched_clutch.c
++++ b/osfmk/kern/sched_clutch.c
+@@ -3200,10 +3200,20 @@ sched_clutch_thread_update_scan(sched_update_scan_context_t scan_context)
+ 
+ extern int sched_allow_rt_smt;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern bool sweet_big_should_leave(processor_t processor, thread_t thread);
++#endif
++
+ /* Return true if this thread should not continue running on this processor */
+ static bool
+ sched_clutch_thread_avoid_processor(processor_t processor, thread_t thread)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* 0178: a UI thread on an A55 moves to an idle A76 (see sched_prim.c) */
++	if (sweet_big_should_leave(processor, thread)) {
++		return true;
++	}
++#endif
+ 	if (processor->processor_primary != processor) {
+ 		/*
+ 		 * This is a secondary SMT processor.  If the primary is running
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index c88084e..7a80d5a 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -2095,12 +2095,23 @@ change_locked_pset(processor_set_t current_pset, processor_set_t new_pset)
+ int sched_smt_balance = 1;
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++static bool sweet_big_balance(processor_t cprocessor, processor_set_t cpset);
++static void sweet_account_ui(thread_t thread, processor_t processor, uint64_t slice);
++#endif
++
+ /* Invoked with pset locked, returns with pset unlocked */
+ void
+ sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
+ {
+ 	processor_t ast_processor = NULL;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sweet_big_balance(cprocessor, cpset)) {
++		return;
++	}
++#endif
++
+ #if (DEVELOPMENT || DEBUG)
+ 	if (__improbable(sched_smt_balance == 0)) {
+ 		goto smt_balance_exit;
+@@ -3568,6 +3579,9 @@ thread_dispatch(
+ 			}
+ 
+ 			thread->computation_metered += (processor->last_dispatch - thread->computation_epoch);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			sweet_account_ui(thread, processor, processor->last_dispatch - thread->computation_epoch);
++#endif
+ 
+ 			if (!(thread->state & TH_WAIT)) {
+ 				/*
+@@ -5045,17 +5059,124 @@ static int sweet_big_pri = 46;
+  */
+ static int sweet_big_kernel = 0;
+ 
+-static processor_t
+-sweet_choose_big(processor_set_t pset, thread_t thread)
++/*
++ * SWEET 0178: XNU only places a thread when it becomes runnable. A UI thread that wakes
++ * while both A76s are busy lands on an A55 and stays there for its whole burst, even when
++ * an A76 goes idle a millisecond later (0176 spindump: SpringBoard's main thread ran ~150 ms
++ * of tap handling before the first animation commit while cpu7 was idle). Apple's AMP
++ * scheduler bounces such threads with a rebalance IPI; this single-pset clutch config had
++ * nothing (sched_SMT_balance returns at once on non-SMT cores). Now:
++ *  - sweet_big_should_leave(): a user thread at sweetbigpri..MAXPRI_USER, unbound, running
++ *    on an A55 avoids that processor while an A76 is idle (clutch thread_avoid_processor),
++ *    so thread_select/csw_check re-dispatch it through choose_processor -> idle A76.
++ *  - sweet_big_balance(): an A76 entering idle sends a rebalance IPI to the A55 running the
++ *    highest such priority, so the move happens now rather than at its next AST check.
++ *  - UI-thread run time per core type and the pull/leave counts, logged every 10 s by the
++ *    framebuffer ("SWEET SCHED:"). sweetbigpull=0 disables the pull (accounting stays).
++ */
++static int sweet_big_pull = 1;
++static uint64_t sweet_ui_abs[2];        /* [0] A55, [1] A76, unbound user UI threads */
++static uint64_t sweet_big_pulls, sweet_big_leaves;
++
++#define SWEET_BIG_CPU_MASK ((1ULL << 6) | (1ULL << 7))
++
++static bool
++sweet_big_init(void)
+ {
+ 	if (sweet_big_enabled < 0) {
+-		int on = 1, pri = 46;
++		int on = 1, pri = 46, pull = 1;
+ 		PE_parse_boot_argn("sweetbigcores", &on, sizeof(on));
+ 		PE_parse_boot_argn("sweetbigpri", &pri, sizeof(pri));
+ 		PE_parse_boot_argn("sweetbigkernel", &sweet_big_kernel, sizeof(sweet_big_kernel));
++		PE_parse_boot_argn("sweetbigpull", &pull, sizeof(pull));
+ 		sweet_big_pri = pri;
++		sweet_big_pull = pull != 0;
+ 		sweet_big_enabled = on != 0;
+ 	}
++	return sweet_big_enabled != 0;
++}
++
++static inline bool
++sweet_is_ui_thread(thread_t thread)
++{
++	return thread->sched_pri >= sweet_big_pri && thread->sched_pri <= MAXPRI_USER &&
++	       thread->bound_processor == PROCESSOR_NULL && get_threadtask(thread) != kernel_task;
++}
++
++/* Called from clutch thread_avoid_processor (thread locked, usually pset locked). */
++bool sweet_big_should_leave(processor_t processor, thread_t thread);
++bool
++sweet_big_should_leave(processor_t processor, thread_t thread)
++{
++	if (!sweet_big_init() || !sweet_big_pull || processor->cpu_id >= 6 ||
++	    (thread->state & TH_IDLE) || !sweet_is_ui_thread(thread)) {
++		return false;
++	}
++	processor_set_t pset = processor->processor_set;
++	if ((pset->cpu_state_map[PROCESSOR_IDLE] & pset->recommended_bitmask & SWEET_BIG_CPU_MASK) == 0) {
++		return false;
++	}
++	os_atomic_inc(&sweet_big_leaves, relaxed);
++	return true;
++}
++
++/* From sched_SMT_balance: cpset locked; returns true after unlocking it. */
++static bool
++sweet_big_balance(processor_t cprocessor, processor_set_t cpset)
++{
++	if (!sweet_big_init() || !sweet_big_pull || cprocessor->cpu_id < 6 || !cprocessor->is_recommended) {
++		return false;
++	}
++	processor_t best = PROCESSOR_NULL;
++	uint64_t running = cpset->cpu_state_map[PROCESSOR_RUNNING] & ~SWEET_BIG_CPU_MASK;
++	for (int cpuid = lsb_first(running); cpuid >= 0; cpuid = lsb_next(running, cpuid)) {
++		processor_t p = processor_array[cpuid];
++		if (p == PROCESSOR_NULL || p->processor_set != cpset || p->current_is_bound ||
++		    p->current_pri < sweet_big_pri || p->current_pri > MAXPRI_USER) {
++			continue;
++		}
++		if (best == PROCESSOR_NULL || p->current_pri > best->current_pri) {
++			best = p;
++		}
++	}
++	sched_ipi_type_t ipi_type = SCHED_IPI_NONE;
++	if (best != PROCESSOR_NULL) {
++		ipi_type = sched_ipi_action(best, NULL, SCHED_IPI_EVENT_REBALANCE);
++	}
++	pset_unlock(cpset);
++	if (ipi_type != SCHED_IPI_NONE) {
++		os_atomic_inc(&sweet_big_pulls, relaxed);
++		sched_ipi_perform(best, ipi_type);
++	}
++	return true;
++}
++
++/* From thread_dispatch for the thread leaving the core. */
++static void
++sweet_account_ui(thread_t thread, processor_t processor, uint64_t slice)
++{
++	if (sweet_big_enabled > 0 && sweet_is_ui_thread(thread)) {
++		os_atomic_add(&sweet_ui_abs[processor->cpu_id >= 6 ? 1 : 0], slice, relaxed);
++	}
++}
++
++void sweet_sched_take_stats(uint64_t *little_us, uint64_t *big_us, uint64_t *pulls, uint64_t *leaves);
++void
++sweet_sched_take_stats(uint64_t *little_us, uint64_t *big_us, uint64_t *pulls, uint64_t *leaves)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(os_atomic_xchg(&sweet_ui_abs[0], 0, relaxed), &ns);
++	*little_us = ns / NSEC_PER_USEC;
++	absolutetime_to_nanoseconds(os_atomic_xchg(&sweet_ui_abs[1], 0, relaxed), &ns);
++	*big_us = ns / NSEC_PER_USEC;
++	*pulls = os_atomic_xchg(&sweet_big_pulls, 0, relaxed);
++	*leaves = os_atomic_xchg(&sweet_big_leaves, 0, relaxed);
++}
++
++static processor_t
++sweet_choose_big(processor_set_t pset, thread_t thread)
++{
++	sweet_big_init();
+ 	if (!sweet_big_enabled || thread->sched_pri < sweet_big_pri || thread->bound_processor != PROCESSOR_NULL) {
+ 		return PROCESSOR_NULL;
+ 	}

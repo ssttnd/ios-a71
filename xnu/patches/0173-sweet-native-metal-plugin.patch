@@ -1,0 +1,23 @@
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -3,13 +3,14 @@
+  provider->setName("NativeAdrenoGpu");
+  int gles=0,mtl=0;
+  PE_parse_boot_argn("sweetgles",&gles,sizeof(gles));PE_parse_boot_argn("sweetmtl",&mtl,sizeof(mtl));
++ int native=0;PE_parse_boot_argn("sweetnative",&native,sizeof native);
+  if(gles!=1) {
+-  // Both bundles stay installed: sweetmtl=1 selects the old untested
+-  // NativeAdrenoMetal stack, anything else the Sunfish-derived SweetMetal2.
+-  const char *plugin=mtl==1?"NativeAdrenoMetal":"SweetMetal2";
++  // sweetnative=1 opts into the direct AIR/freedreno frontend.
++  // Existing sweetmtl values retain their previous plugin and row-layout behavior.
++  const char *plugin=native==1?"SweetNativeMetal":mtl==1?"NativeAdrenoMetal":"SweetMetal2";
+   provider->setProperty("MetalPluginName",plugin);
+-  provider->setProperty("MetalPluginClassName",mtl==1?"SweetAdrenoMetalDevice":"SweetMTL2Device");
+-  IOLog("SWEET RENDER: Metal plugin %s selected (%s)\n",plugin,mtl==1?"sweetmtl=1":"default");
++  provider->setProperty("MetalPluginClassName",native==1?"SweetNativeMetalDevice":mtl==1?"SweetAdrenoMetalDevice":"SweetMTL2Device");
++  IOLog("SWEET RENDER: Metal plugin %s selected (sweetmtl=%d sweetnative=%d)\n",plugin,mtl,native);
+  } else IOLog("SWEET GLES: native A618 transport published; Metal discovery disabled for GLES boot\n");
+  provider->setProperty("model","Adreno 618");
+  provider->setProperty("NativeAdrenoABI",NativeAdrenoAbiVersion,32);

@@ -1,0 +1,62 @@
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+index 376cc6e..d348393 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -21,6 +21,7 @@ extern "C" volatile uint32_t native_adreno_wc_audit[6];
+ extern "C" volatile uint32_t native_adreno_wc_distrusted;
+ extern "C" uint64_t native_adreno_publish_stats[3];
+ extern "C" volatile uint32_t native_adreno_import_sync;
++extern "C" volatile uint64_t native_adreno_import_sync_below;
+ extern "C" void sweet_native_adreno_fault_report(const char *why);
+ namespace {
+ struct Backend {
+@@ -433,7 +434,10 @@ extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit
+  backend.extra_slots=extra<0?0u:(extra>3?3u:(unsigned)extra);
+  int import_sync=0;PE_parse_boot_argn("sweetimportsync",&import_sync,sizeof(import_sync));
+  native_adreno_import_sync=import_sync!=0;
+- IOLog("SWEET RENDER: imported BO cache sync by %s (sweetimportsync=%d)\n",import_sync?"kernel at every submit/completion":"client per command",import_sync);
++ uint32_t below_kib=2048;PE_parse_boot_argn("sweetimportmin",&below_kib,sizeof(below_kib));
++ native_adreno_import_sync_below=(uint64_t)below_kib<<10;
++ IOLog("SWEET RENDER: imported BO cache sync by %s (sweetimportsync=%d), kernel still maintains imports below %u KiB\n",
++   import_sync?"kernel at every submit/completion":"client per command",import_sync,below_kib);
+  int swap_fence=0;PE_parse_boot_argn("sweetpresentfence",&swap_fence,sizeof(swap_fence));
+  backend.present_swap_fence=swap_fence!=0;
+  int present_locked=0;PE_parse_boot_argn("sweetpresentlock",&present_locked,sizeof(present_locked));
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp b/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp
+index 225c4f7..1557215 100644
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp
+@@ -19,6 +19,15 @@ extern "C" uint64_t native_adreno_publish_stats[3];
+  * 0129 hardware: the full publish was 15.7ms of a 16.1ms submit, 204MiB in
+  * 620 objects per submit. Owned cacheable BOs are always maintained. */
+ extern "C" {volatile uint32_t native_adreno_import_sync=1;}
++/* With client sync, imported BOs smaller than this are still maintained by the
++ * kernel: SweetMetal2 flushes the IOSurfaces a command uses, but not
++ * newBufferWithBytesNoCopy/newTextureWithBytesNoCopy host memory. The 0129
++ * 204MiB per submit was large surfaces. 0 = maintain no imported BO. */
++extern "C" {volatile uint64_t native_adreno_import_sync_below=2u<<20;}
++static bool kernelMaintainsImport(const NativeAdrenoMemory *m)
++{
++    return native_adreno_import_sync || m->bytes()<native_adreno_import_sync_below;
++}
+ static bool coherentMapping(unsigned writeback) {return writeback && native_adreno_io_coherent;}
+ static bool overlap(uint64_t a,uint64_t ab,uint64_t b,uint64_t bb)
+ {return a<b+bb && b<a+ab;}
+@@ -355,7 +364,7 @@ IOReturn NativeAdrenoVm::publishMapped()
+         const Mapping &m=mappings_[i];
+         if(!m.memory)continue;
+         if(coherentMapping(m.writeback)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
+-        if(m.memory->imported() && !native_adreno_import_sync) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
++        if(m.memory->imported() && !kernelMaintainsImport(m.memory)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
+         if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_))return fail(ArmSmmu4KIoError);
+         if(!m.memory->writeCombined() || distrust_write_combined_) {   /* the ones actually maintained */
+             __atomic_add_fetch(&native_adreno_publish_stats[1],(uint64_t)m.memory->bytes(),__ATOMIC_RELAXED);
+@@ -369,7 +378,7 @@ IOReturn NativeAdrenoVm::acquireImported()
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+     for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
+         const Mapping &m=mappings_[i];
+-        if(!m.memory || !m.memory->imported() || !(m.permissions&ArmSmmu4KWrite) || !native_adreno_import_sync)continue;
++        if(!m.memory || !m.memory->imported() || !(m.permissions&ArmSmmu4KWrite) || !kernelMaintainsImport(m.memory))continue;
+         if(coherentMapping(m.writeback)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
+         if(m.memory->acquireDeviceWrites(0,m.memory->bytes()))return fail(ArmSmmu4KIoError);
+     }

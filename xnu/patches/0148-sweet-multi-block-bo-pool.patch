@@ -1,0 +1,205 @@
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+index c79c6ff..d66da6a 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -484,10 +484,18 @@ extern "C" int sweet_native_adreno_reserve_pool(void)
+ {
+  if(NativeAdrenoMemory::poolBytes())return 1;
+  uint32_t pool_mib=384;PE_parse_boot_argn("sweetbopool",&pool_mib,sizeof(pool_mib));
+- IOReturn reserved=kIOReturnNoMemory;uint32_t got=0;
+- for(uint32_t mib=pool_mib>1024?1024:pool_mib;mib>=16 && reserved;mib/=2)
+-  if(!(reserved=NativeAdrenoMemory::reservePool(36,(size_t)mib<<20)))got=mib;
+- if(pool_mib)IOLog("SWEET RENDER: owned BO pool reserved %u of %u MiB (%#x)\n",got,pool_mib,reserved);
++ if(pool_mib>1024)pool_mib=1024;
++ /* Blocks of up to 64 MiB (0137: 48 MiB was the largest contiguous run), halving on refusal. */
++ uint32_t got=0,blocks=0,mib=64;IOReturn last=kIOReturnSuccess;
++ while(got<pool_mib && mib>=16) {
++  uint32_t want=pool_mib-got<mib?pool_mib-got:mib;
++  if(want<16)want=16;
++  last=NativeAdrenoMemory::reservePool(36,(size_t)want<<20);
++  if(last==kIOReturnNoResources)break;   /* every block slot used */
++  if(last) {mib/=2;continue;}
++  got+=want;++blocks;
++ }
++ if(pool_mib)IOLog("SWEET RENDER: owned BO pool reserved %u of %u MiB in %u blocks (%#x)\n",got,pool_mib,blocks,last);
+  return got!=0;
+ }
+ extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit *submit,
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.cpp b/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.cpp
+index 18b92dd..90a1471 100644
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.cpp
+@@ -39,8 +39,18 @@ struct Pool {
+     unsigned char *virt=nullptr;uint64_t physical=0;size_t bytes=0,used=0,peak=0;
+     PoolExtent free[512];unsigned count=0;
+     bool write_combined=false;
+-} pool;
+-bool poolTake(size_t bytes,size_t *offset) {
++};
++/* 0148: several blocks. On sweet XNU hands out at most ~48 MiB physically contiguous even early in bsd init (0137), so the pool is
++ * up to PoolBlocks of them; a BO never straddles two blocks and remembers its own (pool_block_). */
++enum : unsigned {PoolBlocks=16};
++Pool pools[PoolBlocks];unsigned pool_blocks=0;
++void poolStats() {
++    size_t used=0;
++    for(unsigned b=0;b<pool_blocks;++b)used+=pools[b].used;
++    native_adreno_pool_stats[3]=(uint32_t)(used>>20);
++    if((uint32_t)(used>>20)>native_adreno_pool_stats[4])native_adreno_pool_stats[4]=(uint32_t)(used>>20);
++}
++bool poolTake(Pool &pool,size_t bytes,size_t *offset) {
+     int best=-1;
+     for(unsigned i=0;i<pool.count;++i)if(pool.free[i].bytes>=bytes && (best<0 || pool.free[i].bytes<pool.free[best].bytes))best=(int)i;
+     if(best<0)return false;
+@@ -48,10 +58,10 @@ bool poolTake(size_t bytes,size_t *offset) {
+     pool.free[best].offset+=bytes;pool.free[best].bytes-=bytes;
+     if(!pool.free[best].bytes) {for(unsigned i=(unsigned)best;i+1<pool.count;++i)pool.free[i]=pool.free[i+1];--pool.count;}
+     pool.used+=bytes;if(pool.used>pool.peak)pool.peak=pool.used;
+-    native_adreno_pool_stats[3]=(uint32_t)(pool.used>>20);native_adreno_pool_stats[4]=(uint32_t)(pool.peak>>20);
++    poolStats();
+     return true;
+ }
+-void poolGive(size_t offset,size_t bytes) {
++void poolGive(Pool &pool,size_t offset,size_t bytes) {
+     unsigned at=0;while(at<pool.count && pool.free[at].offset<offset)++at;
+     if(pool.count>=512) {pool.used-=bytes;return;}   /* cannot happen with bounded fragmentation; the extent is lost, not reused */
+     for(unsigned i=pool.count;i>at;--i)pool.free[i]=pool.free[i-1];
+@@ -66,10 +76,15 @@ void poolGive(size_t offset,size_t bytes) {
+         for(unsigned i=at;i+1<pool.count;++i)pool.free[i]=pool.free[i+1];
+         --pool.count;
+     }
+-    pool.used-=bytes;native_adreno_pool_stats[3]=(uint32_t)(pool.used>>20);
++    pool.used-=bytes;poolStats();
++}
+ }
++size_t NativeAdrenoMemory::poolBytes()
++{
++    size_t bytes=0;
++    for(unsigned b=0;b<pool_blocks;++b)bytes+=pools[b].bytes;
++    return bytes;
+ }
+-size_t NativeAdrenoMemory::poolBytes() {return pool.bytes;}
+ IOMemoryDescriptor *NativeAdrenoMemory::userDescriptor() const
+ {return descriptor_?static_cast<IOMemoryDescriptor *>(descriptor_):pool_view_;}
+ /* int-152: a user BO's pages changed attribute one pmap_set_cache_attributes call at a time (each walks the page's mappings, flushes the
+@@ -78,18 +93,23 @@ IOMemoryDescriptor *NativeAdrenoMemory::userDescriptor() const
+  * its pages take the attribute once here and keep it while the pool lives. */
+ IOReturn NativeAdrenoMemory::writeCombinePool()
+ {
+-    if(!pool.descriptor || !pool.virt || !pool.bytes)return kIOReturnNotReady;
+-    if(pool.write_combined)return kIOReturnSuccess;
+-    IOReturn status=NativeAdrenoMaintainOwnedPages(pool.virt,pool.bytes,NativeAdrenoCleanInvalidate);
+-    if(status)return status;
+-    const NativeAdrenoPhysicalSpan span={0,pool.physical,pool.bytes};
+-    status=NativeAdrenoSetPagesCacheMode(&span,1,true);
+-    if(status)return status;
+-    pool.write_combined=true;return kIOReturnSuccess;
++    if(!pool_blocks)return kIOReturnNotReady;
++    for(unsigned b=0;b<pool_blocks;++b) {
++        Pool &pool=pools[b];
++        if(!pool.descriptor || !pool.virt || !pool.bytes)return kIOReturnNotReady;
++        if(pool.write_combined)continue;
++        IOReturn status=NativeAdrenoMaintainOwnedPages(pool.virt,pool.bytes,NativeAdrenoCleanInvalidate);
++        if(status)return status;
++        const NativeAdrenoPhysicalSpan span={0,pool.physical,pool.bytes};
++        status=NativeAdrenoSetPagesCacheMode(&span,1,true);
++        if(status)return status;
++        pool.write_combined=true;
++    }
++    return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoMemory::reservePool(unsigned bits,size_t bytes)
+ {
+-    if(pool.descriptor)return kIOReturnBusy;
++    if(pool_blocks>=PoolBlocks)return kIOReturnNoResources;
+     if(!bytes || (bytes&(PAGE_SIZE-1)) || !outputWidth(bits))return kIOReturnBadArgument;
+     NativeAdrenoCpuState cpu{};
+     IOReturn status=NativeAdrenoQueryCpuGranule(&cpu);if(status!=kIOReturnSuccess)return status;
+@@ -108,9 +128,11 @@ IOReturn NativeAdrenoMemory::reservePool(unsigned bits,size_t bytes)
+         descriptor->getLength()!=bytes) {
+         (void)descriptor->complete();descriptor->release();return kIOReturnUnsupported;
+     }
++    Pool &pool=pools[pool_blocks];
+     pool.descriptor=descriptor;pool.virt=virt;pool.physical=first;pool.bytes=bytes;pool.used=pool.peak=0;
+     pool.free[0]={0,bytes};pool.count=1;
+-    native_adreno_pool_stats[0]=(uint32_t)(bytes>>20);
++    ++pool_blocks;
++    native_adreno_pool_stats[0]=(uint32_t)(poolBytes()>>20);
+     return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous,size_t budget,bool pooled)
+@@ -123,19 +145,20 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
+     NativeAdrenoCpuState cpu{};
+     IOReturn status=NativeAdrenoQueryCpuGranule(&cpu);if(status!=kIOReturnSuccess)return status;
+     uint64_t limit=UINT64_C(1)<<bits;
+-    if(pooled && pool.descriptor && capacity<=pool.bytes) {
++    for(unsigned b=0;pooled && b<pool_blocks;++b) {
++        Pool &pool=pools[b];
+         size_t offset=0;
+-        if(poolTake(capacity,&offset)) {
++        if(capacity<=pool.bytes && poolTake(pool,capacity,&offset)) {
+             const uint64_t physical=pool.physical+offset;
+-            if(physical>=limit || capacity>limit-physical) {poolGive(offset,capacity);}
++            if(physical>=limit || capacity>limit-physical) {poolGive(pool,offset,capacity);}
+             else {
+                 spans_=IONew(NativeAdrenoPhysicalSpan,1);
+-                if(!spans_) {poolGive(offset,capacity);return kIOReturnNoMemory;}
++                if(!spans_) {poolGive(pool,offset,capacity);return kIOReturnNoMemory;}
+                 owned_spans_=IONew(NativeAdrenoPhysicalSpan,1);
+-                if(!owned_spans_) {IODelete(spans_,NativeAdrenoPhysicalSpan,1);spans_=nullptr;poolGive(offset,capacity);return kIOReturnNoMemory;}
++                if(!owned_spans_) {IODelete(spans_,NativeAdrenoPhysicalSpan,1);spans_=nullptr;poolGive(pool,offset,capacity);return kIOReturnNoMemory;}
+                 owned_capacity_=owned_count_=1;owned_spans_[0]={0,physical,capacity};
+                 span_capacity_=1;span_count_=1;spans_[0]={0,physical,bytes};
+-                mapping_=pool.virt+offset;bytes_=bytes;allocated_bytes_=capacity;pooled_=true;pool_offset_=offset;prepared_=true;write_combined_=pool.write_combined;
++                mapping_=pool.virt+offset;bytes_=bytes;allocated_bytes_=capacity;pooled_=true;pool_offset_=offset;pool_block_=b;prepared_=true;write_combined_=pool.write_combined;
+                 /* Turnip CPU-maps every BO through clientMemoryForType; a pooled one has no descriptor of its own. */
+                 pool_view_=IOSubMemoryDescriptor::withSubRange(pool.descriptor,offset,capacity,kIODirectionInOut);
+                 if(!pool_view_) {(void)release();return kIOReturnNoMemory;}
+@@ -148,8 +171,8 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
+                 return kIOReturnSuccess;
+             }
+         }
+-        native_adreno_pool_stats[2]=native_adreno_pool_stats[2]+1;
+     }
++    if(pooled && pool_blocks)native_adreno_pool_stats[2]=native_adreno_pool_stats[2]+1;
+     IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone);
+     if(contiguous)options|=kIOMemoryPhysicallyContiguous;
+     descriptor_=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,capacity,(limit-1)&~uint64_t(PAGE_SIZE-1));
+@@ -268,7 +291,7 @@ IOReturn NativeAdrenoMemory::makeWriteCombined()
+     if(write_combined_ && prepared_ && !quarantined_ && !device_references_)return kIOReturnSuccess;
+     if(!(descriptor_ || pooled_) || imported_ || !prepared_ || quarantined_ || device_references_ || write_combined_ || !mapping_ || !span_count_)
+         return kIOReturnNotReady;
+-    if(pooled_ && pool.write_combined) {write_combined_=true;return kIOReturnSuccess;}
++    if(pooled_ && pools[pool_block_].write_combined) {write_combined_=true;return kIOReturnSuccess;}
+     IOReturn status=NativeAdrenoMaintainOwnedPages(mapping_,allocated_bytes_,NativeAdrenoCleanInvalidate);
+     if(status)return status;
+     status=NativeAdrenoSetPagesCacheMode(owned_spans_,owned_count_,true);
+@@ -284,7 +307,7 @@ IOReturn NativeAdrenoMemory::release()
+         if(pool_view_->getRetainCount()>1) {quarantined_=true;return kIOReturnBusy;}
+         pool_view_->release();pool_view_=nullptr;
+     }
+-    if(write_combined_ && pooled_ && pool.write_combined)write_combined_=false;   /* the pool's pages keep the attribute */
++    if(write_combined_ && pooled_ && pools[pool_block_].write_combined)write_combined_=false;   /* the pool's pages keep the attribute */
+     if(write_combined_) {
+         /* The pages go back to the VM cacheable, as they came. */
+         const IOReturn status=NativeAdrenoSetPagesCacheMode(owned_spans_,owned_count_,false);
+@@ -311,7 +334,7 @@ IOReturn NativeAdrenoMemory::release()
+         descriptor_->release();descriptor_=nullptr;
+         native_adreno_trace_stage=34;
+     }
+-    if(pooled_) {poolGive(pool_offset_,allocated_bytes_);pooled_=false;prepared_=false;pool_offset_=0;}
++    if(pooled_) {poolGive(pools[pool_block_],pool_offset_,allocated_bytes_);pooled_=false;prepared_=false;pool_offset_=0;pool_block_=0;}
+     if(spans_)IODelete(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
+     if(owned_spans_)IODelete(owned_spans_,NativeAdrenoPhysicalSpan,owned_capacity_);
+     owned_spans_=nullptr;owned_count_=owned_capacity_=0;
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.h b/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.h
+index 7e9675a..cec88d4 100644
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.h
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.h
+@@ -45,6 +45,7 @@ class NativeAdrenoMemory final {
+     uint32_t device_references_=0;
+     bool prepared_=false,quarantined_=false,write_combined_=false,pooled_=false,borrowed_nc_=false;
+     size_t pool_offset_=0;
++    unsigned pool_block_=0;   /* which pool block a pooled BO came from */
+     IOMemoryDescriptor *pool_view_=nullptr;   /* a pooled BO's own range of the pool, for user mappings */
+     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
+ public:

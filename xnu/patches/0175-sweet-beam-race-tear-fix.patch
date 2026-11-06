@@ -1,0 +1,75 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0110293..07ebb6f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -959,10 +959,22 @@ AppleCLCD::beamProbe(void)
+ }
+ 
+ /* The copy writes rows top to bottom faster than the panel scans them. Begun
+- * while the scan is at active row b, it overtakes the scan at row
+- * b/(1 - copy/scan) - after the last copied row when b >= rows*(1 - copy/scan).
+- * So start in that late window (with a 1.5x copy-time margin), never in the
+- * last lines before the wrap, where fetch-ahead may already read the next frame. */
++ * while the scan is at active row b, it crosses the scan at row
++ * b/(1 - copy/scan): rows below the crossing show the new frame in THIS
++ * refresh and rows above it the old one - a tear - unless the crossing lies
++ * past the last row, i.e. b >= rows*(1 - copy/scan). Then this refresh shows
++ * the old frame whole and the copy, still faster than the scan, leads the
++ * next refresh from the top.
++ * 0175: the danger is a copy FASTER than estimated (earlier crossing), so the
++ * start row is computed for a copy 1.5x faster than the running average.
++ * 0145 inflated the copy time instead, which started copies ~500 rows early
++ * and put a tear in the lower fifth of the screen at the average copy speed.
++ * A slower copy only moves the crossing down; it must still beat the scan of
++ * the next refresh, checked with a 1.5x slower copy. Never start in the last
++ * lines before the wrap, where fetch-ahead may already read the next frame.
++ * The line counter reads >= the total during vertical blanking; 0145 gave up
++ * there and copied unsynchronised (~16 per 1000 presents once frame rates
++ * rose). Now it waits from the wrap, bounded by two refreshes. */
+ void
+ AppleCLCD::beamWait(uint32_t rows)
+ {
+@@ -972,30 +984,35 @@ AppleCLCD::beamWait(uint32_t rows)
+ 	if (!fBeam || rows == 0 || rows > fBeamLast - fBeamFirst) {
+ 		return;
+ 	}
+-	const uint64_t copy = (fCopyRowNs ? fCopyRowNs : 1100) * 3 / 2, scan = fBeamLineNs;
+-	if (copy >= scan) {
++	const uint64_t avg = fCopyRowNs ? fCopyRowNs : 1100;
++	const uint64_t fast = avg * 2 / 3, slow = avg * 3 / 2, scan = fBeamLineNs;
++	if (slow >= scan) {
+ 		__atomic_add_fetch(&fStatsBeamSkips, 1, __ATOMIC_RELAXED);
+ 		return;
+ 	}
+-	const uint32_t from = fBeamFirst + rows - (uint32_t)((uint64_t)rows * copy / scan);
++	const uint32_t from = fBeamFirst + rows - (uint32_t)((uint64_t)rows * fast / scan);
+ 	const uint32_t to = fBeamLast - 16;
+ 	if (from >= to) {
+ 		__atomic_add_fetch(&fStatsBeamSkips, 1, __ATOMIC_RELAXED);
+ 		return;
+ 	}
+ 	const uint64_t began = mach_absolute_time();
++	const uint64_t limit_ns = 2 * (uint64_t)fBeamTotal * scan;
+ 	uint32_t line = 0, before = fIntf[INTF_LINE_COUNT / 4];
+ 	bool ok = false;
+-	for (unsigned tries = 0; tries < 6; tries++) {
++	for (;;) {
+ 		line = fIntf[INTF_LINE_COUNT / 4];
+-		if (line >= fBeamTotal) {
++		if (line < fBeamTotal && line >= from && line < to) {
++			ok = true;
+ 			break;
+ 		}
+-		if (line >= from && line < to) {
+-			ok = true;
++		uint64_t waited = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &waited);
++		if (waited >= limit_ns) {
+ 			break;
+ 		}
+-		const uint32_t ahead = line < from ? from - line : fBeamTotal - line + from;
++		const uint32_t at = line < fBeamTotal ? line : 0;
++		const uint32_t ahead = at < from ? from - at : fBeamTotal - at + from;
+ 		IODelay((unsigned)((uint64_t)ahead * scan / NSEC_PER_USEC) + 1);
+ 	}
+ 	uint64_t ns = 0;

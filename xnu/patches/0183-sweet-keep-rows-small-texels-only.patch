@@ -1,0 +1,19 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index db94882..af35d63 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -331,7 +331,13 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+     PE_parse_boot_argn("sweetsurfalignall", &roundall, sizeof roundall);
+     char creator[32] = {0};
+     proc_selfname(creator, sizeof(creator));
+-    const bool keep_asked = asked != 0 && !roundall && strcmp(creator, "backboardd") != 0;
++    /* 0183: only for one- and two-byte texels. 0182 kept every caller's rows and
++     * SpringBoard's 1125x2436 BGRA snapshot surfaces (4512-byte rows) then could not
++     * be imported as backboardd render targets (usage 0x5): App Library background
++     * and the search status bar went black. 4/8-byte surfaces are rendered by the
++     * GPU, as before 0182; CPU-written glyph masks (LA08/A8) keep their rows. */
++    const bool keep_asked = asked != 0 && !roundall && strcmp(creator, "backboardd") != 0 &&
++        s->bytesPerElement < 4;
+     if (keep_asked && (asked & 63)) {
+         static unsigned kept;
+         if (kept++ < 32) {

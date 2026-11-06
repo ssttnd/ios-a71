@@ -1,0 +1,67 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 8c3fcba..24a63f7 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@ extern void sweet_pmem_init(void);
+ extern void flame_wlan_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_gpu_probe(void);
++extern int sweet_native_adreno_reserve_pool(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -659,6 +660,7 @@ sweet_ufs_init(void)
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
++	(void)sweet_native_adreno_reserve_pool();   /* owned-BO pool while memory is unfragmented (0147) */
+ 	sweet_pmem_init();       /* /dev/pmem (sweetpmem=1): bsd/dev/sweet_pmem.c, from ios-flame 0094 */
+ 	flame_wlan_init();       /* /dev/wlan, en0 + Apple80211 for wifid: bsd/dev/flame_wlan.c, from ios-flame 0123 */
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+index 88557d9..c79c6ff 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -477,6 +477,19 @@ void AGXDeviceUserClient::free()
+  }
+  IOUserClient::free();
+ }
++/* The owned-BO pool (0146/0147): one physically contiguous block, taken from
++ * bsd init (sweet_ufs_init) while memory is still unfragmented. sweetbopool=MiB
++ * (default 384, 0 = off); halves until a block is found. Returns 1 if held. */
++extern "C" int sweet_native_adreno_reserve_pool(void)
++{
++ if(NativeAdrenoMemory::poolBytes())return 1;
++ uint32_t pool_mib=384;PE_parse_boot_argn("sweetbopool",&pool_mib,sizeof(pool_mib));
++ IOReturn reserved=kIOReturnNoMemory;uint32_t got=0;
++ for(uint32_t mib=pool_mib>1024?1024:pool_mib;mib>=16 && reserved;mib/=2)
++  if(!(reserved=NativeAdrenoMemory::reservePool(36,(size_t)mib<<20)))got=mib;
++ if(pool_mib)IOLog("SWEET RENDER: owned BO pool reserved %u of %u MiB (%#x)\n",got,pool_mib,reserved);
++ return got!=0;
++}
+ extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit *submit,
+     NativeAdrenoRing *ring,IOLock *gate,const NativeAdrenoRingClock *clock,
+     int (*health)(void *),int (*read)(void *,uint32_t,uint32_t *),const NativeAdrenoAbiDeviceInfo *info)
+@@ -500,15 +513,14 @@ extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit
+   * The UniXNU pool (one contiguous block, write-combined once) was never
+   * reserved here. Owned BOs come from it first; larger or overflow ones keep
+   * the old path. sweetbopool=MiB (0 = off). */
+- uint32_t pool_mib=192;PE_parse_boot_argn("sweetbopool",&pool_mib,sizeof(pool_mib));
+- if(pool_mib) {
++ /* 0136 hardware: reserved here, only 48 of 192 MiB were still contiguous and
++  * the pool filled within seconds; sweet_native_adreno_reserve_pool() now
++  * takes it early in bsd init, and this only write-combines it. */
++ if(NativeAdrenoMemory::poolBytes() || sweet_native_adreno_reserve_pool()) {
+   const uint64_t began=clock->now_us(clock->cookie);
+-  IOReturn reserved=kIOReturnNoMemory;uint32_t got=0;
+-  for(uint32_t mib=pool_mib>1024?1024:pool_mib;mib>=16 && reserved;mib/=2)
+-   if(!(reserved=NativeAdrenoMemory::reservePool(36,(size_t)mib<<20)))got=mib;
+-  const IOReturn combined=!reserved && wc?NativeAdrenoMemory::writeCombinePool():kIOReturnSuccess;
+-  IOLog("SWEET RENDER: owned BO pool %u MiB reserve=%#x write-combine=%#x in %llu us\n",got,reserved,combined,
+-    clock->now_us(clock->cookie)-began);
++  const IOReturn combined=wc?NativeAdrenoMemory::writeCombinePool():kIOReturnSuccess;
++  IOLog("SWEET RENDER: owned BO pool %lu MiB write-combine=%#x in %llu us\n",
++    (unsigned long)(NativeAdrenoMemory::poolBytes()>>20),combined,clock->now_us(clock->cookie)-began);
+  }
+  auto provider=new AGXAccelerator;
+  if(!provider || !provider->init() || !provider->attach(IOService::getPlatform())) {

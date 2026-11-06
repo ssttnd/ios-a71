@@ -1,0 +1,17 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index b12b85f..0ff7c1d 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -268,8 +268,10 @@ SweetBattery::poll(void)
+ 			/* milli-percent = mA * ms / 3600000 * 100 / 5020 * 1000 */
+ 			fSocMilli += (int32_t)((int64_t)ma * (int64_t)ms / 180720);
+ 		}
+-		if (!currentValid || (ma > -150 && ma < 150)) {
+-			fSocMilli += (curve - fSocMilli) / 20;
++		/* 0158 (0150 hardware: the curve swung 40-61% under load): drift only at a measured rest,
++		 * 2% of the difference per poll; with no valid current hold the counted value. */
++		if (currentValid && ma > -100 && ma < 100) {
++			fSocMilli += (curve - fSocMilli) / 50;
+ 		}
+ 	}
+ 	fLastPoll = now;

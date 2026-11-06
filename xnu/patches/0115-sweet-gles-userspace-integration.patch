@@ -1,0 +1,214 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -444,6 +444,28 @@
+ 
+ 	return error;
+ }
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* Fixed, compositor-only GLES bootstrap. Inactive on ordinary Metal boots. */
++static int
++sweet_gles_exec_env(struct image_params *imgp, int ptr_size)
++{
++    int enabled=0;
++    if (!PE_parse_boot_argn("sweetgles", &enabled, sizeof(enabled)) || enabled!=1) return 0;
++    const char *path=imgp->ip_strings+strlen("executable_path="), *base=path;
++    for (const char *c=path; *c; ++c) if (*c=='/') base=c+1;
++    if (strcmp(base,"backboardd")) return 0;
++    if (imgp->ip_argspace<ptr_size) return E2BIG;
++    static const char env[]="DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib";
++    int error=exec_add_user_string(imgp,CAST_USER_ADDR_T(env),UIO_SYSSPACE,TRUE);
++    if (error) return error;
++    if (imgp->ip_argspace<ptr_size) return E2BIG;
++    imgp->ip_argspace-=ptr_size;
++    imgp->ip_envc++;
++    printf("SWEET GLES: backboardd will load /usr/lib/sweetgl.dylib\n");
++    return 0;
++}
++#endif
+ 
+ /*
+  * dyld is now passed the executable path as a getenv-like variable
+@@ -5759,6 +5781,11 @@
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++    error=sweet_gles_exec_env(imgp,new_ptr_size);
++    if (error) goto bad;
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -35,6 +35,7 @@
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
++#include <pexpert/pexpert.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+@@ -305,8 +306,23 @@
+ 	}
+ }
+ 
++/* dyld op0x5a asks which DYLD_* settings may be honored. Scope the
++ * permissive experimental policy to backboardd on explicit GLES boots. */
++static int
++sweet_gles_dyld_policy(__unused struct proc *p, int call, user_addr_t arg)
++{
++    int enabled=0;
++    char name[32]={0};proc_selfname(name,sizeof(name));
++    if (call!=0x5a || !PE_parse_boot_argn("sweetgles",&enabled,sizeof(enabled)) ||
++        enabled!=1 || strcmp(name,"backboardd")) return ENOPOLICY;
++    uint64_t request[2], flags=0x7b;
++    if (copyin(arg,request,sizeof(request)) || !request[1]) return EFAULT;
++    return copyout(&flags,(user_addr_t)request[1],sizeof(flags));
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++	.mpo_policy_syscall = sweet_gles_dyld_policy,
+ };
+ 
+ /*
+@@ -360,7 +376,7 @@
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+-	.mpc_name = "SWEET AMFI",
++	.mpc_name = "AMFI",
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+ 	.mpc_ops = &sweet_amfi_mac_ops,
+ };
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -3,6 +3,7 @@
+  * one resource gate, synchronous quiescence before VM edits/cache publication.
+  */
+ #include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IOService.h>
+@@ -204,7 +205,9 @@
+   if(provider)provider->release();return 1;
+  }
+  provider->setName("NativeAdrenoGpu");
+- provider->setProperty("MetalPluginName","NativeAdrenoMetal");
++ int gles=0;PE_parse_boot_argn("sweetgles",&gles,sizeof(gles));
++ if(gles!=1)provider->setProperty("MetalPluginName","NativeAdrenoMetal");
++ else IOLog("SWEET GLES: native A618 transport published; Metal discovery disabled for GLES boot\n");
+  provider->setProperty("model","Adreno 618");
+  provider->setProperty("NativeAdrenoABI",NativeAdrenoAbiVersion,32);
+  backend.published=true;provider->registerService();
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -84,6 +84,7 @@
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++	if (clientMemory && memory != NULL) memory->complete();
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+@@ -98,7 +99,7 @@
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++		kernelMap = memory->map(mapCache | (readOnly ? kIOMapReadOnly : 0));
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -276,6 +277,15 @@
+ 	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
+ }
+ 
++static uint32_t
++sweet_gles_rows(uint32_t asked, uint32_t width, uint32_t ew, uint32_t bpe, bool client)
++{
++    if (!asked) return sweet_row_bytes(width,ew,bpe);
++    char name[32]={0};proc_selfname(name,sizeof(name));
++    return !client && !strcmp(name,"backboardd") ?
++        (uint32_t)(((uint64_t)asked+63)&~63ull) : asked;
++}
++
+ /* Geometry from the creation properties (IOSurface.h keys). */
+ static IOReturn
+ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -294,8 +304,8 @@
+ 	    s->bytesPerElement > 64 || s->elementWidth == 0 || s->elementHeight == 0) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow",
+-	    sweet_row_bytes(s->width, s->elementWidth, s->bytesPerElement));
++	s->bytesPerRow = sweet_gles_rows(sweet_dict_u32(props,"IOSurfaceBytesPerRow",0),
++        s->width,s->elementWidth,s->bytesPerElement,props->getObject("IOSurfaceAddress")!=NULL);
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
+@@ -527,7 +537,8 @@
+ 	s->retain();
+ 	ref->surface = s;
+ 	ref->count = 1;
+-	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
++	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache |
++	    (s->readOnly ? kIOMapReadOnly : 0));
+ 	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
+ 	if (ref->data == NULL || ref->state == NULL) {
+ 		ref->release();
+@@ -684,7 +695,27 @@
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++    OSNumber *address=OSDynamicCast(OSNumber,props->getObject("IOSurfaceAddress"));
++    if (ret==kIOReturnSuccess && address!=NULL) {
++        uint64_t addr=address->unsigned64BitValue(), start=trunc_page_64(addr);
++        uint64_t used=(uint64_t)s->bytesPerRow*sweet_div_up(s->height,s->elementHeight);
++        uint64_t len=round_page_64((addr-start)+used);
++        bool valid=addr && used && len && s->planeCount==0 &&
++            len<=SWEET_SURFACE_MAX_ALLOC && addr+used>=addr;
++        IOMemoryDescriptor *md=valid?IOMemoryDescriptor::withAddressRange(start,len,kIODirectionInOut,fTask):NULL;
++        if (md && md->prepare()!=kIOReturnSuccess) {
++            OSSafeReleaseNULL(md);
++            md=IOMemoryDescriptor::withAddressRange(start,len,kIODirectionOut,fTask);
++            if (md && md->prepare()!=kIOReturnSuccess) OSSafeReleaseNULL(md);
++            s->readOnly=md!=NULL;
++        }
++        if (!md) ret=kIOReturnVMError;
++        else {
++            s->memory=md;s->clientMemory=true;s->mapCache=kIOMapDefaultCache;
++            s->offset=(uint32_t)(addr-start);s->allocSize=(uint32_t)len;
++            if (!sweet_surface_publish(s)) ret=kIOReturnNoResources;
++        }
++    } else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+@@ -739,6 +770,9 @@
+ 	}
+ 	case kSweetSurfaceCreate:
+ 		return create(args);
++	case 6:
++	case 7:
++		return kIOReturnUnsupported;
+ 	case kSweetSurfaceLookup: {
+ 		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
+ 		IOReturn ret = kIOReturnNotFound;
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -40,6 +40,9 @@
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+ 
++	bool clientMemory=false;
++	bool readOnly=false;
++
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 

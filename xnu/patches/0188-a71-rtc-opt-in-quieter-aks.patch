@@ -1,0 +1,39 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -398,7 +398,13 @@
+ 	int real = 1;   /* 0149 hardware: PM6150 QG/SMB5 reads work; sweetbattery=0 = static 100% */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
+-	if (sweet_spmi_init() == 0) {
++	/*
++	 * The A71's RTC does not hold the real date (it reads 1970), and its SPMI arbiter was
++	 * not exercised here until a run of images boot-looped, so this is opt-in.
++	 */
++	int use_rtc = 0;
++	(void)PE_parse_boot_argn("sweetrtc", &use_rtc, sizeof(use_rtc));
++	if (use_rtc && sweet_spmi_init() == 0) {
+ 		sweetSetCalendarFromRtc();
+ 	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -275,10 +275,15 @@
+ 		break;
+ 	}
+ 
+-	char name[32];
+-	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	/* Thousands of calls per session: log failures and only the first successes. */
++	static uint32_t logged;
++	if (ret != kIOReturnSuccess || logged < 64) {
++		char name[32];
++		logged++;
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
++		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	}
+ 	return ret;
+ }
+ #endif /* SWEET */

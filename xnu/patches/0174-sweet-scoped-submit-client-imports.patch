@@ -1,0 +1,24 @@
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp b/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp
+index 2cf7a54..d4cb927 100644
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp
+@@ -351,6 +351,11 @@ IOReturn NativeAdrenoVm::publishHandle(uint64_t handle,bool writes)
+     Mapping *m=find(handle);
+     if(!m || !m->memory || m->mapped_spans!=m->spans)return kIOReturnBadArgument;
+     if(coherentMapping(m->writeback))return kIOReturnSuccess;
++    /* 0174: the scoped (SubmitResources) path follows the same ownership rule as publishMapped. The native Metal transport
++     * cleans every imported IOSurface it lists once per command and after real completion; walking each one again at every
++     * submit measured ~2.2-2.4 ms per call on 0172 (1a6b5dd/1df4ee1 traces). sweetimportsync=1 restores kernel maintenance;
++     * the GLES client (userspace/gles) relies on it and must boot with sweetimportsync=1. */
++    if(m->memory->imported() && !kernelMaintainsImport(m->memory)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;return kIOReturnSuccess;}
+     return m->memory->publishForDevice(0,m->memory->bytes(),writes,distrust_write_combined_);
+ }
+ IOReturn NativeAdrenoVm::acquireHandle(uint64_t handle)
+@@ -359,6 +364,7 @@ IOReturn NativeAdrenoVm::acquireHandle(uint64_t handle)
+     Mapping *m=find(handle);
+     if(!m || !m->memory || m->mapped_spans!=m->spans)return kIOReturnBadArgument;
+     if(coherentMapping(m->writeback))return kIOReturnSuccess;
++    if(m->memory->imported() && !kernelMaintainsImport(m->memory)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;return kIOReturnSuccess;}
+     return m->memory->acquireDeviceWrites(0,m->memory->bytes());
+ }
+ IOReturn NativeAdrenoVm::publishMapped()

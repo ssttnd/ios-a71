@@ -1,0 +1,24 @@
+--- a/iokit/Kernel/arm/SweetNativeAdrenoRender.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoRender.cpp
+@@ -23,7 +23,12 @@
+   {0x9e00,0x00180000,0x00180000},
+   /* UBWC2: bank14 (hbb_lo1), min32B, four channels, levels2+3 swizzle. */
+   {0x8e08,2,0xffffffff}, {0xb604,2,0xffffffff}, {0xae02,2,0xffffffff},
+-  {0x0e01,1u<<21,(1u<<23)|(3u<<21)}, {0x0e19,0x81,0x81},
++  {0x0e01,1u<<21,(1u<<23)|(3u<<21)},
++  /* Downstream A618 a6xx_start programs UCHE_CLIENT_PF=1. The XML calls
++   * this field PERFSEL, not a render-enable bit. On sweet0114 bit7 read
++   * zero after the generic mainline0x81 write. Use the vendor selector
++   * and validate its entire8-bit field instead of gating on that bit. */
++  {0x0e19,1,0xff},
+   /* A618 has no eight-channel macrotiling override. Downstream a6xx_start
+    * accesses RBBM_NC_MODE_CNTL only for channel==8. Preserve its reset
+    * setting here; 0112 hardware reads 0xdeafbead from 0x534. */
+@@ -42,6 +47,7 @@
+  if(core[0x084f]!=0xb || core[0x0e09]!=0xfffff000 || core[0x0e0a]!=0x1ffff)return 1;
+  *info={0x06010800,512u*1024u,0x100000,UINT64_C(0x1fffffffff000),
+      UINT64_C(0x40000000),UINT64_C(0x30000000),14,6,0,2,NativeAdrenoDeviceClientIova,0};
++ IOLog("SWEET RENDER: A618 PERFSEL legacy selector=1 accepted\n");
+  IOLog("SWEET RENDER: A618 address modes/GMEM512K/UBWC2 programmed and read back\n");
+  return 0;
+ }

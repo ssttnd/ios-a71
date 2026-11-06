@@ -1,0 +1,70 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 2c13d5e..6a99363 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -35,6 +35,7 @@ private:
+ 	uint64_t fLastPoll;
+ 	unsigned fPolls;
+ 	unsigned fFailures;     /* 0161: consecutive failed reads */
++	bool fSeededSdam;       /* 0162: seeded from the QG driver's SOC: count only, no drift */
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -193,11 +194,14 @@ SweetBattery::readWord(unsigned address, uint16_t *value)
+ unsigned
+ SweetBattery::estimatePercent(unsigned mv)
+ {
+-	/* Generic single-cell curve, intentionally NOT advertised as QG SOC.
+-	 * Load sag, temperature, aging and charging introduce large errors. */
+-	static const unsigned volts[] = {3400, 3500, 3600, 3700, 3800, 3900,
+-	    4000, 4100, 4200, 4350};
+-	static const unsigned soc[] = {1, 5, 10, 20, 40, 60, 75, 85, 93, 100};
++	/* 0162: the phone's own OCV table at 25 C (stock DT qcom,pc-temp-v1-lut, Sunwoda and
++	 * NVT 5020 mAh profiles agree within ~10 mV). 20-50% spans only 3.77-3.89 V, so under
++	 * load this is a fallback only; the QG SDAM charge seeds the count when it is there. */
++	static const unsigned volts[] = {3000, 3310, 3450, 3600, 3686, 3708, 3729, 3772, 3801,
++	    3816, 3835, 3852, 3872, 3895, 3922, 3970, 4018, 4056, 4097, 4142, 4190, 4238, 4287,
++	    4335, 4378, 4416, 4433};
++	static const unsigned soc[] = {0, 1, 2, 4, 6, 10, 14, 20, 26, 32, 38, 42, 46, 50, 54, 58,
++	    62, 66, 70, 74, 78, 82, 86, 90, 94, 98, 100};
+ 	if (mv <= volts[0]) {
+ 		return soc[0];
+ 	}
+@@ -272,6 +276,28 @@ SweetBattery::poll(void)
+ 	if (!fSocValid) {
+ 		fSocMilli = curve;
+ 		fSocValid = true;
++		/*
++		 * 0162 (0151 hardware: the count said 55% where OrangeFox's QG driver said 25%): the
++		 * Linux QG driver keeps its SOC in the PM6150 QG SDAM (stock DT qcom,qg-sdam@b600),
++		 * qg-sdam layout: valid 0x46, SOC 0x47 (percent). Seed from it; logged raw once.
++		 */
++		uint8_t sdam[16];
++		bool sdamOk = true;
++		for (unsigned i = 0; i < sizeof(sdam) && sdamOk; i++) {
++			sdamOk = !sweet_spmi_read(0, 0xb640 + i, &sdam[i]);
++		}
++		if (sdamOk) {
++			IOLog("SWEET BATTERY: QG SDAM b640: %02x %02x %02x %02x %02x %02x %02x %02x "
++			    "%02x %02x %02x %02x %02x %02x %02x %02x\n", sdam[0], sdam[1], sdam[2], sdam[3],
++			    sdam[4], sdam[5], sdam[6], sdam[7], sdam[8], sdam[9], sdam[10], sdam[11],
++			    sdam[12], sdam[13], sdam[14], sdam[15]);
++		}
++		if (sdamOk && sdam[6] != 0 && sdam[7] <= 100) {
++			fSocMilli = (int32_t)sdam[7] * 1000;
++			fSeededSdam = true;
++		}
++		IOLog("SWEET BATTERY: seed %d%% from %s (curve %d%%)\n", (int)(fSocMilli / 1000),
++		    fSeededSdam ? "QG SDAM" : "the OCV table", (int)(curve / 1000));
+ 	} else {
+ 		absolutetime_to_nanoseconds(now - fLastPoll, &ns);
+ 		uint64_t ms = ns / 1000000ull;
+@@ -281,7 +307,7 @@ SweetBattery::poll(void)
+ 		}
+ 		/* 0158 (0150 hardware: the curve swung 40-61% under load): drift only at a measured rest,
+ 		 * 2% of the difference per poll; with no valid current hold the counted value. */
+-		if (currentValid && ma > -100 && ma < 100) {
++		if (!fSeededSdam && currentValid && ma > -100 && ma < 100) {
+ 			fSocMilli += (curve - fSocMilli) / 50;
+ 		}
+ 	}

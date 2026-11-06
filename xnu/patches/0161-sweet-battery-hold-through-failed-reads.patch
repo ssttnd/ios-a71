@@ -1,0 +1,43 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 0ff7c1d..2c13d5e 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -34,6 +34,7 @@ private:
+ 	int32_t fSocMilli;
+ 	uint64_t fLastPoll;
+ 	unsigned fPolls;
++	unsigned fFailures;     /* 0161: consecutive failed reads */
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -226,10 +227,20 @@ SweetBattery::poll(void)
+ 	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u) : 0;
+ 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+ 	valid = valid && mv >= 2800 && mv <= 4600;
++	/*
++	 * 0161 (0150/0151 hardware: 13 and 3 single failed polls, each published 100% and not
++	 * charging for 5 s): hold the last good reading through up to a minute of failures.
++	 */
+ 	if (!valid) {
+-		publish(100, 4200, 0, true, true, false, true, false, false);
++		if (!fSocValid || ++fFailures >= 12) {
++			if (fFailures == 12) {
++				IOLog("SWEET BATTERY: 12 failed reads in a row; static fallback\n");
++			}
++			publish(100, 4200, 0, true, true, false, true, false, false);
++		}
+ 		return;
+ 	}
++	fFailures = 0;
+ 	bool external = (usb & 0x10u) != 0;
+ 	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
+ 	unsigned state = charger & 7u;
+@@ -242,7 +253,7 @@ SweetBattery::poll(void)
+ 	uint16_t rawCurrent;
+ 	bool currentValid = !sweet_spmi_read(0, 0x4805, &subtype) &&
+ 	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
+-	    rawCurrent != 0x8000;
++	    rawCurrent != 0x8000 && rawCurrent != 0;   /* 0161: an exact 0 is not a running phone */
+ 	if (currentValid) {
+ 		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
+ 		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */

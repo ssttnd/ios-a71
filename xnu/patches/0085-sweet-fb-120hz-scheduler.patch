@@ -1,0 +1,138 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -25,7 +25,7 @@
+  * Everything else is accepted and logged once.
+  *
+  * SwapEnd copies the enabled layers' surfaces into the panel memory (no
+- * scaling, CPU copy). Vsync (notification type 5) is a 60 Hz timer that
++ * scaling, CPU copy). Vsync (notification type 5) is a software timer up to 120 Hz that
+  * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+  * enabled it, through the port they registered (IOConnectSetNotificationPort).
+  *
+@@ -68,7 +68,7 @@
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+-#define SWEET_FB_VSYNC_US               16667
++#define SWEET_FB_MAX_HZ                 120u
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+@@ -113,7 +113,10 @@
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+-	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
++	uint32_t      fPresentHz, fTimerHz, fPresentPhase;
++	uint64_t      fVsyncPeriod, fNextVsync;
++	uint64_t      fStatsStart, fStatsCallbacks, fStatsPresents, fStatsMissed;
++	void rearmVsync(void);
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+@@ -194,8 +197,20 @@
+ 	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+-	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	/* Preserve the legacy hz=0 meaning, and bound the experiment at 120 Hz. */
++	fPresentHz = hz == 0 ? 60u : (hz > SWEET_FB_MAX_HZ ? SWEET_FB_MAX_HZ : hz);
++	fTimerHz = fPresentHz > 60u ? fPresentHz : 60u;
++	fPresentPhase = 0;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC / fTimerHz, &fVsyncPeriod);
++	if (fVsyncPeriod == 0) {
++		return false;
++	}
++	fStatsStart = mach_absolute_time();
++	fStatsCallbacks = fStatsPresents = fStatsMissed = 0;
++	fNextVsync = fStatsStart + fVsyncPeriod;
++	fVsync->wakeAtTime(fNextVsync);
++	IOLog("SWEET FB: scheduler v2 requested=%u present=%u timer=%u Hz; software timing, panel mode unchanged\n",
++	    hz, fPresentHz, fTimerHz);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -206,12 +221,43 @@
+ 	return true;
+ }
+ 
++/* Advance on an absolute cadence. Skip missed slots instead of queuing bursts. */
++void
++AppleCLCD::rearmVsync(void)
++{
++	uint64_t now = mach_absolute_time();
++	fNextVsync += fVsyncPeriod;
++	if (fNextVsync <= now) {
++		uint64_t skipped = (now - fNextVsync) / fVsyncPeriod + 1;
++		fNextVsync += skipped * fVsyncPeriod;
++		fStatsMissed += skipped;
++	}
++	uint64_t elapsed;
++	absolutetime_to_nanoseconds(now - fStatsStart, &elapsed);
++	if (elapsed >= 10ULL * NSEC_PER_SEC) {
++		IOLog("SWEET FB: timing window_ms=%llu callbacks=%llu present_calls=%llu missed_deadlines=%llu target=%u Hz\n",
++		    elapsed / NSEC_PER_MSEC, fStatsCallbacks, fStatsPresents,
++		    fStatsMissed, fPresentHz);
++		fStatsStart = now;
++		fStatsCallbacks = fStatsPresents = fStatsMissed = 0;
++	}
++	fVsync->wakeAtTime(fNextVsync);
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
++	(void)sender;
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	++fb->fStatsCallbacks;
++	/* Fractional pacing also handles requested rates that do not divide 60. */
++	fb->fPresentPhase += fb->fPresentHz;
++	bool presentDue = fb->fPresentPhase >= fb->fTimerHz;
++	if (presentDue) {
++		fb->fPresentPhase -= fb->fTimerHz;
++	}
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -239,10 +285,10 @@
+ 				}
+ 			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		fb->rearmVsync();
+ 		return;
+ 	}
+-	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	bool flush = fb->fDirty && presentDue;
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+@@ -253,10 +299,11 @@
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		++fb->fStatsPresents;
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	fb->rearmVsync();
+ }
+ 
+ void
+@@ -292,9 +339,9 @@
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+  * A swap only records the frame: copying 10 MB into the panel on every
+- * swap (backboardd presents at 60 Hz) took the whole CPU. The vsync timer
+- * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+- * default 10 Hz).
++ * swap consumed substantial CPU time. The timer presents the latest frame
++ * at sweetfb_hz (default 10, maximum 120); it does not program the DSI panel
++ * or enable GPU rendering. Presentation time is included in deadline pacing.
+  */
+ void
+ AppleCLCD::swap(const uint8_t *rec)

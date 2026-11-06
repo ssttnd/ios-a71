@@ -1,0 +1,74 @@
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+index 26a6150..3bc7fde 100644
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -116,6 +116,24 @@ pm_io(uint64_t pa)
+ 	return pm_map[i].va ? (volatile uint32_t *)(pm_map[i].va + (pa - win)) : NULL;
+ }
+ 
++/* 0151: 0131/0140 wland stopped on its first apps-SMMU read through here while
++ * the kernel's own read of the same registers (0149/0150) worked. Trace the
++ * first device accesses: CPU, address, and the value once the access returned. */
++static unsigned pm_traced;
++extern int cpu_number(void);
++
++/* The probe's read through this exact path (window cache + mapping). */
++uint32_t sweet_pmem_probe_read(uint64_t pa);
++uint32_t
++sweet_pmem_probe_read(uint64_t pa)
++{
++	lck_mtx_lock(&sweet_pmem_lock);
++	volatile uint32_t *r = pm_io(pa);
++	const uint32_t v = r ? *r : 0xdeadbeef;
++	lck_mtx_unlock(&sweet_pmem_lock);
++	return v;
++}
++
+ static int
+ pm_rw(struct uio *uio, bool write)
+ {
+@@ -136,11 +154,20 @@ pm_rw(struct uio *uio, bool write)
+ 			err = EINVAL;
+ 			break;
+ 		}
++		const bool trace = pm_traced < 48;
++		if (trace) {
++			pm_traced++;
++			printf("SWEET PMEM: cpu%d %s %u at %#llx (%s)\n", cpu_number(), write ? "write" : "read", n,
++			    (unsigned long long)pa, proc_best_name(current_proc()));
++		}
+ 		volatile uint32_t *r = pm_io(pa);
+ 		if (r == NULL) {
+ 			err = ENOMEM;
+ 			break;
+ 		}
++		if (trace) {
++			printf("SWEET PMEM: mapped %#llx at %p\n", (unsigned long long)pa, (void *)(uintptr_t)r);
++		}
+ 		if (write) {
+ 			err = uiomove((caddr_t)pm_bounce, (int)n, uio);
+ 			__asm__ volatile ("dmb oshst" ::: "memory");
+@@ -153,6 +180,9 @@ pm_rw(struct uio *uio, bool write)
+ 				pm_bounce[i] = r[i];
+ 			}
+ 			__asm__ volatile ("dmb oshld" ::: "memory");
++			if (trace) {
++				printf("SWEET PMEM: read %#llx -> %#x\n", (unsigned long long)pa, pm_bounce[0]);
++			}
+ 			err = uiomove((caddr_t)pm_bounce, (int)n, uio);
+ 		}
+ 	}
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 1b5bd07..232587f 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -973,6 +973,9 @@ sweet_smmu_probe_thread(void *arg, wait_result_t wr)
+ 	printf("SWEET SMMU: sCR0=%#x\n", scr0);
+ 	const uint32_t id0 = smmu[0x20 / 4], id1 = smmu[0x24 / 4], id2 = smmu[0x28 / 4];
+ 	printf("SWEET SMMU: ID0=%#x ID1=%#x ID2=%#x: %u SMRs, %u context banks\n", id0, id1, id2, id0 & 0xff, id1 & 0xff);
++	extern uint32_t sweet_pmem_probe_read(uint64_t pa);
++	printf("SWEET SMMU: reading ID0 through the /dev/pmem window path next\n");
++	printf("SWEET SMMU: pmem-path ID0=%#x\n", sweet_pmem_probe_read(0x15000020));
+ }
+ 
+ void sweet_smmu_probe_start(void);

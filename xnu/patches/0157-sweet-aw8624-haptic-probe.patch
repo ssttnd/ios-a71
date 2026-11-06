@@ -1,0 +1,599 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 8603669..ae9f6f8 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -119,6 +119,7 @@ bsd/dev/flame_sta.c		standard
+ bsd/dev/flame_wlan.c		standard
+ bsd/dev/sweet_bt.c			standard
+ bsd/dev/sweet_bt_hci.c			standard
++bsd/dev/sweet_haptic.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_adreno.c			standard
+ bsd/dev/sweet_adreno_clock.c		standard
+diff --git a/bsd/dev/sweet_haptic.c b/bsd/dev/sweet_haptic.c
+new file mode 100644
+index 0000000..35d9576
+--- /dev/null
++++ b/bsd/dev/sweet_haptic.c
+@@ -0,0 +1,561 @@
++/*
++ * Sweet (Redmi Note 10 Pro) haptics: the Awinic AW8624 LRA driver on QUP1 SE3 (global SE9,
++ * i2c@0xa8c000, address 0x5a, SDA/SCL GPIO 46/47 = qup13), reset TLMM GPIO 4 (low = reset),
++ * interrupt PM6150L GPIO 10 (not used: polled). Board values from the phone's DT
++ * (aw8624_haptic@5A): f0_pre 208.0 Hz, f0_coeff 260, cont drive 0x6a / overdrive 0x9b, cont_td
++ * 0xf06c, zero-cross 0x8f8, brake count 3, tset 0x11, sw brake 0x2c, bemf 00 08 03 f8.
++ * Register sequences from Xiaomi's sm6150 aw8624.c (continuous mode: the chip drives the motor at
++ * its resonance until GO is cleared). The GENI I2C core is the touch driver's (bsd/dev/sweet_touch.c).
++ *
++ *   sweethaptic=1  bus up, reset released, chip ID and status read; nothing written to the chip
++ *   sweethaptic=2  ... Android's init values, then three 80 ms buzzes about 45 s after boot
++ *
++ * Every write is read back; a NACK, an I2C error, a mismatch or a fault bit stops the driver and
++ * puts the chip back into reset.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void sweet_haptic_init(void);
++
++#define HAP_SE_PA        0x00a8c000u   /* QUP1 SE3 = global SE9 */
++#define HAP_GCC_PA       0x00100000u
++#define HAP_NORTH_PA     0x03900000u   /* TLMM NORTH tile: GPIO 4, 46, 47 */
++#define HAP_GCC_VOTE     0x5200cu
++#define HAP_RCG          0x183a8u      /* gcc_qupv3_wrap1_s3_clk_src */
++#define HAP_CBCR         0x183a4u      /* gcc_qupv3_wrap1_s3_clk, vote bit 25 */
++#define HAP_GPIO_CFG(n)  ((uint32_t)(n) * 0x1000u)
++#define HAP_GPIO_IO(n)   (HAP_GPIO_CFG(n) + 4u)
++#define HAP_ADDR         0x5au
++#define HAP_RESET_GPIO   4u
++
++#define SE_STATUS       0x040u
++#define SE_MCLK         0x048u
++#define SE_FW           0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_DMA          0x258u
++#define SE_TX_LEN       0x26cu
++#define SE_RX_LEN       0x270u
++#define SE_SCL          0x278u
++#define SE_CMD          0x600u
++#define SE_CTRL         0x604u
++#define SE_IRQ          0x610u
++#define SE_IRQ_EN       0x614u
++#define SE_IRQ_CLR      0x618u
++#define SE_TX           0x700u
++#define SE_RX           0x780u
++#define SE_TX_COUNT     0x800u
++#define SE_RX_COUNT     0x804u
++#define SE_HW_TX        0xe24u
++#define SE_HW_RX        0xe28u
++#define SE_TX_WM        0x80cu
++#define SE_RX_WM_IRQ    (1u << 26)
++#define SE_RX_LAST      (1u << 27)
++#define SE_TX_WM_IRQ    (1u << 30)
++#define SE_DONE         (1u << 0)
++#define SE_NACK         (1u << 10)
++#define SE_ERRORS       (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | \
++                         (1u << 13) | (3u << 24) | (3u << 28))
++#define SE_EVENTS       (SE_DONE | SE_ERRORS | SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ)
++/* geni_se_config_packing(8, 4, true, true, true): start bits 7/15/23/31,
++ * MSB-to-LSB, length 8, STOP only on vector 3. FIFO bytes remain LSB first. */
++#define SE_PACK0        0x0007f8feu
++#define SE_PACK1        0x000ffefeu
++
++
++static struct {
++	vm_offset_t se, gcc, gpio;
++	bool started, dead, probing;
++	uint32_t irq_status, irq_last;
++	unsigned sent, got;
++	int stage;
++} hs;
++static int hap_sleep_chan;
++
++static uint32_t
++hap_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++hap_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++hap_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&hap_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++hap_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(hap_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++hap_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++{
++	uint32_t off = HAP_GPIO_CFG(pin);
++	uint32_t cfg = hap_rd(hs.gpio, off);
++	if (out) {
++		/* Set the desired latch before enabling output (reset is active low). */
++		hap_wr(hs.gpio, HAP_GPIO_IO(pin),
++		    (hap_rd(hs.gpio, HAP_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	hap_wr(hs.gpio, off, cfg);
++}
++
++/* Called only for a transfer started by this driver, including a stretched TX. */
++static void
++hap_abort(void)
++{
++	hap_wr(hs.se, SE_CTRL, 2); /* abort M command, release held bus */
++	bool done = false;
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (hap_rd(hs.se, SE_IRQ) & (1u << 5)) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	if (!done || !hap_wait_clear(hs.se, SE_STATUS, 1u)) {
++		hs.dead = true;
++		printf("SWEET HAPTIC: abort failed status=%#x irq=%#x; stopping\n",
++		    hap_rd(hs.se, SE_STATUS), hap_rd(hs.se, SE_IRQ));
++	}
++	/* Bound drain even if the hardware reports an impossible FIFO count. */
++	for (unsigned i = 0; i < 64 && (hap_rd(hs.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)hap_rd(hs.se, SE_RX);
++	}
++	hap_wr(hs.se, SE_IRQ_CLR, 0xffffffffu);
++	if (hap_rd(hs.se, SE_TX_COUNT) & 0xfffffffu) {
++		hs.dead = true;
++		printf("SWEET HAPTIC: TX FIFO not empty after abort; stopping\n");
++	}
++}
++
++/* Keep all observed bits for diagnostics, even if a watermark was cleared. */
++static uint32_t
++hap_irq(void)
++{
++	hs.irq_last = hap_rd(hs.se, SE_IRQ);
++	hs.irq_status |= hs.irq_last;
++	return hs.irq_last;
++}
++
++/* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
++static int
++hap_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
++    unsigned nr, bool stretch)
++{
++	if (hs.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
++		return EIO;
++	}
++	if (!hap_wait_clear(hs.se, SE_STATUS, 1u)) {
++		hs.dead = true; /* no other SE9 owner is supported */
++		return EBUSY;
++	}
++	hap_wr(hs.se, SE_IRQ_CLR, 0xffffffffu);
++	hap_wr(hs.se, SE_TX_WM, nt ? 1u : 0u);
++	hap_wr(hs.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
++	hap_wr(hs.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
++	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
++	int err = ETIMEDOUT;
++	for (unsigned i = 0; i < 20000; ++i) {
++		uint32_t irq = hap_irq();
++		if (irq & SE_ERRORS) {
++			err = (irq & SE_NACK) ? ENXIO : EIO;
++			/* A completed NACK is normal during address probing. Aborting an
++			 * idle sequencer may never produce ABORT_DONE. Wait for completion
++			 * and leave a clean idle engine available for the other IC. */
++			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
++				delay(1);
++				irq = hap_irq();
++			}
++			if ((irq & SE_DONE) && !(hap_rd(hs.se, SE_STATUS) & 1u) &&
++			    !(hap_rd(hs.se, SE_TX_COUNT) & 0xfffffffu) &&
++			    !(hap_rd(hs.se, SE_RX_COUNT) & 0x1ffffffu)) {
++				hap_wr(hs.se, SE_IRQ_CLR, irq);
++				return err;
++			}
++			break;
++		}
++		if (nt && !hs.sent && (irq & SE_TX_WM_IRQ)) {
++			uint32_t word = 0;
++			for (unsigned j = 0; j < nt; ++j) {
++				word |= (uint32_t)tx[j] << (8u * j);
++			}
++			hap_wr(hs.se, SE_TX, word);
++			hs.sent = nt;
++			hap_wr(hs.se, SE_TX_WM, 0);
++		}
++		uint32_t count = hap_rd(hs.se, SE_RX_COUNT) & 0x1ffffffu;
++		if (count > 64 || count > (nr - hs.got + 3u) / 4u) {
++			err = EIO;
++			break;
++		}
++		while (count--) {
++			uint32_t word = hap_rd(hs.se, SE_RX);
++			for (unsigned j = 0; j < 4 && hs.got < nr; ++j) {
++				rx[hs.got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		/* DONE is checked after draining RX, so final short words aren't lost. */
++		if (irq & SE_DONE) {
++			/* Re-sample after the final drain; a late error must beat DONE. */
++			irq = hap_irq();
++			if (irq & SE_ERRORS) {
++				continue;
++			}
++			hap_wr(hs.se, SE_IRQ_CLR, irq);
++			if (hs.got == nr && hs.sent == nt) {
++				return 0;
++			}
++			err = EIO;
++			break;
++		}
++		/* Preserve DONE/errors if they arrive during this iteration. */
++		hap_wr(hs.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
++		delay(1);
++	}
++	hap_abort();
++	return err;
++}
++
++static int
++hap_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
++    unsigned nr, bool stretch)
++{
++	hs.irq_status = hs.irq_last = 0;
++	hs.sent = hs.got = 0;
++	int err = hap_msg_run(addr, tx, nt, rx, nr, stretch);
++	if (hs.probing) {
++		printf("SWEET HAPTIC: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
++		    addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
++		    err, hs.irq_last, hs.irq_status, hs.sent, hs.got,
++		    hap_rd(hs.se, SE_STATUS));
++	}
++	return err;
++}
++
++static int
++hap_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
++{
++	uint8_t ptr[2] = {(uint8_t)(reg >> 8), (uint8_t)reg};
++	int err = hap_msg(addr, wide ? ptr : ptr + 1, wide ? 2u : 1u,
++	    NULL, 0, true);
++	if (err) {
++		return err;
++	}
++	/* STOP_STRETCH on the pointer write retains the bus for a repeated START. */
++	return hap_msg(addr, NULL, 0, buf, len, false);
++}
++
++static bool
++hap_clocks(void)
++{
++	/* wrapper1 core/core2x/m_ahb/s_ahb (bits 18-21) and wrap1 s3 (bit 25), as the touch driver votes s1 */
++	uint32_t mask = (0x0fu << 18) | (1u << 25);
++	hap_wr(hs.gcc, HAP_GCC_VOTE, hap_rd(hs.gcc, HAP_GCC_VOTE) | mask);
++	uint32_t dfs = hap_rd(hs.gcc, HAP_RCG + 0x14u);
++	uint32_t cfg = hap_rd(hs.gcc, HAP_RCG + 4u);
++	printf("SWEET HAPTIC: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
++	    hap_rd(hs.gcc, HAP_GCC_VOTE), hap_rd(hs.gcc, HAP_RCG), cfg, dfs);
++	if (dfs & 1u) {
++		cfg = hap_rd(hs.gcc, HAP_RCG + 0x1cu);
++		if ((cfg & 0x371fu) != 1u) {
++			printf("SWEET HAPTIC: DFS level0=%#x is not XO/1; stop\n", cfg);
++			return false;
++		}
++	} else {
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;   /* XO, divider 1: 19.2 MHz */
++		hap_wr(hs.gcc, HAP_RCG + 4u, cfg);
++		hap_wr(hs.gcc, HAP_RCG, hap_rd(hs.gcc, HAP_RCG) | 1u);
++		if (!hap_wait_clear(hs.gcc, HAP_RCG, 1u)) {
++			printf("SWEET HAPTIC: RCG update timeout\n");
++			return false;
++		}
++	}
++	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, HAP_CBCR};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		if (!hap_wait_clear(hs.gcc, branches[i], 1u << 31)) {
++			printf("SWEET HAPTIC: GCC branch %#x halted (%#x)\n", branches[i], hap_rd(hs.gcc, branches[i]));
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool
++hap_se_init(void)
++{
++	uint32_t fw = hap_rd(hs.se, SE_FW);
++	uint32_t tx = hap_rd(hs.se, SE_HW_TX), rx = hap_rd(hs.se, SE_HW_RX);
++	printf("SWEET HAPTIC: se9 fw=%#x proto=%u status=%#x tx=%#x rx=%#x\n",
++	    fw, (fw >> 8) & 0xffu, hap_rd(hs.se, SE_STATUS), tx, rx);
++	if (((fw >> 8) & 0xffu) != 3u || (hap_rd(hs.se, 0x64) & 1u) ||
++	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
++	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
++		printf("SWEET HAPTIC: SE9 has no ABL-loaded I2C firmware / 32-bit FIFOs; stop\n");
++		return false;
++	}
++	if (hap_rd(hs.se, SE_STATUS) & 0x1001u) {
++		printf("SWEET HAPTIC: SE9 already busy; stop\n");
++		return false;
++	}
++	hap_wr(hs.se, 0xe18, 0);
++	hap_wr(hs.se, 0xe1c, 0);
++	hap_wr(hs.se, 0x644, 0);
++	hap_wr(hs.se, SE_IRQ_CLR, 0xffffffffu);
++	hap_wr(hs.se, 0x648, 0xffffffffu);
++	hap_wr(hs.se, SE_DMA, 0);
++	hap_wr(hs.se, 0x28, hap_rd(hs.se, 0x28) | 0x7fu);
++	hap_wr(hs.se, 0xe30, hap_rd(hs.se, 0xe30) | 0x0fu);
++	hap_wr(hs.se, 0x24, 0x7f);
++	hap_wr(hs.se, 0x20, 1);
++	hap_wr(hs.se, SE_CLK_SEL, 0);
++	hap_wr(hs.se, SE_MCLK, (7u << 4) | 1u);
++	hap_wr(hs.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
++	hap_wr(hs.se, 0x254, 0);
++	hap_wr(hs.se, 0x260, SE_PACK0);
++	hap_wr(hs.se, 0x264, SE_PACK1);
++	hap_wr(hs.se, 0x284, SE_PACK0);
++	hap_wr(hs.se, 0x288, SE_PACK1);
++	hap_wr(hs.se, SE_TX_WM, 0);
++	hap_wr(hs.se, 0x810, 0);
++	hap_wr(hs.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
++	hap_wr(hs.se, SE_IRQ_EN, SE_EVENTS);
++	if (hap_rd(hs.se, 0x260) != SE_PACK0 || hap_rd(hs.se, 0x264) != SE_PACK1 ||
++	    (hap_rd(hs.se, SE_TX_COUNT) & 0xfffffffu) || (hap_rd(hs.se, SE_RX_COUNT) & 0x1ffffffu)) {
++		printf("SWEET HAPTIC: SE9 setup readback mismatch / inherited FIFO data; stop\n");
++		return false;
++	}
++	return true;
++}
++
++/* ---------------------------------------------------------------- AW8624 */
++
++static int
++aw_rd(uint8_t reg, uint8_t *val)
++{
++	return hap_read(HAP_ADDR, reg, false, val, 1);
++}
++
++static int
++aw_wr_raw(uint8_t reg, uint8_t val)
++{
++	uint8_t tx[2] = {reg, val};
++	return hap_msg(HAP_ADDR, tx, 2, NULL, 0, false);
++}
++
++/* a write that must read back (registers that hold their value) */
++static bool
++aw_wr(uint8_t reg, uint8_t val)
++{
++	uint8_t rb = 0;
++	if (hs.dead || aw_wr_raw(reg, val) || aw_rd(reg, &rb)) {
++		printf("SWEET HAPTIC: write %#04x <- %#04x failed\n", reg, val);
++		hs.dead = true;
++		return false;
++	}
++	if (rb != val) {
++		printf("SWEET HAPTIC: write %#04x <- %#04x read back %#04x\n", reg, val, rb);
++		hs.dead = true;
++		return false;
++	}
++	return true;
++}
++
++/* the vendor driver's write_bits: keep = mask, then OR the field */
++static bool
++aw_bits(uint8_t reg, uint8_t keep, uint8_t field)
++{
++	uint8_t v = 0;
++	if (hs.dead || aw_rd(reg, &v)) {
++		hs.dead = true;
++		return false;
++	}
++	return aw_wr(reg, (uint8_t)((v & keep) | field));
++}
++
++static void
++hap_reset(bool run)
++{
++	/* GPIO 4 as output, function gpio, no pull, 2 mA; low holds the chip in reset */
++	hap_gpio(HAP_RESET_GPIO, 0, 0, 0, true, run);
++}
++
++static bool
++aw_status(const char *when)
++{
++	uint8_t sysst = 0, sysint = 0, glb = 0;
++	if (aw_rd(0x01, &sysst) || aw_rd(0x02, &sysint) || aw_rd(0x47, &glb)) {
++		hs.dead = true;
++		return false;
++	}
++	printf("SWEET HAPTIC: %s: SYSST %#04x SYSINT %#04x GLB_STATE %#04x\n", when, sysst, sysint, glb);
++	/* SYSINT: UVLO bit 5, over-current bit 3, over-temperature bit 2 (aw8624_reg.h) */
++	if (sysint & 0x2cu) {
++		printf("SWEET HAPTIC: fault bits %#04x: stop, chip back into reset\n", sysint & 0x2cu);
++		hs.dead = true;
++		return false;
++	}
++	return true;
++}
++
++static bool
++aw_init(void)
++{
++	/* aw8624_haptic_init() without the f0 calibration (the DT's f0_pre is used) */
++	return aw_bits(0x03, (uint8_t)~(1u << 5), (1u << 5)) &&        /* SYSINTM: UVLO off (standby) */
++	    aw_bits(0x04, (uint8_t)~(1u << 0), (1u << 0)) &&           /* SYSCTRL: standby */
++	    aw_bits(0x20, (uint8_t)~(1u << 5), 0) &&                   /* DBGCTRL: trig enable */
++	    aw_bits(0x2e, (uint8_t)~(3u << 5), (2u << 5)) &&           /* PWMDBG: 24 kHz */
++	    aw_bits(0x5f, (uint8_t)~(1u << 5), (1u << 5)) &&           /* DETCTRL: protect, no action */
++	    aw_bits(0x2d, (uint8_t)~(1u << 7), 0) &&                   /* PWMPRC: off */
++	    aw_bits(0x3e, (uint8_t)~(1u << 7), 0) &&                   /* PRLVL: off */
++	    aw_bits(0x66, (uint8_t)~(1u << 6), (1u << 6)) &&           /* ADCTEST: vbat HW compensation */
++	    aw_bits(0x5d, (uint8_t)~(1u << 7), (1u << 7)) &&           /* R_SPARE */
++	    aw_wr(0x39, 0x2c) &&                                       /* SW_BRAKE (DT vib_sw_brake) */
++	    aw_wr(0x4f, 0x00) &&                                       /* THRS_BRA_END */
++	    aw_bits(0x31, (uint8_t)~(0xfu << 4), 0) &&                 /* WAVECTRL */
++	    aw_wr(0x72, 0x08) && aw_wr(0x73, 0xf8) &&                  /* zero cross 0x8f8 */
++	    aw_wr(0x4d, 0x11) &&                                       /* TSET */
++	    aw_wr(0x74, 0x00) && aw_wr(0x75, 0x08) && aw_wr(0x76, 0x03) && aw_wr(0x77, 0xf8);  /* BEMF thresholds */
++}
++
++/* aw8624_haptic_cont(): continuous drive at the preset f0 until GO is cleared */
++static bool
++aw_cont_start(void)
++{
++	const unsigned f0_reg = 1000000000u / (2080u * 260u);   /* f0_pre 208.0 Hz, f0_coeff 260 */
++	return aw_bits(0x04, (uint8_t)~(3u << 2), (2u << 2)) &&       /* SYSCTRL: play mode CONT */
++	    aw_bits(0x04, (uint8_t)~(1u << 0), 0) &&                   /* active */
++	    aw_bits(0x03, (uint8_t)~(1u << 5), 0) &&                   /* UVLO interrupt on */
++	    aw_wr(0x49, (uint8_t)(f0_reg >> 8)) && aw_wr(0x4a, (uint8_t)f0_reg) &&
++	    aw_bits(0x2b, (uint8_t)~(1u << 6), (3u << 6)) &&           /* DATCTRL: 1000 Hz LPF (vendor masks) */
++	    aw_bits(0x2b, (uint8_t)~(1u << 5), (1u << 5)) &&
++	    aw_wr(0x48, (uint8_t)((1u << 7) | (1u << 3) | (1u << 0))) &&   /* CONT_CTRL: ZC detect, closed loop, auto brake */
++	    aw_wr(0x4b, 0xf0) && aw_wr(0x4c, 0x6c) &&                  /* TD 0xf06c */
++	    aw_wr(0x4d, 0x11) &&
++	    aw_wr(0x72, 0x08) && aw_wr(0x73, 0xf8) &&
++	    aw_bits(0x78, (uint8_t)~0xfu, 3) &&                        /* BEMF_NUM: 3 brake periods */
++	    aw_wr(0x7a, 0x23) &&                                       /* TIME_NZC */
++	    aw_wr(0x7b, 0x6a) && aw_wr(0x7c, 0x9b) &&                  /* drive level / overdrive */
++	    aw_wr_raw(0x05, 0x01) == 0;                                /* GO */
++}
++
++static void
++aw_cont_stop(void)
++{
++	(void)aw_wr_raw(0x05, 0x00);                                   /* GO off */
++	for (unsigned i = 0; i < 50; i++) {
++		uint8_t glb = 0;
++		if (aw_rd(0x47, &glb) || (glb & 0x0fu) == 0) {
++			break;
++		}
++		hap_wait(2);
++	}
++	(void)aw_bits(0x03, (uint8_t)~(1u << 5), (1u << 5));
++	(void)aw_bits(0x04, (uint8_t)~(1u << 0), (1u << 0));           /* standby */
++}
++
++static void
++hap_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	hap_wait(40000);    /* after the UI is up */
++	hs.gcc = ml_io_map(HAP_GCC_PA, 0x90000);
++	hs.gpio = ml_io_map(HAP_NORTH_PA, 0x30000);
++	hs.se = ml_io_map(HAP_SE_PA, 0x4000);
++	if (!hs.gcc || !hs.gpio || !hs.se || !hap_clocks()) {
++		goto out;
++	}
++	/* I2C pins: function qup13 (mux 1), bias disabled (board pull-ups), 2 mA */
++	hap_gpio(46, 1, 0, 0, false, false);
++	hap_gpio(47, 1, 0, 0, false, false);
++	if (!hap_se_init()) {
++		goto out;
++	}
++	hap_reset(false);
++	hap_wait(5);
++	hap_reset(true);
++	hap_wait(5);
++	uint8_t id = 0;
++	int err = aw_rd(0x00, &id);
++	printf("SWEET HAPTIC: AW8624 chip ID read -> %d, id %#04x (expect 0x24)\n", err, id);
++	if (err || id != 0x24) {
++		goto reset;
++	}
++	(void)aw_status("after reset");
++	if (hs.stage < 2) {
++		goto reset;
++	}
++	(void)aw_wr_raw(0x00, 0xaa);    /* soft reset (aw8624_haptic_softreset) */
++	hap_wait(2);
++	if (!aw_init() || !aw_status("after init")) {
++		goto reset;
++	}
++	for (unsigned n = 0; n < 3 && !hs.dead; n++) {
++		if (!aw_cont_start()) {
++			break;
++		}
++		hap_wait(80);
++		aw_cont_stop();
++		if (!aw_status("after buzz")) {
++			break;
++		}
++		hap_wait(300);
++	}
++	printf("SWEET HAPTIC: test buzzes done%s\n", hs.dead ? " (stopped on an error)" : "");
++reset:
++	hap_reset(false);
++	printf("SWEET HAPTIC: chip back in reset\n");
++out:
++	(void)thread_terminate(current_thread());
++}
++
++void
++sweet_haptic_init(void)
++{
++	int stage = 0;
++	(void)PE_parse_boot_argn("sweethaptic", &stage, sizeof(stage));
++	if (stage <= 0 || hs.started) {
++		return;
++	}
++	hs.started = true;
++	hs.stage = stage;
++	thread_t th;
++	if (kernel_thread_start(hap_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++		printf("SWEET HAPTIC: stage %d armed (40 s)\n", stage);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 4555c38..c87381e 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -58,6 +58,7 @@ extern void sweet_gpu_probe(void);
+ extern int sweet_native_adreno_reserve_pool(void);
+ extern void sweet_smmu_probe_start(void);
+ extern void sweet_bt_init(void);
++extern void sweet_haptic_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -665,6 +666,7 @@ sweet_ufs_init(void)
+ 	(void)sweet_native_adreno_reserve_pool();   /* owned-BO pool while memory is unfragmented (0147) */
+ 	sweet_pmem_init();       /* /dev/pmem (sweetpmem=1): bsd/dev/sweet_pmem.c, from ios-flame 0094 */
+ 	sweet_smmu_probe_start();   /* sweetsmmuprobe=1: BCM votes + apps SMMU ID read (0149) */
++	sweet_haptic_init();     /* sweethaptic=1|2: AW8624 on QUP1 SE3 (bsd/dev/sweet_haptic.c) */
+ 	sweet_bt_init();         /* sweetbt=1: WCN3990 Bluetooth over QUP0 SE3, com.apple.uart.bluetooth (bsd/dev/sweet_bt.c) */
+ 	flame_wlan_init();       /* /dev/wlan, en0 + Apple80211 for wifid: bsd/dev/flame_wlan.c, from ios-flame 0123 */
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */

@@ -1,0 +1,83 @@
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8e29586..7011303 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -127,6 +127,9 @@
+ #include <kern/host.h>
+ #include <stdatomic.h>
+ #include <os/atomic_private.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <pexpert/pexpert.h>
++#endif
+ 
+ #ifdef KDBG_MACOS_RELEASE
+ #define KTRC KDBG_MACOS_RELEASE
+@@ -5021,6 +5024,52 @@ choose_next_pset(
+  *	The thread must be locked.  The pset must be locked,
+  *	and the resulting pset is locked on return.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET 0167: the SM7150's two Cortex-A76 (cpu 6 and 7) next to six Cortex-A55, all in one
++ * pset (MAX_CPU_CLUSTERS 1; Apple's __AMP__ scheduler needs Apple's cluster machinery). 0154
++ * hardware: ~15 frames/s with the GPU gate as low as 6 ms, i.e. CoreAnimation's CPU side
++ * (backboardd, SpringBoard, apps) was the limit, and most of it ran on an A55 (~2.5x slower).
++ * A runnable thread at sweetbigpri (default 46, user-interactive) or above goes to an idle
++ * A76, else to an A76 running something of lower priority (the caller preempts it); realtime
++ * threads are never displaced. sweetbigcores=0 turns it off.
++ */
++static int sweet_big_enabled = -1;
++static int sweet_big_pri = 46;
++
++static processor_t
++sweet_choose_big(processor_set_t pset, thread_t thread)
++{
++	if (sweet_big_enabled < 0) {
++		int on = 1, pri = 46;
++		PE_parse_boot_argn("sweetbigcores", &on, sizeof(on));
++		PE_parse_boot_argn("sweetbigpri", &pri, sizeof(pri));
++		sweet_big_pri = pri;
++		sweet_big_enabled = on != 0;
++	}
++	if (!sweet_big_enabled || thread->sched_pri < sweet_big_pri || thread->bound_processor != PROCESSOR_NULL) {
++		return PROCESSOR_NULL;
++	}
++	processor_t best = PROCESSOR_NULL;
++	for (int cpu = 6; cpu <= 7; cpu++) {
++		processor_t big = processor_array[cpu];
++		if (big == PROCESSOR_NULL || big->processor_set != pset || !big->is_recommended ||
++		    big->processor_primary != big) {
++			continue;
++		}
++		if (big->state == PROCESSOR_IDLE) {
++			return big;
++		}
++		if ((big->state == PROCESSOR_RUNNING || big->state == PROCESSOR_DISPATCHING) &&
++		    big->current_pri < thread->sched_pri && big->current_pri < BASEPRI_RTQUEUES &&
++		    (best == PROCESSOR_NULL || big->current_pri < best->current_pri)) {
++			best = big;
++		}
++	}
++	return best;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ processor_t
+ choose_processor(
+ 	processor_set_t         starting_pset,
+@@ -5032,6 +5081,15 @@ choose_processor(
+ 
+ 	assert(thread->sched_pri <= MAXPRI);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (pset->online_processor_count > 2) {
++		processor_t big = sweet_choose_big(pset, thread);
++		if (big != PROCESSOR_NULL) {
++			return big;
++		}
++	}
++#endif
++
+ 	/*
+ 	 * Prefer the hinted processor, when appropriate.
+ 	 */

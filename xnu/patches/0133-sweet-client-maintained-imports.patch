@@ -1,0 +1,57 @@
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+index ebd450d..c978fcc 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -18,6 +18,7 @@
+ extern "C" void proc_selfname(char *,int);
+ extern "C" volatile uint32_t native_adreno_wc_enabled;
+ extern "C" uint64_t native_adreno_publish_stats[3];
++extern "C" volatile uint32_t native_adreno_import_sync;
+ namespace {
+ struct Backend {
+  NativeAdrenoVm *vm=nullptr;
+@@ -386,6 +387,9 @@ extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit
+  provider->setProperty("NativeAdrenoABI",NativeAdrenoAbiVersion,32);
+  int extra=3;PE_parse_boot_argn("sweetm2extra",&extra,sizeof(extra));
+  backend.extra_slots=extra<0?0u:(extra>3?3u:(unsigned)extra);
++ int import_sync=0;PE_parse_boot_argn("sweetimportsync",&import_sync,sizeof(import_sync));
++ native_adreno_import_sync=import_sync!=0;
++ IOLog("SWEET RENDER: imported BO cache sync by %s (sweetimportsync=%d)\n",import_sync?"kernel at every submit/completion":"client per command",import_sync);
+  int present_locked=0;PE_parse_boot_argn("sweetpresentlock",&present_locked,sizeof(present_locked));
+  backend.present_locked=present_locked!=0;
+  int pipeline=1;PE_parse_boot_argn("sweetpipeline",&pipeline,sizeof(pipeline));
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp b/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp
+index 3468353..225c4f7 100644
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp
+@@ -12,6 +12,13 @@ extern "C" {int (*native_adreno_dram_read32)(uint64_t,uint32_t *);int (*native_a
+  * coherent mappings at map, unmap, submission and completion. */
+ extern "C" {volatile uint32_t native_adreno_io_coherent;volatile uint32_t native_adreno_coherent_skips[4];}
+ extern "C" uint64_t native_adreno_publish_stats[3];
++/* 1: the kernel cleans/invalidates every imported (client-owned) BO at each
++ * legacy submit and completion. 0: the client maintains imported pages, as
++ * the Sunfish donor kernel requires (SweetMetal2 flushSurfaces() dc civac's
++ * every IOSurface a command uses at commit and again at completion).
++ * 0129 hardware: the full publish was 15.7ms of a 16.1ms submit, 204MiB in
++ * 620 objects per submit. Owned cacheable BOs are always maintained. */
++extern "C" {volatile uint32_t native_adreno_import_sync=1;}
+ static bool coherentMapping(unsigned writeback) {return writeback && native_adreno_io_coherent;}
+ static bool overlap(uint64_t a,uint64_t ab,uint64_t b,uint64_t bb)
+ {return a<b+bb && b<a+ab;}
+@@ -348,6 +355,7 @@ IOReturn NativeAdrenoVm::publishMapped()
+         const Mapping &m=mappings_[i];
+         if(!m.memory)continue;
+         if(coherentMapping(m.writeback)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
++        if(m.memory->imported() && !native_adreno_import_sync) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
+         if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_))return fail(ArmSmmu4KIoError);
+         if(!m.memory->writeCombined() || distrust_write_combined_) {   /* the ones actually maintained */
+             __atomic_add_fetch(&native_adreno_publish_stats[1],(uint64_t)m.memory->bytes(),__ATOMIC_RELAXED);
+@@ -361,7 +369,7 @@ IOReturn NativeAdrenoVm::acquireImported()
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+     for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
+         const Mapping &m=mappings_[i];
+-        if(!m.memory || !m.memory->imported() || !(m.permissions&ArmSmmu4KWrite))continue;
++        if(!m.memory || !m.memory->imported() || !(m.permissions&ArmSmmu4KWrite) || !native_adreno_import_sync)continue;
+         if(coherentMapping(m.writeback)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
+         if(m.memory->acquireDeviceWrites(0,m.memory->bytes()))return fail(ArmSmmu4KIoError);
+     }

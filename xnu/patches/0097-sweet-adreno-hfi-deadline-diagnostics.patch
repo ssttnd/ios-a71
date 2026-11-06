@@ -1,0 +1,94 @@
+diff --git a/bsd/dev/sweet_adreno_dma.h b/bsd/dev/sweet_adreno_dma.h
+--- a/bsd/dev/sweet_adreno_dma.h
++++ b/bsd/dev/sweet_adreno_dma.h
+@@ -44,7 +44,8 @@
+  volatile uint32_t *table;
+  void (*barrier)(void *);
+  void *cookie;
+- unsigned sequence, poisoned;
++ unsigned sequence, poisoned, responses;
++ uint32_t last_request, last_response, firmware_error;
+ };
+ int a618_hfi_init(struct a618_hfi *, const struct a618_dma_region *,
+  void (*)(void *), void *);
+diff --git a/bsd/dev/sweet_adreno_hfi.c b/bsd/dev/sweet_adreno_hfi.c
+--- a/bsd/dev/sweet_adreno_hfi.c
++++ b/bsd/dev/sweet_adreno_hfi.c
+@@ -36,7 +36,8 @@
+  hfi->table = (volatile uint32_t *)(memory->cpu + A618_TABLE_BYTES +
+      (A618_HFI_IOVA - A618_SHARED_IOVA));
+  hfi->barrier = barrier; hfi->cookie = cookie;
+- hfi->sequence = hfi->poisoned = 0;
++ hfi->sequence = hfi->poisoned = hfi->responses = 0;
++ hfi->last_request = hfi->last_response = hfi->firmware_error = 0;
+  for (unsigned i = 0; i < 4096; ++i) hfi->table[i] = 0;
+  hfi->table[0] = 0;
+  hfi->table[1] = 24 + 3 * 48; /* size in bytes; offsets below in DWORDs */
+@@ -121,11 +122,12 @@
+  hfi->sequence = (hfi->sequence + 1) % 0xfffu;
+  uint32_t sent = (hfi->sequence << 20) | ((body_words + 1) << 8) | id;
+  message[0] = sent;
++ hfi->last_request = sent;
+  for (unsigned i = 0; i < body_words; ++i) message[i + 1] = body[i];
+  int error = a618_hfi_write(hfi, message, body_words + 1);
+  if (error) return error; /* Nothing published on a rejected append. */
+  io->write(io->cookie, HFI_DOORBELL, 1);
+- for (unsigned elapsed = 0; elapsed < 10000; elapsed += 10) {
++ for (unsigned elapsed = 0; elapsed < 1000000; elapsed += 100) {
+   uint32_t interrupt = io->read(io->cookie, HFI_INTR_INFO);
+   if (interrupt == 0xffffffffu || (interrupt & HFI_CM3_FAULT)) {
+    error = EIO; goto failed;
+@@ -137,15 +139,20 @@
+   error = a618_hfi_read(hfi, 1, message, 255, &words);
+   if (error != EAGAIN && error) goto failed;
+   if (!error) {
++   ++hfi->responses;
+    unsigned received_id = message[0] & 255;
+    unsigned type = (message[0] >> 16) & 15;
+    if (received_id == 100) { error = EIO; goto failed; }
+    if (received_id != 126 || type != 2 || words < 3) {
+     error = EPROTO; goto failed;
+    }
+-   /* Full echoed header matches id, length, type and sequence. Stale ACKs
+-    * are consumed within this same bounded deadline, never accepted. */
+-   if (message[1] == sent) {
++   /* Match command ID and transaction sequence as in the Linux transport;
++    * request length bits are not used to size the ACK payload. The actual
++    * response length/type were validated above. Stale ACKs cannot extend
++    * the fixed one-second deadline. */
++   hfi->last_response = message[1];
++   if ((message[1] & 0xfff000ffu) == (sent & 0xfff000ffu)) {
++    hfi->firmware_error = message[2];
+     if (message[2]) { error = EIO; goto failed; }
+     if (words < 3 + payload_words) { error = EPROTO; goto failed; }
+     for (unsigned i = 0; i < payload_words; ++i) payload[i] = message[3 + i];
+@@ -157,7 +164,7 @@
+   error = a618_hfi_read(hfi, 2, message, 255, &words);
+   if (error != EAGAIN && error) goto failed;
+   if (!error && (message[0] & 255) == 100) { error = EIO; goto failed; }
+-  io->delay_us(io->cookie, 10);
++  io->delay_us(io->cookie, 100);
+  }
+  error = ETIMEDOUT;
+ failed:
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -379,6 +379,17 @@
+        gpu_vote, gmu_vote, &boot);
+    printf("SWEET ADRENO: legacy GMU boot errno=%d phase=%u offset=%#x value=%#x FW=%#x; CP unavailable\n",
+        error, boot.phase, boot.offset, boot.value, boot.firmware_version);
++   printf("SWEET ADRENO: HFI request=%#x response=%#x fw_error=%#x packets=%u INFO=%#x HOST_RAW=%#x CB1FSR=%#x\n",
++       hfi.last_request, hfi.last_response, hfi.firmware_error, hfi.responses,
++       sweet_adreno_read((void *)gmu, 0x14648),
++       sweet_adreno_read((void *)gmu, 0x14658),
++       sweet_adreno_read((void *)smmu, 0x9058));
++   sweet_adreno_barrier(NULL);
++   for (unsigned q = 0; q < 3; ++q) {
++    volatile uint32_t *qh = hfi.table + 6 + q * 12;
++    printf("SWEET ADRENO: HFI queue=%u status=%#x dropped=%u RX=%u TX=%u RPTR=%u WPTR=%u\n",
++        q, qh[0], qh[5], qh[8], qh[9], qh[10], qh[11]);
++   }
+    if (!error && stage >= 9) return sweet_gpu_cp_start(gmu, smmu);
+    return error;
+   }

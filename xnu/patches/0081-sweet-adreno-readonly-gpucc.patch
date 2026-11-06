@@ -1,0 +1,102 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void sweet_gpu_probe(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -659,6 +660,7 @@
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++	sweet_gpu_probe();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,71 @@
++/*
++ * First SWEET Adreno bring-up step: inspect SM6150 GPUCC clock-controller
++ * registers without powering, clocking, resetting, or submitting work to the
++ * GPU. The probe is opt-in because the ABL/firmware power state is not yet
++ * characterized on every sweet firmware build.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_gpu_probe(void);
++
++#define SWEET_GPUCC_PA       0x05090000u
++#define SWEET_GPUCC_SIZE     0x00009000u
++
++/* Byte offsets from the SM6150 GPUCC regmap in the upstream Linux driver. */
++#define GPU_CC_GX_GFX3D_CBCR       0x1054u
++#define GPU_CC_GX_GMU_CBCR         0x1064u
++#define GPU_CC_CX_GMU_CBCR         0x1098u
++#define GPU_CC_CX_GFX3D_CBCR       0x10a4u
++#define GPU_CC_CX_GFX3D_SLV_CBCR   0x10a8u
++
++static vm_offset_t sweet_gpucc;
++static int sweet_gpu_probe_attempted;
++
++static uint32_t
++sweet_gpucc_read(uint32_t offset)
++{
++	uint32_t value = *(volatile uint32_t *)(sweet_gpucc + offset);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return value;
++}
++
++void
++sweet_gpu_probe(void)
++{
++	int enabled = 0;
++	if (sweet_gpu_probe_attempted) {
++		return;
++	}
++	sweet_gpu_probe_attempted = 1;
++	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
++	if (enabled != 1) {
++		printf("SWEET GPU: read-only GPUCC probe disabled; use sweetgpu=1 to opt in\n");
++		return;
++	}
++
++	/*
++	 * Do not touch the Adreno register aperture yet. The GPU GX power-domain
++	 * state inherited from ABL is not known; this probe only reads the CX-side
++	 * clock-controller status registers. It performs no MMIO writes.
++	 */
++	sweet_gpucc = ml_io_map(SWEET_GPUCC_PA, SWEET_GPUCC_SIZE);
++	if (sweet_gpucc == 0) {
++		printf("SWEET GPU: GPUCC mapping failed at %#x\n", SWEET_GPUCC_PA);
++		return;
++	}
++
++	printf("SWEET GPU: SM6150 GPUCC read-only probe at %#x (no GPU power/clock writes)\n",
++	    SWEET_GPUCC_PA);
++	printf("SWEET GPU: GX_GFX3D=%#x GX_GMU=%#x CX_GMU=%#x CX_GFX3D=%#x CX_GFX3D_SLV=%#x\n",
++	    sweet_gpucc_read(GPU_CC_GX_GFX3D_CBCR),
++	    sweet_gpucc_read(GPU_CC_GX_GMU_CBCR),
++	    sweet_gpucc_read(GPU_CC_CX_GMU_CBCR),
++	    sweet_gpucc_read(GPU_CC_CX_GFX3D_CBCR),
++	    sweet_gpucc_read(GPU_CC_CX_GFX3D_SLV_CBCR));
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

@@ -1,0 +1,37 @@
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+index 4d4e43f..e292ce243cbb2ca7d5da395d690e3d51b0536c5f 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -10,6 +10,8 @@
+ #include <IOKit/IOUserClient.h>
+ #include <kern/task.h>
+ #include <kern/thread.h>
++#include <sys/proc.h>
++#include <sys/signal.h>
+ #include "unixnu/NativeAdrenoUserClient.h"
+ extern "C" void proc_selfname(char *,int);
+ extern "C" volatile uint32_t native_adreno_wc_enabled;
+@@ -219,5 +221,23 @@ extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit
+  provider->setProperty("NativeAdrenoABI",NativeAdrenoAbiVersion,32);
+  backend.published=true;provider->registerService();
+  IOLog("SWEET RENDER: NativeAdreno ABI + Metal discovery published on live A618 context\n");
++ /* Metal.framework probes IOAcceleratorES once, when backboardd initializes
++    CoreAnimation, long before this asynchronous bring-up publishes the
++    service. Restart it once here (Sunfish's install script does the same by
++    hand) so the fresh process finds MetalPluginName. */
++ int restart=1;PE_parse_boot_argn("sweetm2restart",&restart,sizeof(restart));
++ if(gles!=1 && restart==1) {
++  for(int pid=1;pid<99999;pid++) {
++   proc_t p=proc_find(pid);
++   if(!p)continue;
++   const bool match=!strcmp(proc_best_name(p),"backboardd");
++   if(match)proc_signal(pid,SIGKILL);
++   proc_rele(p);
++   if(match) {
++    IOLog("SWEET RENDER: restarted backboardd for Metal discovery\n");
++    break;
++   }
++  }
++ }
+  return 0;
+ }

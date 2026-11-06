@@ -1,0 +1,186 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4bf04d3..f5af167 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -55,7 +55,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <sys/proc.h>
+ #include "unixnu/NativeAdrenoMemory.h"
+ extern "C" int sweet_native_adreno_cpu_present_begin();
+-extern "C" void sweet_native_adreno_cpu_present_end();
++extern "C" void sweet_native_adreno_cpu_present_end(int state);
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -781,7 +781,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	struct PresentGate {
+ 		int state;
+ 		PresentGate():state(sweet_native_adreno_cpu_present_begin()) {}
+-		~PresentGate(){if(state>0)sweet_native_adreno_cpu_present_end();}
++		~PresentGate(){if(state>0)sweet_native_adreno_cpu_present_end(state);}
+ 	} gate;
+ 	if(gate.state<0) {
+ 		IOLockLock(fLock);fDirty=true;IOLockUnlock(fLock);
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+index 4363b60..ebd450d 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -11,11 +11,13 @@
+ #include <IOKit/IOUserClient.h>
+ #include <kern/task.h>
+ #include <kern/thread.h>
++#include <kern/clock.h>
+ #include <sys/proc.h>
+ #include <sys/signal.h>
+ #include "unixnu/NativeAdrenoUserClient.h"
+ extern "C" void proc_selfname(char *,int);
+ extern "C" volatile uint32_t native_adreno_wc_enabled;
++extern "C" uint64_t native_adreno_publish_stats[3];
+ namespace {
+ struct Backend {
+  NativeAdrenoVm *vm=nullptr;
+@@ -29,6 +31,7 @@ struct Backend {
+  int (*health)(void *)=nullptr;
+  bool published=false,opened=false,lost=false,cpu_present=false;
+  bool pipeline=true;   // sweetpipeline=0 restores a full drain before every submit/map
++ bool present_locked=false;   // sweetpresentlock=1: present holds the lock across drain and copy
+  /* Slot 0 is backboardd's original window. Extra slots are separate 256 MiB
+   * windows of the same 2 GiB arena above it, each with its own queue range,
+   * so one client's IOVAs can never collide with another's. */
+@@ -70,22 +73,48 @@ IOReturn quiesce()
+  * Hold the shared submission/VM gate across quiescence and the source copy so
+  * another submit cannot overwrite its source during the CPU read. This waits
+  * real CP fences; it never declares pending work complete. */
++/* 1 = lock held until present_end (sweetpresentlock=1: full drain, then the
++ * copy under the lock, as 0125-0131). 2 = gate passed without the lock: wait
++ * only for the newest fence submitted when presenting starts, with the lock
++ * taken just for each instantaneous check. CACHE_FLUSH_TS writes that fence
++ * after the frame's render output, and present() still does the physical
++ * cache acquire. 0127 hardware: holding the lock 15-22ms per present
++ * serialized CoreAnimation's submissions behind the copy. */
+ extern "C" int sweet_native_adreno_cpu_present_begin()
+ {
+  if(!__atomic_load_n(&presentation_ready,__ATOMIC_ACQUIRE) || !backend.cpu_present)return 0;
+- IOLockLock(backend.lock);
+  const uint64_t began=backend.clock.now_us(backend.clock.cookie);
+- const IOReturn result=quiesce();
+  static unsigned presents=0;
++ if(backend.present_locked) {
++  IOLockLock(backend.lock);
++  const IOReturn result=quiesce();
++  if(++presents<=4 || presents%120==0)
++   IOLog("SWEET RENDER: CPU present gate %u wait_us=%llu result=%#x locked\n",presents,
++     backend.clock.now_us(backend.clock.cookie)-began,result);
++  if(result) {IOLockUnlock(backend.lock);return -1;}
++  return 1;
++ }
++ IOLockLock(backend.lock);
++ const bool ok=healthy();
++ const uint32_t target=ok?backend.ring->lastSubmitted():0;
++ IOLockUnlock(backend.lock);
++ IOReturn result=ok?kIOReturnSuccess:kIOReturnIOError;
++ while(ok && target) {
++  IOLockLock(backend.lock);
++  result=healthy()?backend.submit->observeFence(target,&backend.clock,0):kIOReturnIOError;
++  IOLockUnlock(backend.lock);
++  if(result!=kIOReturnTimeout)break;
++  if(backend.clock.now_us(backend.clock.cookie)-began>=1000000)break;
++  IODelay(50);
++ }
+  if(++presents<=4 || presents%120==0)
+-  IOLog("SWEET RENDER: CPU present gate %u wait_us=%llu result=%#x\n",presents,
++  IOLog("SWEET RENDER: CPU present gate %u fence=%u wait_us=%llu result=%#x unlocked\n",presents,target,
+     backend.clock.now_us(backend.clock.cookie)-began,result);
+- if(result) {IOLockUnlock(backend.lock);return -1;}
+- return 1;
++ return result?-1:2;
+ }
+-extern "C" void sweet_native_adreno_cpu_present_end()
++extern "C" void sweet_native_adreno_cpu_present_end(int state)
+ {
+- IOLockUnlock(backend.lock);
++ if(state==1)IOLockUnlock(backend.lock);
+ }
+ class AGXDeviceUserClient : public IOUserClient {
+  OSDeclareDefaultStructors(AGXDeviceUserClient)
+@@ -268,8 +297,13 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
+   window_us+=spent;if(spent>max_us)max_us=spent;
+   in_flight+=result?0:backend.submit->outstanding();if(result==kIOReturnBusy)++busy;
+   if(++submits%120==0) {
+-   IOLog("SWEET RENDER: legacy submits %u avg_us=%llu max_us=%llu avg_in_flight_x100=%llu busy=%u drain=%d\n",submits,
+-     window_us/120,max_us,in_flight*100/120,busy,drains);
++   // Full-VM cache publication inside those submits (NativeAdrenoSubmit).
++   const uint64_t ticks=__atomic_exchange_n(&native_adreno_publish_stats[0],0,__ATOMIC_RELAXED);
++   const uint64_t bytes=__atomic_exchange_n(&native_adreno_publish_stats[1],0,__ATOMIC_RELAXED);
++   const uint64_t objects=__atomic_exchange_n(&native_adreno_publish_stats[2],0,__ATOMIC_RELAXED);
++   uint64_t publish_ns=0;absolutetime_to_nanoseconds(ticks,&publish_ns);
++   IOLog("SWEET RENDER: legacy submits %u avg_us=%llu max_us=%llu avg_in_flight_x100=%llu busy=%u drain=%d publish_avg_us=%llu publish_avg_kib=%llu publish_avg_objects=%llu\n",submits,
++     window_us/120,max_us,in_flight*100/120,busy,drains,publish_ns/1000/120,bytes/1024/120,objects/120);
+    window_us=max_us=in_flight=0;busy=0;
+   }
+  }
+@@ -352,6 +386,8 @@ extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit
+  provider->setProperty("NativeAdrenoABI",NativeAdrenoAbiVersion,32);
+  int extra=3;PE_parse_boot_argn("sweetm2extra",&extra,sizeof(extra));
+  backend.extra_slots=extra<0?0u:(extra>3?3u:(unsigned)extra);
++ int present_locked=0;PE_parse_boot_argn("sweetpresentlock",&present_locked,sizeof(present_locked));
++ backend.present_locked=present_locked!=0;
+  int pipeline=1;PE_parse_boot_argn("sweetpipeline",&pipeline,sizeof(pipeline));
+  backend.pipeline=pipeline!=0;
+  IOLog("SWEET RENDER: submission pipelining %s (BoFree/close still drain); extra Metal slots=%u\n",
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoSubmit.cpp b/iokit/Kernel/arm/unixnu/NativeAdrenoSubmit.cpp
+index 31ff76a..1cfe0bf 100644
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoSubmit.cpp
+@@ -2,6 +2,7 @@
+ #include "NativeAdrenoSubmit.h"
+ #include "AdrenoPM4.h"
+ #include <IOKit/IOLib.h>
++#include <mach/mach_time.h>
+ 
+ /* CP_INDIRECT_BUFFER is opcode 0x3f with a 3-word payload: 64-bit GPU address
+  * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
+@@ -10,6 +11,8 @@ enum : uint32_t {SubmitIndirectBuffer=0x3f,SubmitIbWords=3,SubmitMaxJobs=8,
+     SubmitMaxBuffers=16,SubmitMaxIbBytes=0xfffffu*4u,
+     SubmitAuditBytes=256u*1024u};   /* IB bytes the write-combine audit compares per submission */
+ extern "C" {volatile uint32_t native_adreno_coherence[8];}
++/* Legacy full-VM publication: [0] mach ticks, [1] bytes maintained, [2] objects maintained (NativeAdrenoVm::publishMapped). */
++extern "C" {uint64_t native_adreno_publish_stats[3];}
+ /* The submission (1-based count) at which the write-combine audit found a dirty IB line or failed; 0 = never. */
+ extern "C" {volatile uint32_t native_adreno_wc_distrusted;}
+ /* The write-combine audit before each submission while trusted: [0] submissions audited, [1] IB lines compared, [2] dirty lines,
+@@ -200,7 +203,11 @@ IOReturn NativeAdrenoSubmit::submitResources(const NativeAdrenoSubmitBuffer *buf
+     if(resources) {
+         for(size_t i=0;i<resource_count && !status;++i)
+             status=vm_->publishHandle(resources[i].handle,(resources[i].access&2)!=0);
+-    } else status=vm_->publishMapped();
++    } else {
++        const uint64_t published=mach_absolute_time();
++        status=vm_->publishMapped();
++        __atomic_add_fetch(&native_adreno_publish_stats[0],mach_absolute_time()-published,__ATOMIC_RELAXED);
++    }
+     if(!status) {
+         (void)vm_->sampleWord(buffers[0].iova,&ignored,&after);
+         native_adreno_coherence[0]=native_adreno_coherence[0]+1;
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp b/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp
+index 11681fe..3468353 100644
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp
+@@ -11,6 +11,7 @@ extern "C" {int (*native_adreno_dram_read32)(uint64_t,uint32_t *);int (*native_a
+  * attributes then needs no CPU cache maintenance. 0 keeps every mapping maintained as before. Counters: maintenance passes skipped for
+  * coherent mappings at map, unmap, submission and completion. */
+ extern "C" {volatile uint32_t native_adreno_io_coherent;volatile uint32_t native_adreno_coherent_skips[4];}
++extern "C" uint64_t native_adreno_publish_stats[3];
+ static bool coherentMapping(unsigned writeback) {return writeback && native_adreno_io_coherent;}
+ static bool overlap(uint64_t a,uint64_t ab,uint64_t b,uint64_t bb)
+ {return a<b+bb && b<a+ab;}
+@@ -348,6 +349,10 @@ IOReturn NativeAdrenoVm::publishMapped()
+         if(!m.memory)continue;
+         if(coherentMapping(m.writeback)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
+         if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_))return fail(ArmSmmu4KIoError);
++        if(!m.memory->writeCombined() || distrust_write_combined_) {   /* the ones actually maintained */
++            __atomic_add_fetch(&native_adreno_publish_stats[1],(uint64_t)m.memory->bytes(),__ATOMIC_RELAXED);
++            __atomic_add_fetch(&native_adreno_publish_stats[2],1,__ATOMIC_RELAXED);
++        }
+     }
+     return kIOReturnSuccess;
+ }

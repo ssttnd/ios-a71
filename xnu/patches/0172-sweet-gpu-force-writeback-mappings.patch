@@ -1,0 +1,45 @@
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp b/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp
+index 38a3df1..6095c21 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp
+@@ -9,6 +9,7 @@
+ #include "unixnu/NativeAdrenoSubmit.h"
+ #include "unixnu/NativeAdrenoABI.h"
+ extern "C" int sweet_native_adreno_render_profile(uintptr_t,NativeAdrenoAbiDeviceInfo *);
++extern "C" volatile uint32_t native_adreno_force_wb;
+ extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *,NativeAdrenoSubmit *,NativeAdrenoRing *,IOLock *,
+     const NativeAdrenoRingClock *,int (*)(void *),int (*)(void *,uint32_t,uint32_t *),const NativeAdrenoAbiDeviceInfo *);
+ 
+@@ -141,6 +142,10 @@ extern "C" int sweet_native_adreno_prepare_vm(const a618_smmu_io *hardware,
+  error=NativeAdrenoPrepareSmmuMemory(&state.tables,32,36,ArenaStart,ArenaBytes,0,
+      ArenaBytes/4096,&state.arena,&state.live,&state.visibility);
+  if(error)return failed("table preparation",error);
++ uint32_t wb=0;
++ PE_parse_boot_argn("sweetgpuwb",&wb,sizeof(wb));
++ native_adreno_force_wb=wb?1:0;
++ printf("SWEET ADRENO: GPU mappings %s (sweetgpuwb=%u)\n",wb?"forced write-back":"as the client asks",wb);
+  uint32_t walk=0;
+  PE_parse_boot_argn("sweetsmmuwalk",&walk,sizeof(walk));
+  printf("SWEET ADRENO: GPU SMMU table walks %s (sweetsmmuwalk=%u)\n",walk?"cacheable (inner WBWA)":"outer non-cacheable",walk);
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp b/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp
+index 1557215..2cf7a54 100644
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp
+@@ -11,6 +11,9 @@ extern "C" {int (*native_adreno_dram_read32)(uint64_t,uint32_t *);int (*native_a
+  * attributes then needs no CPU cache maintenance. 0 keeps every mapping maintained as before. Counters: maintenance passes skipped for
+  * coherent mappings at map, unmap, submission and completion. */
+ extern "C" {volatile uint32_t native_adreno_io_coherent;volatile uint32_t native_adreno_coherent_skips[4];}
++/* 0172 (boot-arg sweetgpuwb=1): every device mapping is write-back (MAIR attribute 1) whatever the client asked for; the CPU-side
++ * maintenance stays (native_adreno_io_coherent is 0), so this tests whether the GPU runs faster through the system cache. */
++extern "C" {volatile uint32_t native_adreno_force_wb;}
+ extern "C" uint64_t native_adreno_publish_stats[3];
+ /* 1: the kernel cleans/invalidates every imported (client-owned) BO at each
+  * legacy submit and completion. 0: the client maintains imported pages, as
+@@ -240,6 +243,7 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t
+ {
+     if(!handle)return kIOReturnBadArgument;*handle=0;result_={};
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
++    if(native_adreno_force_wb)writeback=1;
+     PhaseClock clock;
+     IOReturn checked=preflight(memory,upper,iova,permissions,writeback,shareability);if(checked)return checked;
+     if(next_handle_==UINT64_MAX)return kIOReturnNoResources;

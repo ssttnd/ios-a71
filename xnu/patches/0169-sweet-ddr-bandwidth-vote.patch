@@ -1,0 +1,68 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 6e4d6d3..e64474d 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -876,7 +876,10 @@ int sweet_rpmh_bcm_vote(const char *res, uint32_t x, uint32_t y);
+ int
+ sweet_rpmh_bcm_vote(const char *res, uint32_t x, uint32_t y)
+ {
+-	if (!res || (strcmp(res, "SN15") && strcmp(res, "CN0")) || x > 16 || y > 16 || (!x && !y)) {
++	/* SN15/CN0: the apps SMMU's path (0149, tiny votes); MC0/SH0/ACV: the memory (0169) */
++	const bool memory = res && (!strcmp(res, "MC0") || !strcmp(res, "SH0") || !strcmp(res, "ACV"));
++	if (!res || (strcmp(res, "SN15") && strcmp(res, "CN0") && !memory) ||
++	    x > (memory ? 0x3fffu : 16u) || y > (memory ? 0x3fffu : 16u) || (!x && !y)) {
+ 		return EPERM;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+@@ -1133,3 +1136,31 @@ sweet_smmu_probe_start(void)
+ 		printf("SWEET SMMU: apps SMMU probe armed (1 s)\n");
+ 	}
+ }
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0169: memory bandwidth. Nothing here voted for DRAM; the frames stayed at ~300 Mpx/s of GPU fill
++ * whatever the GPU clock, tiling or shaders (0154-0158 hardware). HackiOS (oosexgang/hackios-xnu-kernel,
++ * bsd/dev/hakios.cpufreq.c ddr_raise(), Poco X5 Pro) casts what Linux's interconnect driver casts for a
++ * busy GPU: the memory controller's BCM (MC0) and the shared hub with the system cache (SH0) at the
++ * most there is (commit, valid, average and peak 14 bits each), and ACV with the apps bit (8): their
++ * Control Center 46 -> 59 frames/s, Settings opening 29 -> 37. sweetddr=0: no vote; sweetddrvote=N:
++ * N instead of 0x3fff.
++ */
++void sweet_rpmh_ddr_raise(void);
++void
++sweet_rpmh_ddr_raise(void)
++{
++	uint32_t on = 1, vote = 0x3fff;
++	PE_parse_boot_argn("sweetddr", &on, sizeof(on));
++	PE_parse_boot_argn("sweetddrvote", &vote, sizeof(vote));
++	if (!on || vote == 0 || vote > 0x3fff) {
++		printf("SWEET DDR: no memory bandwidth vote (sweetddr=%u, vote %u)\n", on, vote);
++		return;
++	}
++	const int mc0 = sweet_rpmh_bcm_vote("MC0", vote, vote);
++	const int sh0 = sweet_rpmh_bcm_vote("SH0", vote, vote);
++	const int acv = sweet_rpmh_bcm_vote("ACV", 0, 8);
++	printf("SWEET DDR: memory bandwidth vote %u: MC0 %d, SH0 %d, ACV %d\n", vote, mc0, sh0, acv);
++}
++#endif
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 1deced0..bc7198f 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -57,6 +57,7 @@ extern void sweet_touch_init(void);
+ extern void sweet_gpu_probe(void);
+ extern int sweet_native_adreno_reserve_pool(void);
+ extern void sweet_smmu_probe_start(void);
++extern void sweet_rpmh_ddr_raise(void);
+ extern void sweet_bt_init(void);
+ extern void sweet_haptic_init(void);
+ extern void sweet_usb_probe(void);
+@@ -665,6 +666,7 @@ sweet_ufs_init(void)
+ 	sweet_sample_start();
+ 	(void)sweet_native_adreno_reserve_pool();   /* owned-BO pool while memory is unfragmented (0147) */
+ 	sweet_pmem_init();       /* /dev/pmem (sweetpmem=1): bsd/dev/sweet_pmem.c, from ios-flame 0094 */
++	sweet_rpmh_ddr_raise();     /* sweetddr: MC0/SH0 at the most, ACV apps (0169, from HackiOS) */
+ 	sweet_smmu_probe_start();   /* sweetsmmuprobe=1: BCM votes + apps SMMU ID read (0149) */
+ 	sweet_haptic_init();     /* sweethaptic=1|2|3: AW8624 on QUP1 SE3 (bsd/dev/sweet_haptic.c) */
+ 	sweet_bt_init();         /* sweetbt=1: WCN3990 Bluetooth over QUP0 SE3, com.apple.uart.bluetooth (bsd/dev/sweet_bt.c) */

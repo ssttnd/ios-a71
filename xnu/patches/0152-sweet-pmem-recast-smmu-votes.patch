@@ -1,0 +1,54 @@
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+index 3bc7fde..e06ae75 100644
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -21,6 +21,8 @@
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
++#include <mach/mach_time.h>
++#include <kern/clock.h>
+ #include <sys/systm.h>
+ #include <sys/conf.h>
+ #include <sys/errno.h>
+@@ -154,6 +156,24 @@ pm_rw(struct uio *uio, bool write)
+ 			err = EINVAL;
+ 			break;
+ 		}
++		/* 0152: 0141 hardware: wland's first apps-SMMU load stalled CPU2 on the
++		 * very mapping the kernel probe had read through 20 s earlier. The SN15/CN0
++		 * votes went to RPMh's active set only; recast them (at most every 50 ms)
++		 * right before an access to the SMMU's window. */
++		if (pa >= 0x15000000ULL && pa < 0x15200000ULL) {
++			extern int sweet_rpmh_bcm_vote(const char *res, uint32_t x, uint32_t y);
++			static uint64_t voted_at;
++			uint64_t now = mach_absolute_time(), ns = 0;
++			absolutetime_to_nanoseconds(now - voted_at, &ns);
++			if (!voted_at || ns > 50 * NSEC_PER_MSEC) {
++				const int sn = sweet_rpmh_bcm_vote("SN15", 1, 1), cn = sweet_rpmh_bcm_vote("CN0", 1, 1);
++				static unsigned revotes;
++				if (++revotes <= 8 || sn || cn) {
++					printf("SWEET PMEM: apps SMMU access: recast SN15=%d CN0=%d (%u)\n", sn, cn, revotes);
++				}
++				voted_at = now;
++			}
++		}
+ 		const bool trace = pm_traced < 48;
+ 		if (trace) {
+ 			pm_traced++;
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 232587f..c393551 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -849,7 +849,10 @@ sweet_rpmh_bcm_vote(const char *res, uint32_t x, uint32_t y)
+ 		if (!error) {
+ 			const uint32_t offset = 0, value = 1u << 30 | 1u << 29 | x << 14 | y;
+ 			error = rh_send_cmds(res, found.addr, 3u, &offset, &value, 1, RH_TIMEOUT_US, NULL);
+-			printf("SWEET RPMH: BCM %s addr=%#x vote %#x -> %d\n", res, found.addr, value, error);
++			static unsigned bcm_logged;
++			if (error || ++bcm_logged <= 4) {
++				printf("SWEET RPMH: BCM %s addr=%#x vote %#x -> %d\n", res, found.addr, value, error);
++			}
+ 		}
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);

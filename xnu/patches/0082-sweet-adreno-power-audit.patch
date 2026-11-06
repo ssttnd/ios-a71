@@ -1,0 +1,129 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1,8 +1,7 @@
+ /*
+- * First SWEET Adreno bring-up step: inspect SM6150 GPUCC clock-controller
+- * registers without powering, clocking, resetting, or submitting work to the
+- * GPU. The probe is opt-in because the ABL/firmware power state is not yet
+- * characterized on every sweet firmware build.
++ * SWEET Adreno 618 bring-up: read SM6150 GPUCC status without changing
++ * power, clocks, resets, firmware or GPU mappings. Disabled by default.
++ * Register offsets: Qualcomm gpucc-sdmmagpie.c / sm6150-gdsc.dtsi.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -15,16 +14,36 @@
+ 
+ #define SWEET_GPUCC_PA       0x05090000u
+ #define SWEET_GPUCC_SIZE     0x00009000u
+-
+-/* Byte offsets from the SM6150 GPUCC regmap in the upstream Linux driver. */
+-#define GPU_CC_GX_GFX3D_CBCR       0x1054u
+-#define GPU_CC_GX_GMU_CBCR         0x1064u
+-#define GPU_CC_CX_GMU_CBCR         0x1098u
+-#define GPU_CC_CX_GFX3D_CBCR       0x10a4u
+-#define GPU_CC_CX_GFX3D_SLV_CBCR   0x10a8u
++#define GPU_CC_GX_BCR        0x1008u
++#define GPU_CC_GX_GDSCR      0x100cu
++#define GPU_CC_CX_GDSCR      0x106cu
++#define GPU_CC_GX_DOMAIN     0x1508u
++#define GPU_CC_CX_HW_CTRL    0x1540u
++#define GDSC_PWR_ON          (1u << 31)
++#define GDSC_SW_COLLAPSE     (1u << 0)
++#define GDSC_HW_CONTROL      (1u << 1)
++#define BRANCH_CLK_OFF       (1u << 31)
++#define BRANCH_CLK_ENABLE    (1u << 0)
+ 
+ static vm_offset_t sweet_gpucc;
+ static int sweet_gpu_probe_attempted;
++
++/* All registers below are in GPUCC; none is in the Adreno/GMU aperture. */
++static const struct {
++	const char *name;
++	uint32_t offset;
++} sweet_gpu_branches[] = {
++	{ "AHB",          0x1078u },
++	{ "CX_APB",       0x1088u },
++	{ "CX_SNOC_DVM",  0x108cu },
++	{ "CX_GMU",       0x1098u },
++	{ "CXO",          0x109cu },
++	{ "CX_GFX3D",     0x10a4u },
++	{ "CX_GFX3D_SLV", 0x10a8u },
++	{ "GX_GFX3D",     0x1054u },
++	{ "GX_CXO",       0x1060u },
++	{ "GX_GMU",       0x1064u },
++};
+ 
+ static uint32_t
+ sweet_gpucc_read(uint32_t offset)
+@@ -38,34 +57,53 @@
+ sweet_gpu_probe(void)
+ {
+ 	int enabled = 0;
++	uint32_t cx, cx_hw, gx, domain, reset;
++	unsigned int i;
++
+ 	if (sweet_gpu_probe_attempted) {
+ 		return;
+ 	}
+ 	sweet_gpu_probe_attempted = 1;
+ 	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
+ 	if (enabled != 1) {
+-		printf("SWEET GPU: read-only GPUCC probe disabled; use sweetgpu=1 to opt in\n");
++		printf("SWEET GPU: GPUCC audit v2 disabled; use sweetgpu=1 to opt in\n");
++		return;
++	}
++
++	printf("SWEET GPU: GPUCC audit v2 at %#x; read-only, no core/GMU access\n",
++	    SWEET_GPUCC_PA);
++	sweet_gpucc = ml_io_map(SWEET_GPUCC_PA, SWEET_GPUCC_SIZE);
++	if (sweet_gpucc == 0) {
++		printf("SWEET GPU: GPUCC mapping failed\n");
+ 		return;
+ 	}
+ 
+ 	/*
+-	 * Do not touch the Adreno register aperture yet. The GPU GX power-domain
+-	 * state inherited from ABL is not known; this probe only reads the CX-side
+-	 * clock-controller status registers. It performs no MMIO writes.
++	 * CX uses the separate HW-control status register in the live DT.
++	 * Preserve raw GX status: the DT also has qcom,poll-cfg-gdscr, whose
++	 * semantics differ across downstream kernels. These snapshots are not
++	 * permission to touch the core, even if a power/clock bit is set.
+ 	 */
+-	sweet_gpucc = ml_io_map(SWEET_GPUCC_PA, SWEET_GPUCC_SIZE);
+-	if (sweet_gpucc == 0) {
+-		printf("SWEET GPU: GPUCC mapping failed at %#x\n", SWEET_GPUCC_PA);
+-		return;
++	cx = sweet_gpucc_read(GPU_CC_CX_GDSCR);
++	cx_hw = sweet_gpucc_read(GPU_CC_CX_HW_CTRL);
++	gx = sweet_gpucc_read(GPU_CC_GX_GDSCR);
++	domain = sweet_gpucc_read(GPU_CC_GX_DOMAIN);
++	reset = sweet_gpucc_read(GPU_CC_GX_BCR);
++	printf("SWEET GPU: CX_GDSCR=%#x CX_HW_CTRL=%#x GX_GDSCR=%#x GX_DOMAIN=%#x GX_BCR=%#x\n",
++	    cx, cx_hw, gx, domain, reset);
++	printf("SWEET GPU: CX pwr_on=%u collapse=%u hw_control=%u; GX bit31=%u collapse=%u hw_control=%u clamp=%u gmem_reset=%u block_reset=%u\n",
++	    !!(cx_hw & GDSC_PWR_ON), !!(cx & GDSC_SW_COLLAPSE),
++	    !!(cx & GDSC_HW_CONTROL), !!(gx & GDSC_PWR_ON),
++	    !!(gx & GDSC_SW_COLLAPSE), !!(gx & GDSC_HW_CONTROL),
++	    !!(domain & 1u), !!(domain & (1u << 4)), !!(reset & 1u));
++
++	for (i = 0; i < sizeof(sweet_gpu_branches) / sizeof(sweet_gpu_branches[0]); i++) {
++		uint32_t value = sweet_gpucc_read(sweet_gpu_branches[i].offset);
++		printf("SWEET GPU: CBCR %s @%#x=%#x enable=%u clk_off=%u fsm=%u\n",
++		    sweet_gpu_branches[i].name, sweet_gpu_branches[i].offset,
++		    value, !!(value & BRANCH_CLK_ENABLE),
++		    !!(value & BRANCH_CLK_OFF), (value >> 28) & 7u);
+ 	}
+-
+-	printf("SWEET GPU: SM6150 GPUCC read-only probe at %#x (no GPU power/clock writes)\n",
+-	    SWEET_GPUCC_PA);
+-	printf("SWEET GPU: GX_GFX3D=%#x GX_GMU=%#x CX_GMU=%#x CX_GFX3D=%#x CX_GFX3D_SLV=%#x\n",
+-	    sweet_gpucc_read(GPU_CC_GX_GFX3D_CBCR),
+-	    sweet_gpucc_read(GPU_CC_GX_GMU_CBCR),
+-	    sweet_gpucc_read(GPU_CC_CX_GMU_CBCR),
+-	    sweet_gpucc_read(GPU_CC_CX_GFX3D_CBCR),
+-	    sweet_gpucc_read(GPU_CC_CX_GFX3D_SLV_CBCR));
++	printf("SWEET GPU: audit complete; rendering driver and power sequencing not initialized\n");
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

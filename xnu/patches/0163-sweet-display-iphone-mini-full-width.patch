@@ -1,0 +1,127 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 9f8ac4e..551215c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -97,12 +97,33 @@ enum {
+  * The iOS userland only has status bar / layout data for real iPhone
+  * screens (UIKit: "No status bar visual provider for screen", the red
+  * rdar://45025538 bar for 360x800 points). The display is therefore
+- * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+- * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+- * Boot-arg sweetfb_native=1 presents the real panel size instead.
++ * presented as a real iPhone screen (sweet_fb_logical_size()):
++ *   sweetfb_mode=2 (default, 0163) iPhone 12/13 mini, 1080x2340 (360x780 points @3x): the
++ *                  full width, pixel for pixel, 30 black rows above and below
++ *   sweetfb_mode=1 iPhone X, 1125x2436 (375x812 points @3x), its centered 1080x2400 shown:
++ *                  23 px cut off left and right (0152 hardware: keyboard keys, the App
++ *                  Library index and "Cancel" cut at the edges)
++ *   sweetfb_mode=0 or sweetfb_native=1: the real 1080x2400 panel (the red status bar)
++ * The ADT's /product artwork-device-subtype must match (2340 / 2436).
+  */
+-#define SWEET_FB_LOGICAL_W              1125
+-#define SWEET_FB_LOGICAL_H              2436
++extern "C" void
++sweet_fb_logical_size(uint32_t panelW, uint32_t panelH, uint32_t *w, uint32_t *h)
++{
++	int native = 0, mode = 2;
++	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
++	PE_parse_boot_argn("sweetfb_mode", &mode, sizeof(mode));
++	*w = panelW;
++	*h = panelH;
++	if (native || panelW != 1080 || panelH != 2400) {
++		return;
++	}
++	if (mode == 2) {
++		*h = 2340;
++	} else if (mode == 1) {
++		*w = 1125;
++		*h = 2436;
++	}
++}
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -161,6 +182,7 @@ public:
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	uint32_t      fBandClears;              /* presents since start: band clearing cadence */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -246,14 +268,7 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+ 	}
+-	int native = 0;
+-	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = fWidth;
+-	fLogicalH = fHeight;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+-		fLogicalW = SWEET_FB_LOGICAL_W;
+-		fLogicalH = SWEET_FB_LOGICAL_H;
+-	}
++	sweet_fb_logical_size(fWidth, fHeight, &fLogicalW, &fLogicalH);
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+@@ -986,6 +1001,14 @@ AppleCLCD::present(const uint8_t *rec)
+ 		return; // retain the last complete panel frame after a GPU fault
+ 	}
+ 	uint32_t mask = get32(rec, 0x104);
++	/* A display shorter than the panel (sweetfb_mode=2): keep the bands above and below black,
++	 * also over console text printed into them since. */
++	if (fOffY < 0 && fPixels != 0 && (fBandClears < 3 || fBandClears % 120 == 0)) {
++		const uint32_t band = (uint32_t)-fOffY;
++		bzero((void *)fPixels, (size_t)band * fRowBytes);
++		bzero((void *)(fPixels + (uintptr_t)(fHeight - band) * fRowBytes), (size_t)band * fRowBytes);
++	}
++	fBandClears++;
+ 
+ 
+ 	if (!fConsolePaused) {
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..03ab967 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -356,6 +356,8 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  * app-switcher gesture.
+  */
+ #define SWEET_TOUCH_EDGE_PX 48
++extern "C" void sweet_fb_logical_size(uint32_t panelW, uint32_t panelH, uint32_t *w, uint32_t *h);
++
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+@@ -432,10 +434,10 @@ SweetHIDTouch::start(IOService *provider)
+ 	if (!fLock || !IOHIDEventService::start(provider)) {
+ 		return false;
+ 	}
+-	int native = 0;
+-	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
++	uint32_t lw, lh;
++	sweet_fb_logical_size(1080, 2400, &lw, &lh);   /* SweetFramebuffer.cpp */
++	fLogicalW = (int)lw;
++	fLogicalH = (int)lh;
+ 	fOffX = (fLogicalW - 1080) / 2;
+ 	fOffY = (fLogicalH - 2400) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+@@ -463,9 +465,13 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+-	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	/* Panel pixels -> the presented display (SweetFramebuffer.cpp); a touch in a black band
++	 * lands on the display's nearest row. */
++	int lx = x + fOffX, ly = y + fOffY;
++	lx = lx < 0 ? 0 : (lx > fLogicalW - 1 ? fLogicalW - 1 : lx);
++	ly = ly < 0 ? 0 : (ly > fLogicalH - 1 ? fLogicalH - 1 : ly);
++	IOFixed nx = (IOFixed)(((int64_t)lx << 16) / fLogicalW);
++	IOFixed ny = (IOFixed)(((int64_t)ly << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);

@@ -1,0 +1,79 @@
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+index 4669a65..b5a00ee 100644
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -4,8 +4,8 @@
+  * in-band sleep), then an H4 transport for iOS's bluetoothd/BlueTool through the kernel control
+  * com.apple.uart.bluetooth (bsd/dev/sweet_bt_hci.c).
+  *
+- * Ported from Bergamota (ry-diffusion, Poco F1 / SDM845, xnu patches 0104-0133 beryllium_wlan.c,
+- * MIT): only its Bluetooth stage. The WLAN probe/inventory parts are left out: they read the apps
++ * Ported from Bergamota (ry-diffusion, Poco F1 / SDM845, xnu patches 0104-0133 beryllium_wlan.c;
++ * that repository has no license file): only its Bluetooth stage. The WLAN probe/inventory parts are left out: they read the apps
+  * SMMU and SMEM, and on sweet a CPU load from the apps SMMU stalls once the system is up (0141).
+  * SM7150 differences (Linux gcc-sm7150.c / pinctrl-sm7150.c, sweet DT): SE3 instead of SE3
+  * (CBCR 0x173c0, RCG 0x173c4, vote bit 13), TLMM SOUTH tile 0x3d00000 with GPIO 38-41 (qup03 = 1),
+diff --git a/bsd/dev/sweet_bt_hci.c b/bsd/dev/sweet_bt_hci.c
+index 17ee0ff..f1310e6 100644
+--- a/bsd/dev/sweet_bt_hci.c
++++ b/bsd/dev/sweet_bt_hci.c
+@@ -1,5 +1,6 @@
+ /*
+- * Poco F1 (beryllium) Bluetooth HCI transport for iOS userland.
++ * Bluetooth HCI transport for iOS userland. From Bergamota (ry-diffusion, Poco F1; beryllium_bt_hci.c,
++ * patches 0136 + 0239; that repository has no license file), used on sweet by bsd/dev/sweet_bt.c.
+  *
+  * What bluetoothd (BT_HCI_TRANSPORT=H4BC:POSIX:com.apple.uart.bluetooth,3000000) and BlueTool
+  * open on A11: a PF_SYSTEM / SYSPROTO_CONTROL SOCK_STREAM socket on the kernel control
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 7e32e33..1cc1826 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -30,6 +30,7 @@
+ #include <sys/codesign.h>
+ #include <sys/mount.h>
+ #include <sys/priv.h>
++#include <IOKit/IOBSD.h>
+ #include <sys/proc.h>
+ #include <sys/systm.h>
+ #include <sys/ubc_internal.h>
+@@ -339,12 +340,39 @@ static struct {
+ } sweet_priv_logged[SWEET_PRIV_LOG_MAX];
+ static int sweet_priv_logged_count;
+ 
++/*
++ * Skywalk privileges, granted like AMFI does on iOS: only to a process holding the matching
++ * entitlement (as Bergamota 0250). bluetoothd (com.apple.private.skywalk.register-user-pipe)
++ * registers its audio user-pipe nexus "com.apple.bluetooth.AudioPipe"; 0146 logged
++ * "bluetoothd privilege 12000 denied".
++ */
++static const struct {
++	int priv;
++	const char *entitlement;
++} sweet_skywalk_privs[] = {
++	{ PRIV_SKYWALK_REGISTER_USER_PIPE, "com.apple.private.skywalk.register-user-pipe" },
++	{ PRIV_SKYWALK_REGISTER_KERNEL_PIPE, "com.apple.private.skywalk.register-kernel-pipe" },
++	{ PRIV_SKYWALK_REGISTER_NET_IF, "com.apple.private.skywalk.register-net-if" },
++	{ PRIV_SKYWALK_REGISTER_FLOW_SWITCH, "com.apple.private.skywalk.register-flow-switch" },
++	{ PRIV_SKYWALK_LOW_LATENCY_CHANNEL, "com.apple.private.skywalk.low-latency-channel" },
++	{ PRIV_SKYWALK_OBSERVE_ALL, "com.apple.private.skywalk.observe-all" },
++	{ PRIV_SKYWALK_OBSERVE_STATS, "com.apple.private.skywalk.observe-stats" },
++};
++
+ static int
+ sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
+ {
+ 	if (priv == PRIV_WORK_INTERVAL) {
+ 		return 0;
+ 	}
++	for (unsigned i = 0; i < sizeof(sweet_skywalk_privs) / sizeof(sweet_skywalk_privs[0]); i++) {
++		if (sweet_skywalk_privs[i].priv == priv) {
++			if (IOCurrentTaskHasEntitlement(sweet_skywalk_privs[i].entitlement)) {
++				return 0;
++			}
++			break;
++		}
++	}
+ 	char name[20];
+ 	proc_selfname(name, sizeof(name));
+ 	for (int i = 0; i < sweet_priv_logged_count; i++) {

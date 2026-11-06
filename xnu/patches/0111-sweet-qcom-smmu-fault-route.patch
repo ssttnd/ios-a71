@@ -1,0 +1,93 @@
+diff --git a/iokit/Kernel/arm/unixnu/ArmSmmu4KStreams.c b/iokit/Kernel/arm/unixnu/ArmSmmu4KStreams.c
+--- a/iokit/Kernel/arm/unixnu/ArmSmmu4KStreams.c
++++ b/iokit/Kernel/arm/unixnu/ArmSmmu4KStreams.c
+@@ -8,6 +8,14 @@
+ static unsigned exids(uint32_t id){return (id>>8)&1;}
+ static uint32_t valid_smr(uint32_t id){return exids(id)?0:UINT32_C(1)<<31;}
+ static uint32_t valid_s2cr(uint32_t id){return exids(id)?1u<<10:0;}
++/* CBNDX has no translation meaning for TYPE=FAULT. On sweet's exact
++ * measured polling profile firmware retains0xff there after ignored FAULT
++ * writes. Keep exact readback for active translations and all other boards. */
++static int fault_equal(const ArmSmmu4KIo *io,uint32_t id,uint32_t got,uint32_t want)
++{
++    const uint32_t ignored=io->polling_faults==1 && id==0x48016605u?0xffu:0;
++    return (got&~ignored)==want;
++}
+ static int valid(uint32_t id,uint32_t smr,uint32_t s2cr)
+ {return exids(id)?!!(s2cr&(1u<<10)):!!(smr&(UINT32_C(1)<<31));}
+ static ArmSmmu4KStatus global(const ArmSmmu4KIo *io,ArmSmmu4KStreamResult *r)
+@@ -40,7 +48,7 @@
+             unsigned live=valid(r->id0,smr,s2cr);
+             if(attached) {
+                 if(smr!=(valid_smr(r->id0)|s[own].sid) || s2cr!=(bank|valid_s2cr(r->id0)))return ArmSmmu4KStateMismatch;
+-            } else if((s2cr&~valid_s2cr(r->id0))!=FAULT ||
++            } else if(!fault_equal(io,r->id0,s2cr&~valid_s2cr(r->id0),FAULT) ||
+                 (live && smr!=(valid_smr(r->id0)|s[own].sid)))return ArmSmmu4KBusy;
+             ++r->streams_verified;
+         } else if(valid(r->id0,smr,s2cr)) {
+@@ -71,10 +79,10 @@
+          * an old or corrupted SID from an initially invalid slot. */
+         size_t smr=0x800+4*state->streams[i].slot;
+         uint32_t match=valid_smr(state->id0)|state->streams[i].sid;
+-        if(wr(io,at,FAULT,r) || io->barrier(io->cookie) || rd(io,at,&value,r) || value!=FAULT ||
++        if(wr(io,at,FAULT,r) || io->barrier(io->cookie) || rd(io,at,&value,r) || !fault_equal(io,state->id0,value,FAULT) ||
+             wr(io,smr,match,r) || io->barrier(io->cookie) || rd(io,smr,&value,r) || value!=match ||
+             wr(io,at,FAULT|valid_s2cr(state->id0),r) || io->barrier(io->cookie) ||
+-            rd(io,at,&value,r) || value!=(FAULT|valid_s2cr(state->id0)))failed=1;
++            rd(io,at,&value,r) || !fault_equal(io,state->id0,value,FAULT|valid_s2cr(state->id0)))failed=1;
+         else ++r->streams_faulted;
+     }
+     return failed;
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp b/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp
+--- a/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp
+@@ -27,7 +27,7 @@
+  ArmSmmu4KIo io{};
+  a618_smmu_io hardware{};
+  uint64_t handles[3]{};
+- bool attempted=false,ready=false,connected=false;
++ bool attempted=false,ready=false,connected=false,faultWriteQuirk=false;
+ } state;
+ int read32(void *,size_t offset,uint32_t *value)
+ {
+@@ -48,6 +48,10 @@
+  const unsigned slot=state.streams.streams[0].slot;
+  if((offset&3) || !((offset>=0x8000 && offset<=0x8ffc) || offset==0x1000 ||
+      offset==0x1800 || offset==0x800+4*slot || offset==0xc00+4*slot))return 1;
++ /* Qualcomm firmware can ignore FAULT writes and rewrite BYPASS to FAULT.
++  * This flag is probed ONLY while our exact leased SMR is still invalid.
++  * Never request a real bypass stream or change the GMU route. */
++ if(offset==0xc00+4*slot && value==(2u<<16) && state.faultWriteQuirk)value=(1u<<16)|0xffu;
+  state.hardware.registers.write(state.hardware.registers.cookie,(uint32_t)offset,value);
+  return 0;
+ }
+@@ -111,10 +115,27 @@
+   * with global IRQ disabled. Preserve that policy and every other route. */
+  if((control&0x407)!=0x402)return ENOTSUP;
+  state.streams.streams[0]={slot,0};
+- if(write32(nullptr,0xc00+4*slot,2u<<16) || barrier(nullptr))return EIO;
++ /* Pinned Linux qcom_smmu_cfg_probe/qcom_smmu_write_s2cr quirk.
++  * Probe the claimed INVALID slot: global USFCFG faults unmatched traffic,
++  * and no valid SID or enabled CB0 exists here. Do not probe any live route. */
++ uint32_t invalidSmr=0,probe=0,faulted=0;
++ if(read32(nullptr,0x800+4*slot,&invalidSmr) || (invalidSmr&(1u<<31)))return EBUSY;
++ if(write32(nullptr,0xc00+4*slot,(1u<<16)|0xffu) || barrier(nullptr) ||
++    read32(nullptr,0xc00+4*slot,&probe))return EIO;
++ if((probe&~0xffu)==(2u<<16))state.faultWriteQuirk=true;
++ else if(probe!=((1u<<16)|0xffu))return failed("S2CR quirk probe",kIOReturnIOError);
++ if(write32(nullptr,0xc00+4*slot,2u<<16) || barrier(nullptr) ||
++    read32(nullptr,0xc00+4*slot,&faulted) || (faulted&~0xffu)!=(2u<<16))
++  return failed("S2CR fault readback",kIOReturnIOError);
++ IOLog("SWEET NATIVE VM: leased slot=%u S2CR probe=%#x fault=%#x qcom_quirk=%u\n",
++     slot,probe,faulted,(unsigned)state.faultWriteQuirk);
+  const ArmSmmu4KStream stream={slot,0};ArmSmmu4KStreamResult routes{};
+  ArmSmmu4KStatus status=ArmSmmu4KCheckFaultedStreams(&state.io,&stream,1,0,&routes);
+- if(status)return failed("route preflight",(IOReturn)status);
++ if(status) {
++  IOLog("SWEET NATIVE VM: route detail ID0=%#x sCR0=%#x GFSR=%#x verified=%u SMR=%#x S2CR=%#x\n",
++      routes.id0,routes.scr0,routes.global_fault,routes.streams_verified,invalidSmr,faulted);
++  return failed("route preflight",(IOReturn)status);
++ }
+  IOReturn error=state.tables.allocate(TableBytes,36,true,8u*1024u*1024u);
+  if(error)return failed("table allocation",error);
+  error=NativeAdrenoPrepareSmmuMemory(&state.tables,32,36,ArenaStart,ArenaBytes,0,

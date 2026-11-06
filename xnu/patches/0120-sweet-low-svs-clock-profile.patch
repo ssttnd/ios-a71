@@ -1,0 +1,63 @@
+diff --git a/bsd/dev/sweet_adreno_hfi.c b/bsd/dev/sweet_adreno_hfi.c
+--- a/bsd/dev/sweet_adreno_hfi.c
++++ b/bsd/dev/sweet_adreno_hfi.c
+@@ -4,6 +4,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #if defined(KERNEL)
+ #include <sys/errno.h>
++#include <sys/systm.h>
+ #else
+ #include <errno.h>
+ #endif
+@@ -177,11 +178,20 @@
+  uint32_t supported = (1u << 28) | (1u << 19) | (1u << 17); /* HFI 1.10 */
+  error = a618_hfi_call(hfi, io, 1, &supported, 1, firmware_version, 1);
+  if (error) return error;
+- /* Two levels include the mandatory off entry; units are kHz. Upper
+-  * corners stay absent until power, thermal control and recovery exist. */
++ /* The pinned SM7150 DT permits 267MHz at raw LOW_SVS=64 for all
++  * speed bins (opp-supported-hw=0x1f). The live command DB already rounds
++  * our MIN_SVS=48 request up to raw64; use that existing voltage corner.
++  * Keep 180MHz if a different command DB supplies a lower corner. Never
++  * infer a measured clock from firmware accepting this table. Higher
++  * frequency/voltage corners and dynamic scaling remain absent. */
++ const uint32_t gpu_khz = (gpu_vote >> 16) >= 64u ? 267000u : 180000u;
++#if defined(KERNEL)
++ printf("SWEET ADRENO: HFI active OPP configured=%u kHz raw_corner=%u; clock not measured\n",
++     gpu_khz, gpu_vote >> 16);
++#endif
+  uint32_t perf[42] = {0}; /* body of the fixed 43-DWORD v1 message */
+  perf[0] = perf[1] = 2;
+- perf[4] = gpu_vote; perf[5] = 180000;
++ perf[4] = gpu_vote; perf[5] = gpu_khz;
+  perf[36] = gmu_vote; perf[37] = 200000;
+  error = a618_hfi_call(hfi, io, 4, perf, 42, 0, 0);
+  if (error) return error;
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoSubmit.cpp b/iokit/Kernel/arm/unixnu/NativeAdrenoSubmit.cpp
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoSubmit.cpp
+@@ -278,7 +278,9 @@
+         }
+         return kIOReturnSuccess;
+     }
++    const uint64_t wait_began=clock && clock->now_us?clock->now_us(clock->cookie):0;
+     const NativeAdrenoRingFence result=ring_->wait(fence,clock,timeout_us,&observed);
++    const uint64_t wait_done=clock && clock->now_us?clock->now_us(clock->cookie):wait_began;
+     if(result==NativeAdrenoRingFencePoisoned)return poison();
+     if(result==NativeAdrenoRingFenceArgument) {native_adreno_fence_wait[7]=fence;return kIOReturnBadArgument;}
+     if(result==NativeAdrenoRingFenceTimeout) {
+@@ -287,7 +289,14 @@
+         native_adreno_fence_wait[4]=ring_->lastSubmitted();native_adreno_fence_wait[5]=ring_->completedFence();
+         return kIOReturnTimeout;
+     }
++    const size_t resource_count=job->count;
+     IOReturn status=release(*job);
++    const uint64_t retired=clock && clock->now_us?clock->now_us(clock->cookie):wait_done;
++    static unsigned retirements=0;
++    if(++retirements<=8 || retirements%120==0 || status)
++        IOLog("SWEET RENDER: fence retire %u resources=%lu gpu_wait_us=%llu cache_retire_us=%llu result=%#x\n",
++            retirements,(unsigned long)resource_count,(unsigned long long)(wait_done-wait_began),
++            (unsigned long long)(retired-wait_done),status);
+     if(status)return status;
+     ++stats_.completed;
+     return kIOReturnSuccess;

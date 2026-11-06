@@ -1,0 +1,51 @@
+diff --git a/bsd/dev/sweet_adreno_cp.h b/bsd/dev/sweet_adreno_cp.h
+--- a/bsd/dev/sweet_adreno_cp.h
++++ b/bsd/dev/sweet_adreno_cp.h
+@@ -21,6 +21,8 @@
+ struct a618_cp_result {
+  unsigned phase, submitted, completed;
+  uint32_t rptr, wptr, status, interrupt, hw_fault, fence, value;
++ uint64_t initial_tsb_base;
++ uint32_t initial_tsb_size, initial_tsb_control;
+  unsigned aperture_phase;
+  int aperture_error;
+  int64_t aperture_status;
+diff --git a/bsd/dev/sweet_adreno_cp.c b/bsd/dev/sweet_adreno_cp.c
+--- a/bsd/dev/sweet_adreno_cp.c
++++ b/bsd/dev/sweet_adreno_cp.c
+@@ -183,6 +183,23 @@
+  (void)gpu->read(gpu->cookie, 0xf114);
+  gpu->write(gpu->cookie, 0x58, 0);
+  (void)gpu->read(gpu->cookie, 0x58);
++ /* Normal non-secure range setup from the A6xx startup protocol. Secure
++  * mode itself is still left only through the authenticated ZAP path. */
++ result->initial_tsb_control = gpu->read(gpu->cookie, 0x3e00c);
++ result->initial_tsb_base = (uint64_t)gpu->read(gpu->cookie, 0x3e000) |
++     ((uint64_t)gpu->read(gpu->cookie, 0x3e004) << 32);
++ result->initial_tsb_size = gpu->read(gpu->cookie, 0x3e008);
++ if (result->initial_tsb_control == 0xffffffffu ||
++     result->initial_tsb_base == 0xffffffffffffffffull ||
++     result->initial_tsb_size == 0xffffffffu) goto failed;
++ gpu->write(gpu->cookie, 0x3e00c, 0); /* TSB_CNTL */
++ write_address(gpu, 0x3e000, 0); /* TSB_TRUSTED_BASE */
++ gpu->write(gpu->cookie, 0x3e008, 0); /* TSB_TRUSTED_SIZE */
++ gpu->write(gpu->cookie, 0x3e040, 1); /* TSB_ADDR_MODE_CNTL */
++ if (gpu->read(gpu->cookie, 0x3e00c) ||
++     gpu->read(gpu->cookie, 0x3e000) || gpu->read(gpu->cookie, 0x3e004) ||
++     gpu->read(gpu->cookie, 0x3e008) || gpu->read(gpu->cookie, 0x3e040) != 1)
++  goto failed;
+  gpu->write(gpu->cookie, 0x3800, 1);
+  gpu->write(gpu->cookie, RBBM_INT_0_MASK, 0); /* no unhandled host IRQ */
+  gpu->write(gpu->cookie, CP_SQE_CNTL, 3);
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -240,6 +240,8 @@
+  bzero(&cp, sizeof(cp));
+  error = a618_cp_start(&gpu_io, &gmu_io, &memory, sqe, sqe_size,
+      sweet_adreno_barrier, NULL, &cp);
++ printf("SWEET ADRENO: CP initial TSB control=%#x base=%#llx size=%#x\n",
++     cp.initial_tsb_control, cp.initial_tsb_base, cp.initial_tsb_size);
+  printf("SWEET ADRENO: CP aperture errno=%d phase=%u status=%lld response=%#llx\n",
+      cp.aperture_error, cp.aperture_phase, cp.aperture_status, cp.aperture_response);
+  printf("SWEET ADRENO: SQE ME_INIT errno=%d phase=%u submitted=%u completed=%u RPTR=%#x WPTR=%#x status=%#x IRQ=%#x fault=%#x\n",

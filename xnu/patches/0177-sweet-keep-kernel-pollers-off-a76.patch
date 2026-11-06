@@ -1,0 +1,144 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 03defe6..62abfe4 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -545,6 +545,36 @@ touch_se_init(void)
+ 	return true;
+ }
+ 
++/*
++ * 0177: the touch thread polls the I2C engine every 10 ms at priority 81. On
++ * 0176 it cost ~7% of a core and, steered to the A76s by the 0167 scheduler
++ * rule, kept preempting CoreAnimation's render thread (bound to cpu7). Bind it
++ * to an A55 (boot-arg sweettouchcpu, default 5; negative = unbound). Called
++ * after the start delay, when all CPUs have been started.
++ */
++extern processor_t thread_bind(processor_t);
++extern processor_t cpu_to_processor(int);
++extern uint32_t processor_avail_count;
++
++static void
++touch_bind(void)
++{
++	int cpu = 5;
++	(void)PE_parse_boot_argn("sweettouchcpu", &cpu, sizeof(cpu));
++	if (cpu < 0 || cpu >= 8 || processor_avail_count < 8) {
++		printf("SWEET TOUCH: not bound (cpu %d, %u processors)\n", cpu, processor_avail_count);
++		return;
++	}
++	processor_t target = cpu_to_processor(cpu);
++	if (target == PROCESSOR_NULL) {
++		printf("SWEET TOUCH: cpu %d has no processor; not bound\n", cpu);
++		return;
++	}
++	(void)thread_bind(target);
++	thread_block(THREAD_CONTINUE_NULL); /* continue on the bound processor */
++	printf("SWEET TOUCH: thread bound to cpu %d\n", cpu);
++}
++
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+@@ -558,6 +588,7 @@ touch_thread(void *arg, wait_result_t result)
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	printf("SWEET TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
++	touch_bind();
+ 	printf("SWEET TOUCH: mapping GCC/TLMM/SE7\n");
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+ 	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 3df053e..86b3acc 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -100,6 +100,17 @@ SweetCPU::start(IOService *provider)
+ 	info.l2_cache_size = cpu->l2_cache_size;
+ 	info.l3_cache_id = cpu->l3_cache_id;
+ 	info.l3_cache_size = cpu->l3_cache_size;
++	/*
++	 * 0177: powergate_latency becomes cpu_idle_latency, the bound below which
++	 * delay()/IODelay() spin (ml_delay_should_spin). Left at 0, every delay
++	 * from a preemptible thread blocked on a timer: the drivers' 1 us register
++	 * polls (touch I2C, UFS, GPU power) each cost a timer, a context switch and
++	 * a wakeup (touch thread ~7% of a core). Waits shorter than 5 us now spin
++	 * as on Apple SoCs; longer ones still block. sweetdelayspin=<ns>, 0 = off.
++	 */
++	uint32_t spin_ns = 5000;
++	PE_parse_boot_argn("sweetdelayspin", &spin_ns, sizeof(spin_ns));
++	info.powergate_latency = spin_ns;
+ 	perfmon_interrupt_handler_func pmi_handler = NULL;
+ 	kern_return_t result = ml_processor_register(&info, &machProcessor, &ipi_handler, &pmi_handler);
+ 	if (result != KERN_SUCCESS) {
+@@ -294,6 +305,9 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
++	uint32_t spin_ns = 5000;
++	PE_parse_boot_argn("sweetdelayspin", &spin_ns, sizeof(spin_ns));
++	IOLog("SWEET CPU: delays below %u ns spin (cpu_idle_latency)\n", spin_ns);
+ 	sweet_cpufreq_start(topology);
+ 	thread_terminate(current_thread());
+ }
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 98f1dd1..b600f00 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -762,7 +762,12 @@ AppleCLCD::presentThread(void *arg, wait_result_t result)
+ {
+ 	(void)result;
+ 	AppleCLCD *fb = (AppleCLCD *)arg;
+-	bool bound = false;
++	/* 0177: boot-arg sweetpresentcpu picks the core (default 6, an A76);
++	 * a negative value leaves the thread unbound (0175 behaviour). */
++	int present_cpu = 6;
++	PE_parse_boot_argn("sweetpresentcpu", &present_cpu, sizeof(present_cpu));
++	IOLog("SWEET FB: present thread cpu %d%s\n", present_cpu, present_cpu < 0 ? " (unbound)" : "");
++	bool bound = present_cpu < 0;
+ 	for (;;) {
+ 		IOLockLock(fb->fPresentLock);
+ 		while (!fb->fPresentRequested) {
+@@ -773,7 +778,7 @@ AppleCLCD::presentThread(void *arg, wait_result_t result)
+ 		/* 0176: the copy and its beam wait run on an A76 (cpu6); binding
+ 		 * waits until iOS has started all eight processors. */
+ 		if (!bound) {
+-			bound = sweet_bind_current_thread(6);
++			bound = sweet_bind_current_thread(present_cpu);
+ 		}
+ 		bool take = false;
+ 		IOLockLock(fb->fLock);
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 7011303..c88084e 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5036,6 +5036,14 @@ choose_next_pset(
+  */
+ static int sweet_big_enabled = -1;
+ static int sweet_big_pri = 46;
++/*
++ * SWEET 0177: kernel threads (kernel_task) no longer get the A76 preference. They run at
++ * 80-95 and several poll hardware (touch I2C every 10 ms, Wi-Fi transport, VM): on 0176 the
++ * touch thread alone (priority 81, ~7% of a core) kept displacing CoreAnimation's render
++ * thread from cpu7, its only core. Threads that must be on an A76 bind themselves.
++ * sweetbigkernel=1 restores the 0167 behaviour.
++ */
++static int sweet_big_kernel = 0;
+ 
+ static processor_t
+ sweet_choose_big(processor_set_t pset, thread_t thread)
+@@ -5044,12 +5052,16 @@ sweet_choose_big(processor_set_t pset, thread_t thread)
+ 		int on = 1, pri = 46;
+ 		PE_parse_boot_argn("sweetbigcores", &on, sizeof(on));
+ 		PE_parse_boot_argn("sweetbigpri", &pri, sizeof(pri));
++		PE_parse_boot_argn("sweetbigkernel", &sweet_big_kernel, sizeof(sweet_big_kernel));
+ 		sweet_big_pri = pri;
+ 		sweet_big_enabled = on != 0;
+ 	}
+ 	if (!sweet_big_enabled || thread->sched_pri < sweet_big_pri || thread->bound_processor != PROCESSOR_NULL) {
+ 		return PROCESSOR_NULL;
+ 	}
++	if (!sweet_big_kernel && get_threadtask(thread) == kernel_task) {
++		return PROCESSOR_NULL;
++	}
+ 	processor_t best = PROCESSOR_NULL;
+ 	for (int cpu = 6; cpu <= 7; cpu++) {
+ 		processor_t big = processor_array[cpu];

@@ -1,0 +1,235 @@
+diff --git a/bsd/dev/sweet_haptic.c b/bsd/dev/sweet_haptic.c
+index e86671b..1e6e750 100644
+--- a/bsd/dev/sweet_haptic.c
++++ b/bsd/dev/sweet_haptic.c
+@@ -9,6 +9,10 @@
+  *
+  *   sweethaptic=1  bus up, reset released, chip ID and status read; nothing written to the chip
+  *   sweethaptic=2  ... Android's init values, then three 80 ms buzzes about 45 s after boot
++ *   sweethaptic=3  ... and then the motor for iOS: /dev/sweet-haptic takes the mono 16-bit samples
++ *                  of the HAL plug-in's "Actuator" (userspace/audio, from HackiOS); the motor runs
++ *                  in continuous mode while they are not silence, at least 30 ms, at most 1 s, then
++ *                  rests as long (the model is HackiOS redwood_haptic.c haptic=5).
+  *
+  * Every write is read back; a NACK, an I2C error, a mismatch or a fault bit stops the driver and
+  * puts the chip back into reset.
+@@ -22,6 +26,10 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <mach/mach_time.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -459,7 +467,7 @@ aw_init(void)
+ 
+ /* aw8624_haptic_cont(): continuous drive at the preset f0 until GO is cleared */
+ static bool
+-aw_cont_start(void)
++aw_cont_start(uint8_t drive)
+ {
+ 	const unsigned f0_reg = 1000000000u / (2080u * 260u);   /* f0_pre 208.0 Hz, f0_coeff 260 */
+ 	uint8_t clr = 0;
+@@ -476,7 +484,7 @@ aw_cont_start(void)
+ 	    aw_wr(0x72, 0x08) && aw_wr(0x73, 0xf8) &&
+ 	    aw_bits(0x78, (uint8_t)~0xfu, 3) &&                        /* BEMF_NUM: 3 brake periods */
+ 	    aw_wr(0x7a, 0x23) &&                                       /* TIME_NZC */
+-	    aw_wr(0x7b, 0x6a) && aw_wr(0x7c, 0x9b) &&                  /* drive level / overdrive */
++	    aw_wr(0x7b, drive) && aw_wr(0x7c, 0x9b) &&                 /* drive level (DT 0x6a) / overdrive */
+ 	    aw_wr_raw(0x05, 0x01) == 0;                                /* GO */
+ }
+ 
+@@ -495,6 +503,141 @@ aw_cont_stop(void)
+ 	(void)aw_bits(0x04, (uint8_t)~(1u << 0), (1u << 0));           /* standby */
+ }
+ 
++/* ---- sweethaptic=3: the motor for iOS ---- */
++
++#define HAP_ACTIVE_US    30000u   /* a write that was not silence counts for this long */
++#define HAP_SILENT_BELOW 256u     /* of 32768 */
++#define HAP_MIN_US       30000u   /* shortest buzz: a tap */
++#define HAP_MAX_US       1000000u /* longest buzz; then it rests as long */
++#define HAP_DRIVE        0x6au    /* the DT's cont_drv_lvl: never exceeded */
++
++static volatile uint64_t hap_heard_us, hap_quiet_us;
++static volatile uint32_t hap_peak;
++static uint64_t hap_frames;
++
++static uint64_t
++hap_now_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_USEC;
++}
++
++/* From the audio server's I/O thread: never waits, never touches the chip. */
++static int
++hap_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	int16_t samples[256];
++	int error = 0;
++	while (uio_resid(uio) >= 2) {
++		user_ssize_t bytes = uio_resid(uio);
++		uint32_t peak = 0;
++		if (bytes > (user_ssize_t)sizeof(samples)) {
++			bytes = sizeof(samples);
++		}
++		bytes &= ~(user_ssize_t)1;
++		if ((error = uiomove((caddr_t)samples, (int)bytes, uio)) != 0) {
++			break;
++		}
++		for (unsigned i = 0; i < bytes / 2; i++) {
++			uint32_t v = samples[i] < 0 ? (uint32_t)-(int32_t)samples[i] : (uint32_t)samples[i];
++			peak = v > peak ? v : peak;
++		}
++		hap_frames += (uint64_t)bytes / 2;
++		uint64_t now = hap_now_us();
++		if (peak > HAP_SILENT_BELOW) {
++			if (hap_heard_us == 0 || hap_quiet_us > hap_heard_us || now - hap_heard_us >= HAP_ACTIVE_US) {
++				hap_peak = 0;
++			}
++			hap_heard_us = now;
++			if (peak > hap_peak) {
++				hap_peak = peak;
++			}
++		} else {
++			hap_quiet_us = now;
++		}
++	}
++	return error;
++}
++
++static int
++hap_dev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	return 0;
++}
++
++static const struct cdevsw hap_cdevsw = {
++	.d_open       = hap_dev_open,
++	.d_close      = hap_dev_open,
++	.d_read       = eno_rdwrt,
++	.d_write      = hap_dev_write,
++	.d_ioctl      = eno_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++/* the vendor drive level from a third of full scale up, five eighths of it for the softest */
++static uint8_t
++hap_drive_for(uint32_t peak)
++{
++	const uint32_t full = 32768u / 3u, low = HAP_DRIVE * 5u / 8u;
++	if (peak >= full) {
++		return HAP_DRIVE;
++	}
++	return (uint8_t)(low + (HAP_DRIVE - low) * peak / full);
++}
++
++static void
++hap_serve(void)
++{
++	bool on = false;
++	uint64_t began = 0, rest_until = 0;
++	unsigned buzzes = 0, capped = 0;
++	printf("SWEET HAPTIC: serving /dev/sweet-haptic (%llu frames written so far)\n", hap_frames);
++	while (!hs.dead) {
++		uint64_t now = hap_now_us(), heard = hap_heard_us;
++		bool want = heard != 0 && now - heard < HAP_ACTIVE_US && hap_quiet_us <= heard;
++		if (want && !on && now >= rest_until) {
++			uint8_t drive = hap_drive_for(hap_peak);
++			if (!aw_cont_start(drive)) {
++				break;
++			}
++			on = true;
++			began = now;
++			if (++buzzes <= 24) {
++				printf("SWEET HAPTIC: buzz %u: peak %u of 32768, drive %#x\n", buzzes, hap_peak, drive);
++			}
++		} else if (on && (now - began >= HAP_MAX_US || (!want && now - began >= HAP_MIN_US))) {
++			bool cap = now - began >= HAP_MAX_US;
++			aw_cont_stop();
++			on = false;
++			if (cap) {
++				rest_until = now + HAP_MAX_US;
++				if (++capped <= 8) {
++					printf("SWEET HAPTIC: buzz %u capped at %u ms; resting\n", buzzes, HAP_MAX_US / 1000u);
++				}
++			}
++			uint8_t sysint = 0;
++			if (aw_rd(0x02, &sysint) || (sysint & 0x46u)) {
++				printf("SWEET HAPTIC: after buzz %u: SYSINT %#04x: stop, chip back into reset\n", buzzes, sysint);
++				hs.dead = true;
++			}
++		}
++		hap_wait(on ? 2 : 4);
++	}
++	if (on) {
++		aw_cont_stop();
++	}
++	printf("SWEET HAPTIC: service stopped after %u buzzes (%u capped), %llu frames\n", buzzes, capped, hap_frames);
++}
++
+ static void
+ hap_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -531,7 +674,7 @@ hap_thread(void *arg __unused, wait_result_t wr __unused)
+ 		goto reset;
+ 	}
+ 	for (unsigned n = 0; n < 3 && !hs.dead; n++) {
+-		if (!aw_cont_start()) {
++		if (!aw_cont_start(0x6a)) {
+ 			break;
+ 		}
+ 		hap_wait(80);
+@@ -542,6 +685,9 @@ hap_thread(void *arg __unused, wait_result_t wr __unused)
+ 		hap_wait(300);
+ 	}
+ 	printf("SWEET HAPTIC: test buzzes done%s\n", hs.dead ? " (stopped on an error)" : "");
++	if (hs.stage >= 3 && !hs.dead) {
++		hap_serve();
++	}
+ reset:
+ 	hap_reset(false);
+ 	printf("SWEET HAPTIC: chip back in reset\n");
+@@ -559,6 +705,16 @@ sweet_haptic_init(void)
+ 	}
+ 	hs.started = true;
+ 	hs.stage = stage;
++	if (stage >= 3) {
++		/* now, before the plug-in first plays: it gives up on a device that is not there */
++		int major = cdevsw_add(-1, &hap_cdevsw);
++		if (major < 0) {
++			printf("SWEET HAPTIC: cdevsw_add failed (%d)\n", major);
++		} else {
++			devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "sweet-haptic");
++			printf("SWEET HAPTIC: /dev/sweet-haptic ready (major %d)\n", major);
++		}
++	}
+ 	thread_t th;
+ 	if (kernel_thread_start(hap_thread, NULL, &th) == KERN_SUCCESS) {
+ 		thread_deallocate(th);
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index c87381e..1deced0 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -666,7 +666,7 @@ sweet_ufs_init(void)
+ 	(void)sweet_native_adreno_reserve_pool();   /* owned-BO pool while memory is unfragmented (0147) */
+ 	sweet_pmem_init();       /* /dev/pmem (sweetpmem=1): bsd/dev/sweet_pmem.c, from ios-flame 0094 */
+ 	sweet_smmu_probe_start();   /* sweetsmmuprobe=1: BCM votes + apps SMMU ID read (0149) */
+-	sweet_haptic_init();     /* sweethaptic=1|2: AW8624 on QUP1 SE3 (bsd/dev/sweet_haptic.c) */
++	sweet_haptic_init();     /* sweethaptic=1|2|3: AW8624 on QUP1 SE3 (bsd/dev/sweet_haptic.c) */
+ 	sweet_bt_init();         /* sweetbt=1: WCN3990 Bluetooth over QUP0 SE3, com.apple.uart.bluetooth (bsd/dev/sweet_bt.c) */
+ 	flame_wlan_init();       /* /dev/wlan, en0 + Apple80211 for wifid: bsd/dev/flame_wlan.c, from ios-flame 0123 */
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */

@@ -1,0 +1,661 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2,14 +2,14 @@
+  * SWEET Adreno 618 bring-up. sweetgpu=1 reads GPUCC and command DB only.
+  * sweetgpu=2 adds deferred RPMh ARC READ transactions after touch power.
+  * sweetgpu=3 additionally raises only gfx.lvl and verifies the readback.
+- * sweetgpu=4 additionally powers the GPUCC CX domain and reads the GPU
+- * aperture when the AHB branch reports running. sweetgpu=5 raises gfx.lvl
+- * and powers the GX domain as well. No GMU, SMMU or command submission at
+- * any stage.
++ * sweetgpu=4 uses the new A618 core to power CX after fresh rail checks.
++ * sweetgpu=5 is disabled pending the GX clock/reset and GMU backend.
++ * No core aperture reads, GMU, SMMU or command submission at any stage.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/errno.h>
++#include "sweet_adreno.h"
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+@@ -20,6 +20,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int sweet_rpmh_arc_probe(const char *res);
+ extern int sweet_rpmh_arc_read(const char *res);
++extern int sweet_rpmh_arc_require(const char *res, unsigned minimum);
+ extern int sweet_rpmh_arc_raise(const char *res, unsigned target_vlvl);
+ extern kern_return_t thread_terminate(thread_t);
+ void sweet_gpu_probe(void);
+@@ -46,7 +47,6 @@
+ #define BRANCH_CLK_ENABLE    (1u << 0)
+ 
+ static vm_offset_t sweet_gpucc;
+-static vm_offset_t sweet_gpu_regs;
+ static int sweet_gpu_probe_attempted;
+ static int sweet_gpu_stage;
+ 
+@@ -67,29 +67,6 @@
+ 	{ "GX_GMU",       0x1064u },
+ };
+ 
+-/*
+- * GPU aperture registers at 0x05000000. Byte offsets are the public A6XX
+- * register numbers times four: drm/msm gpu_read() does
+- * readl(gpu->mmio + (reg << 2)). Only registers defined in the public
+- * A6XX database are listed; there is no chip-ID register there, so the
+- * live-DT chip ID (0x06010800, Adreno 618) stays the identity reference.
+- */
+-static const struct {
+-	const char *name;
+-	uint32_t offset;
+-} sweet_gpu_regs_table[] = {
+-	{ "RBBM_GPR0_CNTL",    0x0060u },  /* 0x018 */
+-	{ "RBBM_INT_0_STATUS", 0x0804u },  /* 0x201 */
+-	{ "RBBM_STATUS",       0x0840u },  /* 0x210 */
+-	{ "RBBM_STATUS1",      0x0844u },  /* 0x211 */
+-	{ "RBBM_STATUS2",      0x0848u },  /* 0x212 */
+-	{ "RBBM_STATUS3",      0x084cu },  /* 0x213: bit 24 SMMU_STALLED_ON_FAULT */
+-	{ "CP_RB_BASE",        0x2000u },  /* 0x800 */
+-	{ "CP_RB_CNTL",        0x2008u },  /* 0x802 */
+-	{ "CP_HW_FAULT",       0x2084u },  /* 0x821 */
+-	{ "VBIF_VERSION",      0xc000u },  /* 0x3000 */
+-};
+-
+ static uint32_t
+ sweet_gpucc_read(uint32_t offset)
+ {
+@@ -98,21 +75,29 @@
+ 	return value;
+ }
+ 
+-/* MMIO write followed by a readback, matching gdsc_mb() in the GDSC driver. */
++/* XNU adapter for the portable A618 power controller. */
++static uint32_t
++sweet_adreno_read(void *cookie, uint32_t offset)
++{
++	(void)cookie;
++	return sweet_gpucc_read(offset);
++}
++
+ static void
+-sweet_gpucc_write(uint32_t offset, uint32_t value)
+-{
++sweet_adreno_write(void *cookie, uint32_t offset, uint32_t value)
++{
++	(void)cookie;
++	__asm__ volatile("dmb oshst" ::: "memory");
+ 	*(volatile uint32_t *)(sweet_gpucc + offset) = value;
+-	__asm__ volatile("dmb oshst" ::: "memory");
++	__asm__ volatile("dsb oshst" ::: "memory");
+ 	(void)sweet_gpucc_read(offset);
+ }
+ 
+-static uint32_t
+-sweet_gpu_reg_read(uint32_t offset)
+-{
+-	uint32_t value = *(volatile uint32_t *)(sweet_gpu_regs + offset);
+-	__asm__ volatile("dmb oshld" ::: "memory");
+-	return value;
++static void
++sweet_adreno_delay(void *cookie, unsigned usec)
++{
++	(void)cookie;
++	delay(usec);
+ }
+ 
+ /*
+@@ -133,102 +118,31 @@
+ 	return 0;
+ }
+ 
+-/*
+- * CX GDSC enable, mirroring the downstream qcom,gdsc driver for
+- * gpu_cx_gdsc: refuse HW-controlled domains, clear SW_COLLAPSE and poll
+- * GPU_CC_CX_HW_CTRL bit 31 (the DT points status at 0x1540). The parent
+- * rails were voted in earlier stages and are never written here.
++/* Fresh resource checks belong to this boot, not to a previous stage.
++ * ARC table selectors are the current board interpretation, not a voltage
++ * measurement. Shared rails are never lowered or written by this driver.
+  */
+ static int
+ sweet_gpu_power_cx(void)
+ {
+-	uint32_t gdscr = sweet_gpucc_read(GPU_CC_CX_GDSCR);
+-	unsigned waited;
+-
+-	if (gdscr & GDSC_HW_CONTROL) {
+-		printf("SWEET GPU: CX GDSCR=%#x is under HW control; refusing write\n",
+-		    gdscr);
+-		return EBUSY;
+-	}
+-	printf("SWEET GPU: CX power before GDSCR=%#x hw_ctrl=%#x clk_dis_wait=%u\n",
+-	    gdscr, sweet_gpucc_read(GPU_CC_CX_HW_CTRL), (gdscr >> 12) & 0xfu);
+-	if (gdscr & GDSC_SW_COLLAPSE) {
+-		sweet_gpucc_write(GPU_CC_CX_GDSCR, gdscr & ~GDSC_SW_COLLAPSE);
+-	}
+-	for (waited = 0; waited < 500; ++waited) {
+-		uint32_t hw = sweet_gpucc_read(GPU_CC_CX_HW_CTRL);
+-		if (hw & GDSC_PWR_ON) {
+-			printf("SWEET GPU: CX power on after %u us; GDSCR=%#x HW_CTRL=%#x\n",
+-			    waited, sweet_gpucc_read(GPU_CC_CX_GDSCR), hw);
+-			return 0;
+-		}
+-		delay(1);
+-	}
+-	printf("SWEET GPU: CX power timeout after 500 us; GDSCR=%#x HW_CTRL=%#x\n",
+-	    sweet_gpucc_read(GPU_CC_CX_GDSCR),
+-	    sweet_gpucc_read(GPU_CC_CX_HW_CTRL));
+-	return ETIMEDOUT;
+-}
+-
+-/*
+- * GX GDSC enable, mirroring gdsc_enable() for gpu_gx_gdsc: pulse the BCR
+- * block reset for 1 us, clear GMEM_CLAMP_IO in GPU_CC_GX_DOMAIN, clear
+- * SW_COLLAPSE and poll GX_GDSCR bit 31 (GX has no HW-control register).
+- */
+-static int
+-sweet_gpu_power_gx(void)
+-{
+-	uint32_t bcr = sweet_gpucc_read(GPU_CC_GX_BCR);
+-	uint32_t domain = sweet_gpucc_read(GPU_CC_GX_DOMAIN);
+-	uint32_t gdscr = sweet_gpucc_read(GPU_CC_GX_GDSCR);
+-	unsigned waited;
+-
+-	if (gdscr & GDSC_HW_CONTROL) {
+-		printf("SWEET GPU: GX GDSCR=%#x is under HW control; refusing write\n",
+-		    gdscr);
+-		return EBUSY;
+-	}
+-	printf("SWEET GPU: GX power before GDSCR=%#x DOMAIN=%#x BCR=%#x\n",
+-	    gdscr, domain, bcr);
+-	sweet_gpucc_write(GPU_CC_GX_BCR, bcr | GX_BCR_BLK_ARES);
+-	delay(1);
+-	sweet_gpucc_write(GPU_CC_GX_BCR, bcr & ~GX_BCR_BLK_ARES);
+-	sweet_gpucc_write(GPU_CC_GX_DOMAIN, domain & ~GX_DOMAIN_CLAMP);
+-	sweet_gpucc_write(GPU_CC_GX_GDSCR, gdscr & ~GDSC_SW_COLLAPSE);
+-	for (waited = 0; waited < 500; ++waited) {
+-		uint32_t status = sweet_gpucc_read(GPU_CC_GX_GDSCR);
+-		if (status & GDSC_PWR_ON) {
+-			printf("SWEET GPU: GX power on after %u us; GDSCR=%#x DOMAIN=%#x BCR=%#x\n",
+-			    waited, status, sweet_gpucc_read(GPU_CC_GX_DOMAIN),
+-			    sweet_gpucc_read(GPU_CC_GX_BCR));
+-			return 0;
+-		}
+-		delay(1);
+-	}
+-	printf("SWEET GPU: GX power timeout after 500 us; GDSCR=%#x DOMAIN=%#x BCR=%#x\n",
+-	    sweet_gpucc_read(GPU_CC_GX_GDSCR),
+-	    sweet_gpucc_read(GPU_CC_GX_DOMAIN), sweet_gpucc_read(GPU_CC_GX_BCR));
+-	return ETIMEDOUT;
+-}
+-
+-/* Reads are attempted only after the AHB branch reports a running clock. */
+-static void
+-sweet_gpu_read_aperture(void)
+-{
+-	unsigned count = sizeof(sweet_gpu_regs_table) / sizeof(sweet_gpu_regs_table[0]);
+-	uint32_t status3;
+-
+-	printf("SWEET GPU: GPU aperture reads at %#x; %u registers\n",
+-	    SWEET_GPU_PA, count);
+-	for (unsigned i = 0; i < count; ++i) {
+-		printf("SWEET GPU: REG %s @%#x=%#x\n", sweet_gpu_regs_table[i].name,
+-		    sweet_gpu_regs_table[i].offset,
+-		    sweet_gpu_reg_read(sweet_gpu_regs_table[i].offset));
+-	}
+-	status3 = sweet_gpu_reg_read(0x084cu);
+-	printf("SWEET GPU: RBBM_STATUS3 smmu_stalled=%u CP_HW_FAULT=%#x\n",
+-	    !!(status3 & (1u << 24)), sweet_gpu_reg_read(0x2084u));
+-	printf("SWEET GPU: GPU aperture reads complete\n");
++	struct a618_power_result result;
++	const struct a618_io io = {
++		.cookie = NULL,
++		.read = sweet_adreno_read,
++		.write = sweet_adreno_write,
++		.delay_us = sweet_adreno_delay,
++	};
++	int error = sweet_rpmh_arc_require("mx.lvl", 65);
++	if (!error)
++		error = sweet_rpmh_arc_require("cx.lvl", 65);
++	if (error) {
++		printf("SWEET ADRENO: CX preconditions failed errno=%d; no GPUCC write\n", error);
++		return error;
++	}
++	error = a618_enable_cx(&io, &result);
++	printf("SWEET ADRENO: CX result errno=%d control=%#x status=%#x waited_us=%u\n",
++	    error, result.control, result.status, result.waited_us);
++	return error;
+ }
+ 
+ static void
+@@ -246,50 +160,13 @@
+ 	(void)assert_wait_deadline(&sleep_chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+ 	if (stage >= 4) {
+-		int error;
+ 		if (stage == 5) {
+-			printf("SWEET GPU: GPUCC CX+GX power v1 starting; gfx.lvl first\n");
+-			error = sweet_rpmh_arc_raise("gfx.lvl", SWEET_GPU_GFX_TARGET);
+-			if (error) {
+-				printf("SWEET GPU: GPUCC GX power stopped at gfx.lvl errno=%d; no retry\n",
+-				    error);
+-				goto out;
+-			}
+-		} else {
+-			printf("SWEET GPU: GPUCC CX power v1 starting; GX untouched\n");
+-		}
+-		error = sweet_gpu_power_cx();
+-		if (error) {
+-			printf("SWEET GPU: GPUCC CX power v1 stopped errno=%d; no retry\n",
+-			    error);
++			printf("SWEET ADRENO: GX unavailable: root clock, GMU and reset sequencing incomplete; no writes\n");
+ 			goto out;
+ 		}
+-		if (stage == 5) {
+-			error = sweet_gpu_power_gx();
+-			if (error) {
+-				printf("SWEET GPU: GPUCC GX power v1 stopped errno=%d; CX left on, no retry\n",
+-				    error);
+-				goto out;
+-			}
+-		}
+-		{
+-			uint32_t ahb = sweet_gpucc_read(GPU_CC_CBCR_AHB);
+-			printf("SWEET GPU: CBCR AHB after power @%#x=%#x enable=%u clk_off=%u\n",
+-			    GPU_CC_CBCR_AHB, ahb, !!(ahb & BRANCH_CLK_ENABLE),
+-			    !!(ahb & BRANCH_CLK_OFF));
+-			if (ahb & BRANCH_CLK_OFF) {
+-				printf("SWEET GPU: AHB clock still off; GPU aperture reads skipped\n");
+-			} else if (sweet_gpu_regs) {
+-				sweet_gpu_read_aperture();
+-			} else {
+-				printf("SWEET GPU: GPU aperture unmapped; reads skipped\n");
+-			}
+-		}
+-		if (stage == 5) {
+-			printf("SWEET GPU: GPUCC GX power v1 complete; domains left on, no GMU/SMMU access\n");
+-		} else {
+-			printf("SWEET GPU: GPUCC CX power v1 complete; CX left on, GX untouched\n");
+-		}
++		printf("SWEET ADRENO: CX controller v2 starting; no GPU core access\n");
++		int error = sweet_gpu_power_cx();
++		printf("SWEET ADRENO: CX controller finished errno=%d; rendering unavailable\n", error);
+ 		goto out;
+ 	}
+ 	if (stage == 3) {
+@@ -340,7 +217,7 @@
+ 	sweet_gpu_probe_attempted = 1;
+ 	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
+ 	if (enabled < 1 || enabled > 5) {
+-		printf("SWEET GPU: audit disabled; sweetgpu=1 read-only, 2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 powers CX+GX\n");
++		printf("SWEET GPU: audit disabled; sweetgpu=1 read-only, 2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 disabled\n");
+ 		return;
+ 	}
+ 
+@@ -350,13 +227,6 @@
+ 	if (sweet_gpucc == 0) {
+ 		printf("SWEET GPU: GPUCC mapping failed\n");
+ 		return;
+-	}
+-	if (enabled >= 4) {
+-		sweet_gpu_regs = ml_io_map(SWEET_GPU_PA, SWEET_GPU_SIZE);
+-		if (sweet_gpu_regs == 0) {
+-			printf("SWEET GPU: GPU aperture mapping failed; stage %d will stop after CX power\n",
+-			    enabled);
+-		}
+ 	}
+ 
+ 	/*
+@@ -390,7 +260,7 @@
+ 		return;
+ 	}
+ 	if (enabled == 1) {
+-		printf("SWEET GPU: read-only audit complete; sweetgpu=2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 powers CX+GX\n");
++		printf("SWEET GPU: read-only audit complete; sweetgpu=2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 disabled\n");
+ 		return;
+ 	}
+ 	sweet_gpu_stage = enabled;
+@@ -399,9 +269,9 @@
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 		if (enabled == 5) {
+-			printf("SWEET GPU: GPUCC CX+GX power v1 scheduled in 60 s; gfx.lvl then CX then GX\n");
++			printf("SWEET ADRENO: GX request will be refused; no complete GX backend\n");
+ 		} else if (enabled == 4) {
+-			printf("SWEET GPU: GPUCC CX power v1 scheduled in 60 s; GX untouched\n");
++			printf("SWEET ADRENO: CX controller v2 scheduled in 60 s; fresh rail checks required\n");
+ 		} else if (enabled == 3) {
+ 			printf("SWEET GPU: ARC gfx raise v1 scheduled in 60 s; gfx only\n");
+ 		} else {
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -14,6 +14,7 @@
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_arc_probe(const char *res);
+ int sweet_rpmh_arc_read(const char *res);
++int sweet_rpmh_arc_require(const char *res, unsigned minimum);
+ int sweet_rpmh_arc_raise(const char *res, unsigned target_vlvl);
+ 
+ /* Resource descriptor resolved from the bootloader command DB. */
+@@ -575,6 +576,43 @@
+ 	return error;
+ }
+ 
++/* Check the current board's ARC selector interpretation without voting.
++ * Unlike arc_read(), this returns an error for off/out-of-range replies.
++ * This is a resource-setting check; it does not measure a rail voltage.
++ */
++int
++sweet_rpmh_arc_require(const char *res, unsigned minimum)
++{
++	if (!rh_arc_name(res) || minimum <= 1)
++		return EINVAL;
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE))
++		return EBUSY;
++	int error = EIO;
++	struct rh_res found = {0};
++	uint32_t levels[RH_ARC_MAX_LEVELS] = {0}, reply = 0xffffffffu;
++	unsigned count = 0;
++	if (rh_poisoned)
++		goto out;
++	if (!rh_touch_ready) {
++		error = EAGAIN;
++		goto out;
++	}
++	error = rh_arc_read_locked(res, &found, levels, &count, &reply);
++	if (error)
++		goto out;
++	if (reply >= count) {
++		error = EIO;
++		goto out;
++	}
++	printf("SWEET RPMH: ARC require %s selector=%u interpreted-level=%u minimum=%u\n",
++	    res, reply, levels[reply], minimum);
++	if (levels[reply] < minimum)
++		error = EAGAIN;
++out:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ /*
+  * Raise-only ARC vote. This is deliberately narrower than 0083's fixed
+  * votes: it reads the resource first, refuses a non-index reply, and never
+--- /dev/null
++++ b/bsd/dev/sweet_adreno.h
+@@ -0,0 +1,61 @@
++/* SPDX-License-Identifier: MIT
++ * SWEET A618 hardware core. See docs/adreno-port.md for provenance/status.
++ */
++#ifndef SWEET_ADRENO_H
++#define SWEET_ADRENO_H
++#if defined(KERNEL)
++#include <sys/types.h>
++#else
++#include <stdint.h>
++#endif
++
++/* All offsets passed to these callbacks are GPUCC byte offsets.
++ * write() must order prior stores and complete the MMIO store before return.
++ * The caller serializes device operations and keeps the rails voted on.
++ */
++struct a618_io {
++	void *cookie;
++	uint32_t (*read)(void *, uint32_t);
++	void (*write)(void *, uint32_t, uint32_t);
++	void (*delay_us)(void *, unsigned);
++};
++struct a618_power_result {
++	uint32_t control;
++	uint32_t status;
++	unsigned waited_us;
++};
++int a618_enable_cx(const struct a618_io *, struct a618_power_result *);
++
++/* CPU-side PM4 builder. No allocation, MMIO, firmware loading or submission.
++ * Caller supplies private, writable storage and owns all referenced IOVAs.
++ * A failed append leaves both the buffer and used count unchanged.
++ */
++struct a618_commands {
++	uint32_t *words;
++	unsigned capacity;
++	unsigned used;
++};
++int a618_emit_reg_write(struct a618_commands *, uint32_t, uint32_t);
++int a618_emit_memory_write(struct a618_commands *, uint64_t, uint32_t);
++int a618_emit_fence(struct a618_commands *, uint64_t, uint32_t);
++
++/* Single producer ring transport. Caller holds its device lock for init and
++ * submit, supplies coherent memory (or syncs it in publish), and guarantees
++ * CP/SQE, SMMU, power and clocks are initialized before attaching this ring.
++ * publish synchronizes the ENTIRE ring for DMA, orders writes, then writes
++ * CP_RB_WPTR. A failure poisons the ring: hardware ownership is uncertain.
++ * This API accepts trusted kernel-built packets only, never userspace PM4.
++ */
++struct a618_ring {
++	uint32_t *words;
++	unsigned size;
++	unsigned wptr;
++	int poisoned;
++	void *cookie;
++	int (*read_rptr)(void *, unsigned *);
++	int (*publish)(void *, unsigned);
++};
++int a618_ring_init(struct a618_ring *, uint32_t *, unsigned, void *,
++    int (*)(void *, unsigned *), int (*)(void *, unsigned));
++int a618_ring_submit(struct a618_ring *, const struct a618_commands *);
++#endif
+--- /dev/null
++++ b/bsd/dev/sweet_adreno.c
+@@ -0,0 +1,199 @@
++/* SPDX-License-Identifier: MIT
++ * Copyright (c) 2026 ios-sweet contributors
++ *
++ * Original portable implementation of the public A6xx PM4 wire format and
++ * SDM7150 CX GDSC sequence. References and limitations: docs/adreno-port.md.
++ * No Linux DRM or Mesa rendering implementation is included in this file.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(KERNEL)
++#include <sys/errno.h>
++#else
++#include <errno.h>
++#endif
++#include "sweet_adreno.h"
++
++#define CX_GDSCR 0x106cu
++#define CX_STATUS 0x1540u
++#define COLLAPSE 1u
++#define HW_CONTROL 2u
++#define POWER_ON 0x80000000u
++
++int
++a618_enable_cx(const struct a618_io *io, struct a618_power_result *result)
++{
++	uint32_t control, status;
++	if (!io || !result || !io->read || !io->write || !io->delay_us)
++		return EINVAL;
++	result->waited_us = 0;
++	control = result->control = io->read(io->cookie, CX_GDSCR);
++	status = result->status = io->read(io->cookie, CX_STATUS);
++	if (control == 0xffffffffu || status == 0xffffffffu)
++		return EIO;
++	if (control & HW_CONTROL)
++		return EBUSY;
++	/* This call does not reset an already powered domain. */
++	if (!(control & COLLAPSE) && (status & POWER_ON))
++		return 0;
++	/* Live DT: qcom,clk-dis-wait-val = 8; preserve all other fields. */
++	control = (control & ~(0xfu << 12)) | (8u << 12);
++	io->write(io->cookie, CX_GDSCR, control & ~COLLAPSE);
++	/* Qualcomm gdsc_enable: allow at least eight XO cycles before polling. */
++	io->delay_us(io->cookie, 1);
++	for (unsigned elapsed = 0; elapsed < 500; ++elapsed) {
++		result->waited_us = elapsed + 1;
++		status = result->status = io->read(io->cookie, CX_STATUS);
++		if (status == 0xffffffffu)
++			return EIO;
++		if (status & POWER_ON) {
++			/* Clock re-enable/memory power-up settling from gdsc_enable. */
++			io->delay_us(io->cookie, 2);
++			result->control = io->read(io->cookie, CX_GDSCR);
++			if (result->control == 0xffffffffu ||
++			    (result->control & (COLLAPSE | HW_CONTROL)))
++				return EIO;
++			return 0;
++		}
++		io->delay_us(io->cookie, 1);
++	}
++	result->control = io->read(io->cookie, CX_GDSCR);
++	/* Do not attempt a power-down after uncertain hardware completion. */
++	return ETIMEDOUT;
++}
++
++/* A6xx uses odd parity for the payload length and opcode/register fields. */
++static uint32_t
++odd_parity(uint32_t value)
++{
++	unsigned parity = 1;
++	while (value) {
++		parity ^= value & 1u;
++		value >>= 1;
++	}
++	return parity;
++}
++
++static int
++reserve(const struct a618_commands *commands, unsigned count)
++{
++	if (!commands || !commands->words || commands->used > commands->capacity)
++		return EINVAL;
++	if (count > commands->capacity - commands->used)
++		return ENOSPC;
++	return 0;
++}
++
++static uint32_t
++packet7(unsigned opcode, unsigned count)
++{
++	return 0x70000000u | count | (odd_parity(count) << 15) |
++	    (opcode << 16) | (odd_parity(opcode) << 23);
++}
++
++int
++a618_emit_reg_write(struct a618_commands *commands, uint32_t reg, uint32_t value)
++{
++	int error;
++	/* Register indices are DWORD indices, not byte offsets. */
++	if (reg > 0x3ffffu)
++		return EINVAL;
++	error = reserve(commands, 2);
++	if (error)
++		return error;
++	commands->words[commands->used++] = 0x40000001u | (reg << 8) |
++	    (odd_parity(reg) << 27); /* count=1 has odd parity already */
++	commands->words[commands->used++] = value;
++	return 0;
++}
++
++int
++a618_emit_memory_write(struct a618_commands *commands, uint64_t iova, uint32_t value)
++{
++	int error;
++	if ((iova & 3u) || iova >= (1ull << 49))
++		return EINVAL;
++	error = reserve(commands, 4);
++	if (error)
++		return error;
++	commands->words[commands->used++] = packet7(0x3d, 3); /* CP_MEM_WRITE */
++	commands->words[commands->used++] = (uint32_t)iova;
++	commands->words[commands->used++] = (uint32_t)(iova >> 32);
++	commands->words[commands->used++] = value;
++	return 0;
++}
++
++int
++a618_emit_fence(struct a618_commands *commands, uint64_t iova, uint32_t sequence)
++{
++	int error;
++	if ((iova & 3u) || iova >= (1ull << 49))
++		return EINVAL;
++	error = reserve(commands, 5);
++	if (error)
++		return error;
++	commands->words[commands->used++] = packet7(0x46, 4); /* CP_EVENT_WRITE */
++	/* CACHE_FLUSH_TS + IRQ, same event used by MSM a6xx_submit(). */
++	commands->words[commands->used++] = 4u | (1u << 31);
++	commands->words[commands->used++] = (uint32_t)iova;
++	commands->words[commands->used++] = (uint32_t)(iova >> 32);
++	commands->words[commands->used++] = sequence;
++	return 0;
++}
++
++int
++a618_ring_init(struct a618_ring *ring, uint32_t *words, unsigned size,
++    void *cookie, int (*read_rptr)(void *, unsigned *),
++    int (*publish)(void *, unsigned))
++{
++	/* A6xx ring length is a power of two. Keep one slot empty. The
++	 * hardware must already be configured for this length and RPTR=WPTR=0.
++	 */
++	if (!ring || !words || size < 2 || (size & (size - 1)) ||
++	    size > 0x100000u || !read_rptr || !publish)
++		return EINVAL;
++	ring->words = words;
++	ring->size = size;
++	ring->wptr = 0;
++	ring->poisoned = 0;
++	ring->cookie = cookie;
++	ring->read_rptr = read_rptr;
++	ring->publish = publish;
++	return 0;
++}
++
++int
++a618_ring_submit(struct a618_ring *ring, const struct a618_commands *commands)
++{
++	unsigned rptr, available, next;
++	int error;
++	if (!ring || !ring->words || !ring->read_rptr || !ring->publish ||
++	    ring->size < 2 || (ring->size & (ring->size - 1)) ||
++	    ring->wptr >= ring->size || !commands || !commands->words ||
++	    !commands->used || commands->used > commands->capacity)
++		return EINVAL;
++	if (ring->poisoned)
++		return EIO;
++	if (commands->used >= ring->size)
++		return ENOSPC;
++	error = ring->read_rptr(ring->cookie, &rptr);
++	if (error || rptr >= ring->size) {
++		ring->poisoned = 1;
++		return error ? error : EIO;
++	}
++	available = (rptr - ring->wptr - 1) & (ring->size - 1);
++	if (commands->used > available)
++		return EAGAIN; /* Caller may retry with a deadline, never busy-spin. */
++	next = ring->wptr;
++	for (unsigned i = 0; i < commands->used; ++i) {
++		ring->words[next] = commands->words[i];
++		next = (next + 1) & (ring->size - 1);
++	}
++	error = ring->publish(ring->cookie, next);
++	if (error) {
++		ring->poisoned = 1;
++		return error;
++	}
++	ring->wptr = next;
++	return 0;
++}
++#endif
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,7 +111,8 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_adreno.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard

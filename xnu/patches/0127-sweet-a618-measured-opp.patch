@@ -1,0 +1,367 @@
+diff --git a/bsd/dev/sweet_adreno_cp.c b/bsd/dev/sweet_adreno_cp.c
+index fe302a8..3f7ae1e 100644
+--- a/bsd/dev/sweet_adreno_cp.c
++++ b/bsd/dev/sweet_adreno_cp.c
+@@ -173,6 +173,30 @@ a618_cp_stage(const struct a618_dma_region *memory, const unsigned char *firmwar
+  barrier(cookie);
+  return 0;
+ }
++/* Linux a6xx_gmu_set_freq for a legacy GMU: performance index, firmware
++ * bandwidth choice, then the OOB_DCVS request/ack pair. EIO is a firmware
++ * refusal (DCVS_RETURN or OOB error bit); ETIMEDOUT leaves the OOB pending. */
++int
++a618_gmu_dcvs(const struct a618_io *gmu, unsigned index)
++{
++ if (!valid_io(gmu) || !index || index > 15) return EINVAL;
++ gmu->write(gmu->cookie, 0x8ff0, 0); /* DCVS_ACK_OPTION */
++ gmu->write(gmu->cookie, 0x8ff4, (3u << 28) | index); /* PERF_SETTING */
++ gmu->write(gmu->cookie, 0x8ff8, 0xff); /* FW chooses bandwidth vote */
++ gmu->write(gmu->cookie, GMU_HOST_SET, 1u << 23);
++ unsigned elapsed;
++ for (elapsed = 0; elapsed < 10000; elapsed += 10) {
++  uint32_t info = gmu->read(gmu->cookie, GMU_HOST_INFO);
++  if (info == 0xffffffffu || (info & (1u << 23))) return EIO;
++  if (info & (1u << 31)) break;
++  gmu->delay_us(gmu->cookie, 10);
++ }
++ gmu->write(gmu->cookie, GMU_HOST_CLEAR, 1u << 31);
++ gmu->write(gmu->cookie, GMU_HOST_SET, 1u << 31);
++ if (elapsed == 10000) return ETIMEDOUT;
++ if (gmu->read(gmu->cookie, 0x8ffc)) return EIO; /* DCVS_RETURN */
++ return 0;
++}
+ int
+ a618_cp_start(const struct a618_io *gpu, const struct a618_io *gmu,
+  const struct a618_dma_region *memory, const unsigned char *firmware,
+@@ -200,23 +224,13 @@ a618_cp_start(const struct a618_io *gpu, const struct a618_io *gmu,
+  }
+  barrier(cookie);
+  result->phase = 1;
+- /* Legacy DCVS selects the one nonzero performance-table entry (180MHz).
+-  * An ARC voltage vote alone does not set the GX clock. */
+- gmu->write(gmu->cookie, 0x8ff0, 0); /* DCVS_ACK_OPTION */
+- gmu->write(gmu->cookie, 0x8ff4, 0x30000001); /* PERF_SETTING, index1 */
+- gmu->write(gmu->cookie, 0x8ff8, 0xff); /* FW chooses bandwidth vote */
+- gmu->write(gmu->cookie, GMU_HOST_SET, 1u << 23);
+- unsigned elapsed;
+- for (elapsed = 0; elapsed < 10000; elapsed += 10) {
+-  uint32_t info = gmu->read(gmu->cookie, GMU_HOST_INFO);
+-  if (info == 0xffffffffu || (info & (1u << 23))) goto failed;
+-  if (info & (1u << 31)) break;
+-  gmu->delay_us(gmu->cookie, 10);
++ /* Legacy DCVS selects performance index 1 for bring-up. An ARC voltage
++  * vote alone does not set the GX clock. */
++ {
++  const int dcvs = a618_gmu_dcvs(gmu, 1);
++  if (dcvs == ETIMEDOUT) { result->poisoned = 1; return ETIMEDOUT; }
++  if (dcvs) goto failed;
+  }
+- gmu->write(gmu->cookie, GMU_HOST_CLEAR, 1u << 31);
+- gmu->write(gmu->cookie, GMU_HOST_SET, 1u << 31);
+- if (elapsed == 10000) { result->poisoned = 1; return ETIMEDOUT; }
+- if (gmu->read(gmu->cookie, 0x8ffc)) goto failed; /* DCVS_RETURN */
+  /* GX access is permitted only after the firmware acknowledges GPU_SET. */
+  gmu->write(gmu->cookie, GMU_HOST_SET, 1u << 16);
+  unsigned us;
+diff --git a/bsd/dev/sweet_adreno_cp.h b/bsd/dev/sweet_adreno_cp.h
+index cc07602..06092b7 100644
+--- a/bsd/dev/sweet_adreno_cp.h
++++ b/bsd/dev/sweet_adreno_cp.h
+@@ -60,6 +60,7 @@ int a618_cp_configure_aperture(struct a618_pas_result *);
+ int a618_zap_authenticate(volatile uint32_t *, uint64_t,
+  const struct a618_dma_region *, const unsigned char *, unsigned,
+  const unsigned char *, unsigned, struct a618_pas_result *);
++int a618_gmu_dcvs(const struct a618_io *, unsigned index);
+ int a618_cp_leave_secure(const struct a618_io *, const struct a618_io *,
+  const struct a618_dma_region *, void (*)(void *), void *, struct a618_cp_result *);
+ #ifdef __cplusplus
+diff --git a/bsd/dev/sweet_adreno_dma.h b/bsd/dev/sweet_adreno_dma.h
+index 1d32981..414871d 100644
+--- a/bsd/dev/sweet_adreno_dma.h
++++ b/bsd/dev/sweet_adreno_dma.h
+@@ -59,6 +59,13 @@ int a618_hfi_call(struct a618_hfi *, const struct a618_io *, unsigned,
+  const uint32_t *, unsigned, uint32_t *, unsigned);
+ int a618_hfi_bootstrap(struct a618_hfi *, const struct a618_io *,
+  uint32_t gpu_vote, uint32_t gmu_vote, uint32_t *firmware_version);
++/* Optional active GPU levels after the mandatory off entry, ascending. When
++ * empty the legacy single level (derived from gpu_vote) is sent. Index i in
++ * this table is HFI performance index i+1 for the legacy DCVS request. */
++#define A618_GPU_LEVELS_MAX 8u
++struct a618_gpu_level { uint32_t vote, khz; };
++extern struct a618_gpu_level a618_gpu_levels[A618_GPU_LEVELS_MAX];
++extern unsigned a618_gpu_level_count;
+ struct a618_gmu_boot_result {
+  unsigned phase;
+  uint32_t offset, value, firmware_version;
+diff --git a/bsd/dev/sweet_adreno_hfi.c b/bsd/dev/sweet_adreno_hfi.c
+index 0db7ac2..ad20320 100644
+--- a/bsd/dev/sweet_adreno_hfi.c
++++ b/bsd/dev/sweet_adreno_hfi.c
+@@ -173,6 +173,9 @@ failed:
+  return error;
+ }
+ 
++struct a618_gpu_level a618_gpu_levels[A618_GPU_LEVELS_MAX];
++unsigned a618_gpu_level_count;
++
+ int
+ a618_hfi_bootstrap(struct a618_hfi *hfi, const struct a618_io *io,
+  uint32_t gpu_vote, uint32_t gmu_vote, uint32_t *firmware_version)
+@@ -197,8 +200,20 @@ a618_hfi_bootstrap(struct a618_hfi *hfi, const struct a618_io *io,
+      gpu_khz, gpu_vote >> 16);
+ #endif
+  uint32_t perf[42] = {0}; /* body of the fixed 43-DWORD v1 message */
++ /* Linux a6xx_hfi_msg_perf_table_v1: counts, 16 gx {vote,kHz}, 4 cx. */
+  perf[0] = perf[1] = 2;
+  perf[4] = gpu_vote; perf[5] = gpu_khz;
++ if (a618_gpu_level_count && a618_gpu_level_count <= A618_GPU_LEVELS_MAX) {
++  perf[0] = 1 + a618_gpu_level_count;
++  for (unsigned i = 0; i < a618_gpu_level_count; ++i) {
++   perf[4 + 2 * i] = a618_gpu_levels[i].vote;
++   perf[5 + 2 * i] = a618_gpu_levels[i].khz;
++#if defined(KERNEL)
++   printf("SWEET ADRENO: HFI perf index %u vote=%#x %u kHz\n", i + 1,
++       a618_gpu_levels[i].vote, a618_gpu_levels[i].khz);
++#endif
++  }
++ }
+  perf[36] = gmu_vote; perf[37] = 200000;
+  error = a618_hfi_call(hfi, io, 4, perf, 42, 0, 0);
+  if (error) return error;
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 3aa7652..66fa3d8 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -14,8 +14,10 @@
+ #include <sys/errno.h>
+ #include "sweet_adreno.h"
+ #include "sweet_adreno_cp.h"
++#include "sweet_adreno_dma.h"
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+@@ -28,8 +30,10 @@ extern int sweet_rpmh_arc_read(const char *res);
+ extern int sweet_rpmh_arc_require(const char *res, unsigned minimum);
+ extern int sweet_rpmh_arc_raise(const char *res, unsigned target_vlvl);
+ extern kern_return_t thread_terminate(thread_t);
++extern int sweet_rpmh_adreno_level_vote(unsigned level, uint32_t *vote, unsigned *mx_level);
+ void sweet_gpu_probe(void);
+ 
++
+ /* LOW_SVS is the first safe GPU corner; the write only raises gfx.lvl. */
+ #define SWEET_GPU_GFX_TARGET 65u
+ 
+@@ -213,6 +217,123 @@ sweet_gpu_zap_prepare(void *cookie)
+      request->metadata, request->mdt, request->mdt_bytes, request->code,
+      request->code_bytes, &request->result);
+ }
++/*
++ * GPU performance levels from the pinned sm7150.dtsi gpu_opp_table, every
++ * one opp-supported-hw 0x1f (all speed bins): kHz and raw RPMh opp-level.
++ * Bring-up still runs at index 1 (267MHz, the proven corner). After the CP
++ * fence succeeds the APPS gfx/mx floors are raised for the chosen level, the
++ * GX clock is measured, DCVS selects it, and the clock is measured again.
++ * sweetgpukhz=267000 keeps the previous single-level behaviour.
++ */
++static const struct { uint32_t khz, level; } sweet_gpu_opps[] = {
++	{ 267000u, 64u },       /* LOW_SVS */
++	{ 355000u, 128u },      /* SVS */
++	{ 430000u, 192u },      /* SVS_L1 */
++	{ 565000u, 256u },      /* NOM */
++};
++static unsigned sweet_gpu_opp_mx[4];
++
++static void
++sweet_gpu_levels_prepare(void)
++{
++	uint32_t target = 565000u;
++	PE_parse_boot_argn("sweetgpukhz", &target, sizeof(target));
++	a618_gpu_level_count = 0;
++	unsigned count = 0;
++	for (unsigned i = 0; i < sizeof(sweet_gpu_opps) / sizeof(sweet_gpu_opps[0]); ++i) {
++		if (sweet_gpu_opps[i].khz > target) {
++			break;
++		}
++		uint32_t vote = 0;
++		unsigned mx = 0;
++		int error = sweet_rpmh_adreno_level_vote(sweet_gpu_opps[i].level, &vote, &mx);
++		if (error) {
++			printf("SWEET ADRENO: OPP %u kHz vote errno=%d; single legacy level\n",
++			    sweet_gpu_opps[i].khz, error);
++			return;
++		}
++		a618_gpu_levels[count].vote = vote;
++		a618_gpu_levels[count].khz = sweet_gpu_opps[i].khz;
++		sweet_gpu_opp_mx[count] = mx;
++		++count;
++	}
++	/* Only a table that begins with the proven 267MHz/raw64 corner. */
++	if (count < 2 || (a618_gpu_levels[0].vote >> 16) != 64u) {
++		printf("SWEET ADRENO: OPP table count=%u first=%#x; single legacy level\n",
++		    count, count ? a618_gpu_levels[0].vote : 0);
++		return;
++	}
++	a618_gpu_level_count = count;
++	printf("SWEET ADRENO: OPP table %u levels up to %u kHz (target %u)\n",
++	    count, a618_gpu_levels[count - 1].khz, target);
++}
++
++/* RBBM_PERFCTR_RBBM_0 with countable PERF_RBBM_ALWAYS_COUNT (GX core clock
++ * cycles) against the architected 19.2MHz timer. 0 means not measurable. */
++static uint64_t
++sweet_gpu_counter(vm_offset_t core)
++{
++	uint32_t hi, lo, again;
++	do {
++		hi = sweet_adreno_read((void *)core, 0x41d * 4);
++		lo = sweet_adreno_read((void *)core, 0x41c * 4);
++		again = sweet_adreno_read((void *)core, 0x41d * 4);
++	} while (hi != again);
++	return ((uint64_t)hi << 32) | lo;
++}
++
++static uint32_t
++sweet_gpu_measure_khz(vm_offset_t core)
++{
++	sweet_adreno_write((void *)core, 0x500 * 4, 1);         /* RBBM_PERFCTR_CNTL */
++	sweet_adreno_write((void *)core, 0x507 * 4, 0);         /* RBBM_SEL_0: ALWAYS_COUNT */
++	sweet_adreno_barrier(NULL);
++	delay(100);
++	const uint64_t c0 = sweet_gpu_counter(core), t0 = mach_absolute_time();
++	delay(20000);
++	const uint64_t c1 = sweet_gpu_counter(core), t1 = mach_absolute_time();
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	if (!ns || c1 <= c0 || (c1 >> 63) || c0 == 0xffffffffffffffffULL) {
++		return 0;
++	}
++	return (uint32_t)(((c1 - c0) * 1000000ULL) / ns);
++}
++
++static void
++sweet_gpu_raise_clock(vm_offset_t core, vm_offset_t gmu)
++{
++	const uint32_t before = sweet_gpu_measure_khz(core);
++	printf("SWEET ADRENO: GX clock measured=%u kHz at perf index 1 (configured %u kHz)\n",
++	    before, a618_gpu_level_count ? a618_gpu_levels[0].khz : 267000u);
++	if (a618_gpu_level_count < 2) {
++		return;
++	}
++	const unsigned top = a618_gpu_level_count - 1;
++	const unsigned gfx_vlvl = (a618_gpu_levels[top].vote >> 16) + 1;   /* ARC consumer level */
++	const unsigned mx_vlvl = sweet_gpu_opp_mx[top] + 1;
++	int error = sweet_rpmh_arc_raise("mx.lvl", mx_vlvl);
++	if (!error) {
++		error = sweet_rpmh_arc_raise("gfx.lvl", gfx_vlvl);
++	}
++	if (error) {
++		printf("SWEET ADRENO: APPS rail floor errno=%d; GX stays at perf index 1\n", error);
++		return;
++	}
++	const struct a618_io gmu_io = {(void *)gmu,
++	    sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay};
++	error = a618_gmu_dcvs(&gmu_io, top + 1);
++	const uint32_t after = sweet_gpu_measure_khz(core);
++	printf("SWEET ADRENO: DCVS perf index %u (%u kHz, gfx vlvl %u, mx vlvl %u) errno=%d; GX clock measured=%u kHz\n",
++	    top + 1, a618_gpu_levels[top].khz, gfx_vlvl, mx_vlvl, error, after);
++	if (error && error != ETIMEDOUT) {
++		/* Firmware refused: request the proven bring-up index again. */
++		int back = a618_gmu_dcvs(&gmu_io, 1);
++		printf("SWEET ADRENO: DCVS restore index 1 errno=%d measured=%u kHz\n",
++		    back, sweet_gpu_measure_khz(core));
++	}
++}
++
+ static int
+ sweet_gpu_cp_start(vm_offset_t gmu, vm_offset_t smmu)
+ {
+@@ -372,6 +493,7 @@ sweet_gpu_cp_start(vm_offset_t gmu, vm_offset_t smmu)
+      cp.hw_fault, cp.fence, cp.value);
+  printf("SWEET ADRENO: CP bootstrap complete errno=%d; iOS rendering ABI unavailable\n", error);
+  if (!error) {
++  sweet_gpu_raise_clock(core, gmu);
+   extern int sweet_native_adreno_adopt(const struct a618_dma_region *, uintptr_t, uintptr_t, uintptr_t, unsigned);
+   error = sweet_native_adreno_adopt(&memory, core, gmu, smmu, cp.fence);
+   printf("SWEET ADRENO: NativeAdreno A618 handoff errno=%d; no userspace rendering\n", error);
+@@ -476,6 +598,7 @@ sweet_gpu_gmu_prepare(int stage)
+         sweet_adreno_read((void *)smmu, 0x800 + slot * 4),
+         sweet_adreno_read((void *)smmu, 0xc00 + slot * 4));
+    uint32_t gpu_vote = 0, gmu_vote = 0;
++   sweet_gpu_levels_prepare();
+    error = sweet_rpmh_adreno_votes(&gpu_vote, &gmu_vote);
+    printf("SWEET ADRENO: MIN_SVS votes errno=%d GPU=%#x GMU=%#x\n",
+        error, gpu_vote, gmu_vote);
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index eb22314..56624c9 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -594,6 +594,48 @@ sweet_rpmh_adreno_votes(uint32_t *gpu, uint32_t *gmu)
+  return error;
+ }
+ 
++/*
++ * One GPU performance level's wire vote, as Linux a6xx_gmu_rpmh_arc_votes_init:
++ * the first gfx.lvl entry at or above the OPP's raw level is primary; the
++ * first mx.lvl entry at or above it is secondary, else the highest nonzero
++ * one. *mx_level returns that secondary level for an APPS raise-only floor.
++ */
++int sweet_rpmh_adreno_level_vote(unsigned level, uint32_t *vote, unsigned *mx_level);
++int
++sweet_rpmh_adreno_level_vote(unsigned level, uint32_t *vote, unsigned *mx_level)
++{
++ if (!vote || !mx_level || !level) return EINVAL;
++ *vote = 0; *mx_level = 0;
++ if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
++ const char *names[] = {"gfx.lvl", "mx.lvl"};
++ const uint32_t address[] = {0x30050, 0x30010};
++ uint32_t levels[2][RH_ARC_MAX_LEVELS] = {{0}};
++ unsigned counts[2] = {0}, index[2] = {0};
++ bool found[2] = {false, false};
++ int error = rh_map();
++ for (unsigned r = 0; !error && r < 2; ++r) {
++  struct rh_res resource = {0};
++  error = rh_lookup(names[r], RH_ARC, &resource);
++  if (!error && resource.addr != address[r]) error = ENODEV;
++  if (!error) error = rh_arc_levels(&resource, levels[r], &counts[r]);
++  if (error) break;
++  for (unsigned i = 0; i < counts[r]; ++i) {
++   --levels[r][i];
++   if (!found[r] && levels[r][i] >= level) { index[r] = i; found[r] = true; }
++   else if (!found[r] && r == 1 && levels[r][i]) index[r] = i;
++  }
++  if (levels[r][0] != 0) error = ERANGE;
++ }
++ if (!error && !found[0]) error = ERANGE;
++ if (!error && !index[1]) error = ERANGE;
++ if (!error) {
++  *vote = (levels[0][index[0]] << 16) | (index[1] << 8) | index[0];
++  *mx_level = levels[1][index[1]];
++ }
++ __atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++ return error;
++}
++
+ /*
+  * Read one ARC resource while the caller holds rh_lock. The same serialized
+  * ACTIVE TCS engine is used for reads and for the raise-only write below.
+@@ -709,13 +751,14 @@ out:
+ /*
+  * Raise-only ARC vote. This is deliberately narrower than 0083's fixed
+  * votes: it reads the resource first, refuses a non-index reply, and never
+- * writes a selector below the current level. The caller uses it only for
+- * gfx.lvl; shared mx/cx votes remain untouched.
++ * writes a selector below the current level. gfx.lvl and mx.lvl only: a
++ * GPU clock above the bootloader corner first raises both APPS floors so the
++ * rails cannot depend solely on the GMU's own votes. cx.lvl stays untouched.
+  */
+ int
+ sweet_rpmh_arc_raise(const char *res, unsigned target_vlvl)
+ {
+-	if (!res || strcmp(res, "gfx.lvl") || target_vlvl == 0) {
++	if (!res || (strcmp(res, "gfx.lvl") && strcmp(res, "mx.lvl")) || target_vlvl == 0) {
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {

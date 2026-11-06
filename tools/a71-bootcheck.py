@@ -21,7 +21,8 @@ seen, port = set(), False
 
 def has_port():
     ps = "Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -match 'VID_1209&PID_0002' } | Select-Object -First 1 -ExpandProperty Status"
-    return "OK" in subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True).stdout
+    # CREATE_NO_WINDOW: without it a detached run opens a console window on every poll.
+    return "OK" in subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True, creationflags=0x08000000).stdout
 
 
 while time.time() - t0 < LIMIT:

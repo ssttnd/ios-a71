@@ -1,0 +1,317 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2,10 +2,14 @@
+  * SWEET Adreno 618 bring-up. sweetgpu=1 reads GPUCC and command DB only.
+  * sweetgpu=2 adds deferred RPMh ARC READ transactions after touch power.
+  * sweetgpu=3 additionally raises only gfx.lvl and verifies the readback.
+- * No GPUCC/core/GMU writes until the ARC reply semantics are understood.
++ * sweetgpu=4 additionally powers the GPUCC CX domain and reads the GPU
++ * aperture when the AHB branch reports running. sweetgpu=5 raises gfx.lvl
++ * and powers the GX domain as well. No GMU, SMMU or command submission at
++ * any stage.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
++#include <sys/errno.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+@@ -20,23 +24,29 @@
+ extern kern_return_t thread_terminate(thread_t);
+ void sweet_gpu_probe(void);
+ 
+-/* LOW_SVS is the first safe GPU corner; the 0086 write only raises gfx.lvl. */
++/* LOW_SVS is the first safe GPU corner; the write only raises gfx.lvl. */
+ #define SWEET_GPU_GFX_TARGET 65u
+ 
+ #define SWEET_GPUCC_PA       0x05090000u
+ #define SWEET_GPUCC_SIZE     0x00009000u
++#define SWEET_GPU_PA         0x05000000u
++#define SWEET_GPU_SIZE       0x00040000u
+ #define GPU_CC_GX_BCR        0x1008u
+ #define GPU_CC_GX_GDSCR      0x100cu
+ #define GPU_CC_CX_GDSCR      0x106cu
++#define GPU_CC_CBCR_AHB      0x1078u
+ #define GPU_CC_GX_DOMAIN     0x1508u
+ #define GPU_CC_CX_HW_CTRL    0x1540u
+ #define GDSC_PWR_ON          (1u << 31)
+ #define GDSC_SW_COLLAPSE     (1u << 0)
+ #define GDSC_HW_CONTROL      (1u << 1)
++#define GX_DOMAIN_CLAMP      (1u << 0)
++#define GX_BCR_BLK_ARES      (1u << 0)
+ #define BRANCH_CLK_OFF       (1u << 31)
+ #define BRANCH_CLK_ENABLE    (1u << 0)
+ 
+ static vm_offset_t sweet_gpucc;
++static vm_offset_t sweet_gpu_regs;
+ static int sweet_gpu_probe_attempted;
+ static int sweet_gpu_stage;
+ 
+@@ -57,6 +67,29 @@
+ 	{ "GX_GMU",       0x1064u },
+ };
+ 
++/*
++ * GPU aperture registers at 0x05000000. Byte offsets are the public A6XX
++ * register numbers times four: drm/msm gpu_read() does
++ * readl(gpu->mmio + (reg << 2)). Only registers defined in the public
++ * A6XX database are listed; there is no chip-ID register there, so the
++ * live-DT chip ID (0x06010800, Adreno 618) stays the identity reference.
++ */
++static const struct {
++	const char *name;
++	uint32_t offset;
++} sweet_gpu_regs_table[] = {
++	{ "RBBM_GPR0_CNTL",    0x0060u },  /* 0x018 */
++	{ "RBBM_INT_0_STATUS", 0x0804u },  /* 0x201 */
++	{ "RBBM_STATUS",       0x0840u },  /* 0x210 */
++	{ "RBBM_STATUS1",      0x0844u },  /* 0x211 */
++	{ "RBBM_STATUS2",      0x0848u },  /* 0x212 */
++	{ "RBBM_STATUS3",      0x084cu },  /* 0x213: bit 24 SMMU_STALLED_ON_FAULT */
++	{ "CP_RB_BASE",        0x2000u },  /* 0x800 */
++	{ "CP_RB_CNTL",        0x2008u },  /* 0x802 */
++	{ "CP_HW_FAULT",       0x2084u },  /* 0x821 */
++	{ "VBIF_VERSION",      0xc000u },  /* 0x3000 */
++};
++
+ static uint32_t
+ sweet_gpucc_read(uint32_t offset)
+ {
+@@ -65,7 +98,26 @@
+ 	return value;
+ }
+ 
+-/* Pure metadata inspection; valid tables do not establish current votes. */
++/* MMIO write followed by a readback, matching gdsc_mb() in the GDSC driver. */
++static void
++sweet_gpucc_write(uint32_t offset, uint32_t value)
++{
++	*(volatile uint32_t *)(sweet_gpucc + offset) = value;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	(void)sweet_gpucc_read(offset);
++}
++
++static uint32_t
++sweet_gpu_reg_read(uint32_t offset)
++{
++	uint32_t value = *(volatile uint32_t *)(sweet_gpu_regs + offset);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return value;
++}
++
++/*
++ * Pure metadata inspection; valid tables do not establish current votes.
++ */
+ static int
+ sweet_gpu_arc_tables(void)
+ {
+@@ -81,6 +133,104 @@
+ 	return 0;
+ }
+ 
++/*
++ * CX GDSC enable, mirroring the downstream qcom,gdsc driver for
++ * gpu_cx_gdsc: refuse HW-controlled domains, clear SW_COLLAPSE and poll
++ * GPU_CC_CX_HW_CTRL bit 31 (the DT points status at 0x1540). The parent
++ * rails were voted in earlier stages and are never written here.
++ */
++static int
++sweet_gpu_power_cx(void)
++{
++	uint32_t gdscr = sweet_gpucc_read(GPU_CC_CX_GDSCR);
++	unsigned waited;
++
++	if (gdscr & GDSC_HW_CONTROL) {
++		printf("SWEET GPU: CX GDSCR=%#x is under HW control; refusing write\n",
++		    gdscr);
++		return EBUSY;
++	}
++	printf("SWEET GPU: CX power before GDSCR=%#x hw_ctrl=%#x clk_dis_wait=%u\n",
++	    gdscr, sweet_gpucc_read(GPU_CC_CX_HW_CTRL), (gdscr >> 12) & 0xfu);
++	if (gdscr & GDSC_SW_COLLAPSE) {
++		sweet_gpucc_write(GPU_CC_CX_GDSCR, gdscr & ~GDSC_SW_COLLAPSE);
++	}
++	for (waited = 0; waited < 500; ++waited) {
++		uint32_t hw = sweet_gpucc_read(GPU_CC_CX_HW_CTRL);
++		if (hw & GDSC_PWR_ON) {
++			printf("SWEET GPU: CX power on after %u us; GDSCR=%#x HW_CTRL=%#x\n",
++			    waited, sweet_gpucc_read(GPU_CC_CX_GDSCR), hw);
++			return 0;
++		}
++		delay(1);
++	}
++	printf("SWEET GPU: CX power timeout after 500 us; GDSCR=%#x HW_CTRL=%#x\n",
++	    sweet_gpucc_read(GPU_CC_CX_GDSCR),
++	    sweet_gpucc_read(GPU_CC_CX_HW_CTRL));
++	return ETIMEDOUT;
++}
++
++/*
++ * GX GDSC enable, mirroring gdsc_enable() for gpu_gx_gdsc: pulse the BCR
++ * block reset for 1 us, clear GMEM_CLAMP_IO in GPU_CC_GX_DOMAIN, clear
++ * SW_COLLAPSE and poll GX_GDSCR bit 31 (GX has no HW-control register).
++ */
++static int
++sweet_gpu_power_gx(void)
++{
++	uint32_t bcr = sweet_gpucc_read(GPU_CC_GX_BCR);
++	uint32_t domain = sweet_gpucc_read(GPU_CC_GX_DOMAIN);
++	uint32_t gdscr = sweet_gpucc_read(GPU_CC_GX_GDSCR);
++	unsigned waited;
++
++	if (gdscr & GDSC_HW_CONTROL) {
++		printf("SWEET GPU: GX GDSCR=%#x is under HW control; refusing write\n",
++		    gdscr);
++		return EBUSY;
++	}
++	printf("SWEET GPU: GX power before GDSCR=%#x DOMAIN=%#x BCR=%#x\n",
++	    gdscr, domain, bcr);
++	sweet_gpucc_write(GPU_CC_GX_BCR, bcr | GX_BCR_BLK_ARES);
++	delay(1);
++	sweet_gpucc_write(GPU_CC_GX_BCR, bcr & ~GX_BCR_BLK_ARES);
++	sweet_gpucc_write(GPU_CC_GX_DOMAIN, domain & ~GX_DOMAIN_CLAMP);
++	sweet_gpucc_write(GPU_CC_GX_GDSCR, gdscr & ~GDSC_SW_COLLAPSE);
++	for (waited = 0; waited < 500; ++waited) {
++		uint32_t status = sweet_gpucc_read(GPU_CC_GX_GDSCR);
++		if (status & GDSC_PWR_ON) {
++			printf("SWEET GPU: GX power on after %u us; GDSCR=%#x DOMAIN=%#x BCR=%#x\n",
++			    waited, status, sweet_gpucc_read(GPU_CC_GX_DOMAIN),
++			    sweet_gpucc_read(GPU_CC_GX_BCR));
++			return 0;
++		}
++		delay(1);
++	}
++	printf("SWEET GPU: GX power timeout after 500 us; GDSCR=%#x DOMAIN=%#x BCR=%#x\n",
++	    sweet_gpucc_read(GPU_CC_GX_GDSCR),
++	    sweet_gpucc_read(GPU_CC_GX_DOMAIN), sweet_gpucc_read(GPU_CC_GX_BCR));
++	return ETIMEDOUT;
++}
++
++/* Reads are attempted only after the AHB branch reports a running clock. */
++static void
++sweet_gpu_read_aperture(void)
++{
++	unsigned count = sizeof(sweet_gpu_regs_table) / sizeof(sweet_gpu_regs_table[0]);
++	uint32_t status3;
++
++	printf("SWEET GPU: GPU aperture reads at %#x; %u registers\n",
++	    SWEET_GPU_PA, count);
++	for (unsigned i = 0; i < count; ++i) {
++		printf("SWEET GPU: REG %s @%#x=%#x\n", sweet_gpu_regs_table[i].name,
++		    sweet_gpu_regs_table[i].offset,
++		    sweet_gpu_reg_read(sweet_gpu_regs_table[i].offset));
++	}
++	status3 = sweet_gpu_reg_read(0x084cu);
++	printf("SWEET GPU: RBBM_STATUS3 smmu_stalled=%u CP_HW_FAULT=%#x\n",
++	    !!(status3 & (1u << 24)), sweet_gpu_reg_read(0x2084u));
++	printf("SWEET GPU: GPU aperture reads complete\n");
++}
++
+ static void
+ sweet_gpu_arc_thread(void *arg, wait_result_t result)
+ {
+@@ -95,6 +245,53 @@
+ 	clock_interval_to_deadline(60, NSEC_PER_SEC, &deadline);
+ 	(void)assert_wait_deadline(&sleep_chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
++	if (stage >= 4) {
++		int error;
++		if (stage == 5) {
++			printf("SWEET GPU: GPUCC CX+GX power v1 starting; gfx.lvl first\n");
++			error = sweet_rpmh_arc_raise("gfx.lvl", SWEET_GPU_GFX_TARGET);
++			if (error) {
++				printf("SWEET GPU: GPUCC GX power stopped at gfx.lvl errno=%d; no retry\n",
++				    error);
++				goto out;
++			}
++		} else {
++			printf("SWEET GPU: GPUCC CX power v1 starting; GX untouched\n");
++		}
++		error = sweet_gpu_power_cx();
++		if (error) {
++			printf("SWEET GPU: GPUCC CX power v1 stopped errno=%d; no retry\n",
++			    error);
++			goto out;
++		}
++		if (stage == 5) {
++			error = sweet_gpu_power_gx();
++			if (error) {
++				printf("SWEET GPU: GPUCC GX power v1 stopped errno=%d; CX left on, no retry\n",
++				    error);
++				goto out;
++			}
++		}
++		{
++			uint32_t ahb = sweet_gpucc_read(GPU_CC_CBCR_AHB);
++			printf("SWEET GPU: CBCR AHB after power @%#x=%#x enable=%u clk_off=%u\n",
++			    GPU_CC_CBCR_AHB, ahb, !!(ahb & BRANCH_CLK_ENABLE),
++			    !!(ahb & BRANCH_CLK_OFF));
++			if (ahb & BRANCH_CLK_OFF) {
++				printf("SWEET GPU: AHB clock still off; GPU aperture reads skipped\n");
++			} else if (sweet_gpu_regs) {
++				sweet_gpu_read_aperture();
++			} else {
++				printf("SWEET GPU: GPU aperture unmapped; reads skipped\n");
++			}
++		}
++		if (stage == 5) {
++			printf("SWEET GPU: GPUCC GX power v1 complete; domains left on, no GMU/SMMU access\n");
++		} else {
++			printf("SWEET GPU: GPUCC CX power v1 complete; CX left on, GX untouched\n");
++		}
++		goto out;
++	}
+ 	if (stage == 3) {
+ 		printf("SWEET GPU: ARC gfx raise v1 starting; mx/cx read-only\n");
+ 		/* Snapshot the shared rails without writing them. */
+@@ -142,18 +339,25 @@
+ 	}
+ 	sweet_gpu_probe_attempted = 1;
+ 	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
+-	if (enabled != 1 && enabled != 2 && enabled != 3) {
+-		printf("SWEET GPU: audit disabled; sweetgpu=1 read-only, sweetgpu=2 reads ARC resources, sweetgpu=3 raises gfx.lvl\n");
++	if (enabled < 1 || enabled > 5) {
++		printf("SWEET GPU: audit disabled; sweetgpu=1 read-only, 2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 powers CX+GX\n");
+ 		return;
+ 	}
+ 
+-	printf("SWEET GPU: GPUCC audit v2 at %#x; stage=%d, no core/GMU access\n",
++	printf("SWEET GPU: GPUCC audit v2 at %#x; stage=%d, no GMU access\n",
+ 	    SWEET_GPUCC_PA, enabled);
+ 	sweet_gpucc = ml_io_map(SWEET_GPUCC_PA, SWEET_GPUCC_SIZE);
+ 	if (sweet_gpucc == 0) {
+ 		printf("SWEET GPU: GPUCC mapping failed\n");
+ 		return;
+ 	}
++	if (enabled >= 4) {
++		sweet_gpu_regs = ml_io_map(SWEET_GPU_PA, SWEET_GPU_SIZE);
++		if (sweet_gpu_regs == 0) {
++			printf("SWEET GPU: GPU aperture mapping failed; stage %d will stop after CX power\n",
++			    enabled);
++		}
++	}
+ 
+ 	/*
+ 	 * CX uses the separate HW-control status register in the live DT.
+@@ -186,7 +390,7 @@
+ 		return;
+ 	}
+ 	if (enabled == 1) {
+-		printf("SWEET GPU: read-only audit complete; sweetgpu=2 reads ARC resources, sweetgpu=3 raises gfx.lvl\n");
++		printf("SWEET GPU: read-only audit complete; sweetgpu=2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 powers CX+GX\n");
+ 		return;
+ 	}
+ 	sweet_gpu_stage = enabled;
+@@ -194,7 +398,11 @@
+ 	kern_return_t kr = kernel_thread_start(sweet_gpu_arc_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+-		if (enabled == 3) {
++		if (enabled == 5) {
++			printf("SWEET GPU: GPUCC CX+GX power v1 scheduled in 60 s; gfx.lvl then CX then GX\n");
++		} else if (enabled == 4) {
++			printf("SWEET GPU: GPUCC CX power v1 scheduled in 60 s; GX untouched\n");
++		} else if (enabled == 3) {
+ 			printf("SWEET GPU: ARC gfx raise v1 scheduled in 60 s; gfx only\n");
+ 		} else {
+ 			printf("SWEET GPU: ARC readback v1 scheduled in 60 s; no resource votes\n");

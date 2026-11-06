@@ -26,7 +26,8 @@ class Timeouts(ctypes.Structure):
 def find_port():
     ps = ("Get-CimInstance Win32_PnPEntity -Filter \"PNPDeviceID LIKE 'USB\\\\VID_1209&PID_0002%'\" "
           "| Select-Object -ExpandProperty Name")
-    out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True).stdout
+    # CREATE_NO_WINDOW: without it a detached run opens a console window on every poll.
+    out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True, creationflags=0x08000000).stdout
     m = re.search(r"\((COM\d+)\)", out)
     return m.group(1) if m else None
 

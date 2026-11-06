@@ -1,0 +1,87 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 7417ece..f297a01 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -87,11 +87,12 @@ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. 0xb6: the QG SDAM
+-	 * (stock DT qcom,qg-sdam@b600), memory the Linux QG driver keeps its SOC in (0164). */
++	 * (stock DT qcom,qg-sdam@b600), memory the Linux QG driver keeps its SOC in (0164). 0x60: the
++	 * RTC's counter, read once to set the calendar (0166). */
+ 	unsigned peripheral = addr >> 8;
+ 	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0xb6)) {
++	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0xb6 && peripheral != 0x60)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 6a99363..942ba80 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -342,6 +342,53 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ }
+ 
++/*
++ * 0166: set the calendar from the PM6150 RTC (Linux rtc-pm8xxx, pm8941 layout: control 0x6046 bit 7
++ * enabled, seconds 0x6048-0x604b little endian; re-read when the low byte moved). Without it every
++ * boot's calendar starts at the epoch and kern.boottime is the same ~40 s each boot; wland's auto
++ * start compares it with /var/local/wland.boot and exits "already started in this boot" whenever
++ * it repeats (0145c, 0153, 0154: no Wi-Fi). Only when the calendar is still before 2001.
++ */
++static void
++sweetSetCalendarFromRtc(void)
++{
++	clock_sec_t now = 0;
++	clock_usec_t us = 0;
++	clock_get_calendar_microtime(&now, &us);
++	if (now > 978307200) {
++		return;
++	}
++	uint8_t ctl = 0, b[4], low = 0;
++	if (sweet_spmi_read(0, 0x6046, &ctl) || !(ctl & 0x80u)) {
++		IOLog("SWEET RTC: PM6150 RTC not readable or disabled (ctl %#x)\n", ctl);
++		return;
++	}
++	for (int attempt = 0; attempt < 3; attempt++) {
++		bool ok = true;
++		for (unsigned i = 0; i < 4 && ok; i++) {
++			ok = !sweet_spmi_read(0, 0x6048 + i, &b[i]);
++		}
++		if (!ok || sweet_spmi_read(0, 0x6048, &low)) {
++			IOLog("SWEET RTC: PM6150 RTC read failed\n");
++			return;
++		}
++		if (low == b[0]) {
++			uint32_t secs = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++			if (secs < 86400u) {
++				IOLog("SWEET RTC: PM6150 RTC %u s: too small, calendar left alone\n", secs);
++				return;
++			}
++			clock_set_calendar_microtime((clock_sec_t)secs, 0);
++			clock_sec_t bs = 0;
++			clock_usec_t bus = 0;
++			clock_get_boottime_microtime(&bs, &bus);
++			IOLog("SWEET RTC: calendar set from the PM6150 RTC: %u s (boot time now %lu)\n", secs, (unsigned long)bs);
++			return;
++		}
++	}
++	IOLog("SWEET RTC: PM6150 RTC kept moving while read\n");
++}
++
+ bool
+ SweetBattery::start(IOService *provider)
+ {
+@@ -351,6 +398,9 @@ SweetBattery::start(IOService *provider)
+ 	int real = 1;   /* 0149 hardware: PM6150 QG/SMB5 reads work; sweetbattery=0 = static 100% */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
++	if (sweet_spmi_init() == 0) {
++		sweetSetCalendarFromRtc();
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {

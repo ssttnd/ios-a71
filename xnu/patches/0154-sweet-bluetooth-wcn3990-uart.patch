@@ -1,0 +1,3231 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index fb64a9b..8603669 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,6 +117,8 @@ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+ bsd/dev/flame_sta.c		standard
+ bsd/dev/flame_wlan.c		standard
++bsd/dev/sweet_bt.c			standard
++bsd/dev/sweet_bt_hci.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_adreno.c			standard
+ bsd/dev/sweet_adreno_clock.c		standard
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+new file mode 100644
+index 0000000..4669a65
+--- /dev/null
++++ b/bsd/dev/sweet_bt.c
+@@ -0,0 +1,2372 @@
++/*
++ * Sweet (Redmi Note 10 Pro, SM7150) Bluetooth: the Qualcomm WCN3990's BT core over the
++ * QUP0 SE3 GENI UART (hsuart0, 0x88c000), HCI in the kernel (power pulse, rampatch + NVM download,
++ * in-band sleep), then an H4 transport for iOS's bluetoothd/BlueTool through the kernel control
++ * com.apple.uart.bluetooth (bsd/dev/sweet_bt_hci.c).
++ *
++ * Ported from Bergamota (ry-diffusion, Poco F1 / SDM845, xnu patches 0104-0133 beryllium_wlan.c,
++ * MIT): only its Bluetooth stage. The WLAN probe/inventory parts are left out: they read the apps
++ * SMMU and SMEM, and on sweet a CPU load from the apps SMMU stalls once the system is up (0141).
++ * SM7150 differences (Linux gcc-sm7150.c / pinctrl-sm7150.c, sweet DT): SE3 instead of SE3
++ * (CBCR 0x173c0, RCG 0x173c4, vote bit 13), TLMM SOUTH tile 0x3d00000 with GPIO 38-41 (qup03 = 1),
++ * rails L10A (vdd-io), L1C (xtal), L2C (core), L10C (pa). Firmware (crbtfw21.tlv, crnv21.bin from
++ * sweet's own bluetooth partition) comes from ADT properties of /arm-io/bluetooth, as the GPU's.
++ *
++ * Off unless sweetbt=1 (or sweetwlan=2 for the bring-up stage alone).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <machine/machine_routines.h>
++#include <machine/atomic.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);
++void sweet_bt_init(void);
++struct bt_hci_ops {
++	bool (*tx)(const uint8_t *pkt, unsigned len);
++	unsigned (*baud)(unsigned requested);
++};
++extern void bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_budget);
++extern void bt_hci_rx_packet(const uint8_t *pkt, unsigned len);
++extern void bt_hci_rx_service(void);
++extern void bt_hci_stats_periodic(bool force);
++extern bool bt_hci_connected(void);
++
++#ifndef MIN
++#define MIN(a, b) ((a) < (b) ? (a) : (b))
++#endif
++#ifndef MAX
++#define MAX(a, b) ((a) > (b) ? (a) : (b))
++#endif
++
++static uint16_t
++le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | p[1] << 8);
++}
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++/* Firmware blobs from the ADT (tools/adt-add-bluetooth.py puts fw-<file name> under /arm-io/bluetooth).
++ * A writable copy: the NVM is edited before it is sent. */
++static bool
++sweet_bt_fw_get(const char *file, void **buf, size_t *len)
++{
++	DTEntry node;
++	const void *data = NULL;
++	unsigned int size = 0;
++	char prop[32];
++	snprintf(prop, sizeof(prop), "fw-%s", file);
++	if (SecureDTLookupEntry(NULL, "/arm-io/bluetooth", &node) != kSuccess ||
++	    SecureDTGetProperty(node, prop, &data, &size) != kSuccess || size == 0) {
++		return false;
++	}
++	void *copy = kalloc_data(size, Z_WAITOK);
++	if (copy == NULL) {
++		return false;
++	}
++	memcpy(copy, data, size);
++	*buf = copy;
++	*len = size;
++	return true;
++}
++
++static void
++sweet_bt_fw_put(void *buf, size_t len)
++{
++	kfree_data(buf, len);
++}
++
++#define WL_GCC_PA       0x00100000u     /* gcc: reg 0x100000 */
++#define WL_GCC_SIZE     0x00090000u     /* up to 0x18a154 (mss axi) */
++#define WL_TLMM_S_PA    0x03d00000u     /* sm7150 TLMM SOUTH tile (west 0x3500000, north 0x3900000) */
++#define WL_SE3_PA       0x0088c000u     /* hsuart0 (BT): qup wrap0 SE3, sweet DT qup_uart@0x88c000 */
++#define WL_SMMU_PA      0x15000000u     /* apps_smmu */
++#define WL_SMEM_PA      0x86000000u     /* smem reserved-memory */
++#define WL_SMEM_SIZE    0x00200000u
++#define WL_MUTEX_PA     0x01f40000u     /* tcsr_mutex, stride 0x1000 */
++#define WL_SMEM_HWLOCK  3u
++
++/* GCC */
++#define GCC_VOTE_WRAP0  0x5200cu        /* hlos1 vote enable */
++#define VOTE_M_AHB      (1u << 6)       /* gcc_qupv3_wrap_0_m_ahb_clk, CBCR 0x17004 */
++#define VOTE_S_AHB      (1u << 7)       /* gcc_qupv3_wrap_0_s_ahb_clk, CBCR 0x17008 */
++#define VOTE_S3         (1u << 13)      /* gcc_qupv3_wrap0_s3_clk,     CBCR 0x173c0 */
++#define CBCR_M_AHB      0x17004u
++#define CBCR_S_AHB      0x17008u
++#define CBCR_S3         0x173c0u
++#define RCG_S3          0x173c4u        /* gcc_qupv3_wrap0_s3_clk_src */
++#define GPLL0_HZ        600000000ull    /* gcc-sm7150.c gpll0 (the table print checks it) */
++#define WL_QUP0_PA      0x008c0000u     /* geniqup wrapper 0 (QUP_HW_VER_REG at +4) */
++#define QUP_HW_VER_REG  0x004u
++#define QUP_SE_VERSION_2_5      0x20050000u     /* qcom-geni-se.h: oversampling halves from here */
++#define XO_HZ           19200000ull
++
++/* GPLL0 (Fabia alpha PLL, clk-alpha-pll.c clk_alpha_pll_regs[FABIA]) */
++#define PLL_MODE        0x00u
++#define PLL_L_VAL       0x04u
++#define PLL_USER_CTL    0x0cu
++#define PLL_FRAC        0x38u
++#define PLL_LOCK_DET    (1u << 31)
++
++/* RCG registers relative to cmd_rcgr (clk-rcg2.c) */
++#define RCG_CMD         0x00u
++#define RCG_CFG         0x04u
++#define RCG_M           0x08u
++#define RCG_N           0x0cu
++#define RCG_D           0x10u
++#define RCG_DFS_ENABLE  0x14u
++#define CMD_UPDATE      (1u << 0)
++#define CMD_ROOT_OFF    (1u << 31)
++#define CFG_SRC_DIV_MASK        0x1fu           /* hid_width = 5 */
++#define CFG_SRC_SEL_SHIFT       8
++#define CFG_SRC_SEL_MASK        (7u << CFG_SRC_SEL_SHIFT)
++#define CFG_MODE_MASK           (3u << 12)
++#define CFG_MODE_DUAL_EDGE      (2u << 12)
++#define CFG_HW_CLK_CTRL         (1u << 20)
++#define RCG_CFG_MASK    (CFG_SRC_DIV_MASK | CFG_SRC_SEL_MASK | CFG_MODE_MASK | CFG_HW_CLK_CTRL)
++#define RCG_MND_MASK    0xffffu                 /* mnd_width = 16 */
++#define P_BI_TCXO       0u                      /* gcc_parent_map_0 */
++#define P_GPLL0_OUT_MAIN        1u
++#define P_GPLL0_OUT_EVEN        6u
++
++/* GENI serial engine (qcom-geni-se.h / qcom_geni_serial.c) */
++#define SE_FORCE_DEFAULT        0x020u
++#define SE_OUTPUT_CTRL          0x024u
++#define SE_CGC_CTRL             0x028u
++#define SE_STATUS               0x040u
++#define SE_M_CLK_CFG            0x048u
++#define SE_S_CLK_CFG            0x04cu
++#define SE_IF_DISABLE           0x064u
++#define SE_FW_REV               0x068u
++#define SE_CLK_SEL              0x07cu
++#define SE_DMA_MODE_EN          0x258u
++#define SE_UART_TX_TRANS_CFG    0x25cu
++#define SE_TX_PACKING0          0x260u
++#define SE_TX_PACKING1          0x264u
++#define SE_UART_TX_WORD_LEN     0x268u
++#define SE_UART_TX_STOP_LEN     0x26cu
++#define SE_UART_TX_TRANS_LEN    0x270u
++#define SE_UART_RX_TRANS_CFG    0x280u
++#define SE_RX_PACKING0          0x284u
++#define SE_RX_PACKING1          0x288u
++#define SE_UART_RX_WORD_LEN     0x28cu
++#define SE_UART_RX_STALE        0x294u
++#define SE_UART_TX_PARITY       0x2a4u
++#define SE_UART_RX_PARITY       0x2a8u
++#define SE_UART_MANUAL_RFR      0x2acu
++#define SE_GENI_IOS             0x908u  /* bit 1 = IO2_DATA_IN = CTS pin level (low = asserted), bit 0 = RX */
++#define SE_BYTE_GRAN            0x254u
++#define SE_M_CMD0               0x600u
++#define SE_M_CMD_CTRL           0x604u
++#define SE_M_IRQ_STATUS         0x610u
++#define SE_M_IRQ_EN             0x614u
++#define SE_M_IRQ_CLEAR          0x618u
++#define SE_S_CMD0               0x630u
++#define SE_S_CMD_CTRL           0x634u
++#define SE_S_IRQ_STATUS         0x640u
++#define SE_S_IRQ_EN             0x644u
++#define SE_S_IRQ_CLEAR          0x648u
++#define SE_TX_FIFO              0x700u
++#define SE_RX_FIFO              0x780u
++#define SE_TX_FIFO_STATUS       0x800u
++#define SE_RX_FIFO_STATUS       0x804u
++#define SE_TX_WM                0x80cu
++#define SE_RX_WM                0x810u
++#define SE_RX_RFR_WM            0x814u
++#define SE_DMA_TX_IRQ_CLR       0xc44u
++#define SE_DMA_RX_IRQ_CLR       0xd44u
++#define SE_GSI_EVENT_EN         0xe18u
++#define SE_IRQ_EN               0xe1cu
++#define SE_HW_PARAM_0           0xe24u
++#define SE_HW_PARAM_1           0xe28u
++#define SE_DMA_GENERAL_CFG      0xe30u
++#define SE_PROTO_UART           2u
++#define M_CMD_DONE              (1u << 0)
++#define M_CMD_ABORT             (1u << 5)
++#define UART_START_TX           1u
++#define UART_START_READ         1u
++#define UART_CTS_MASK           (1u << 1)
++#define UART_OVERSAMPLING       32u     /* halved on QUP >= 2.5, see wl.os */
++#define S_CMD_DONE              (1u << 0)
++#define S_RX_FIFO_RD_ERR        (1u << 24)
++#define S_RX_FIFO_WR_ERR        (1u << 25)
++#define S_RX_FIFO_WATERMARK     (1u << 26)
++#define S_RX_FIFO_LAST          (1u << 27)
++#define GENI_M_IRQ_EN           (1u << 2)       /* SE_IRQ_EN */
++#define GENI_S_IRQ_EN           (1u << 3)
++#define DMA_TX_IRQ_EN           (1u << 1)
++#define DMA_RX_IRQ_EN           (1u << 0)
++#define WL_BT_OPER_BAUD         3200000u        /* beryllium dtsi max-speed (hci_qca oper_speed) */
++
++#define QCA_POWER_ON_PULSE      0xfcu   /* btqca.h QCA_WCN3990_POWERON_PULSE */
++#define QCA_POWER_OFF_PULSE     0xc0u   /* btqca.h QCA_WCN3990_POWEROFF_PULSE */
++
++/* sweet DT qupv3_se3_4uart: CTS gpio38, RFR gpio39, TX gpio40, RX gpio41; function qup03 = mux 1 */
++static const struct { unsigned pin, pull, drive; const char *role; } wl_uart_pins[] = {
++	{ 38, 1 /* pull-down */, 0 /* 2 mA */, "CTS" },
++	{ 39, 0 /* bias-disable */, 0, "RFR" },
++	{ 40, 0, 0, "TX" },
++	{ 41, 3 /* pull-up */, 0, "RX" },
++};
++#define WL_QUP3_FUNC    1u
++
++static struct {
++	vm_offset_t gcc, tlmm, se, smmu, smem, mutex, wrap;
++	uint32_t vote_before;           /* GCC_VOTE_WRAP0 before we touched it */
++	unsigned os;                    /* UART oversampling: 32, or 16 on QUP >= 2.5 */
++	int rcg_row;                    /* ftbl row currently programmed, -1 = untouched */
++	bool rcg_saved, pins_saved, se_saved;
++	uint32_t rcg_orig[4];           /* CFG, M, N, D as found */
++	uint32_t pin_orig[4];           /* TLMM gpio38-41 ctl words as found */
++	uint32_t se_orig[3];            /* SE_M_CLK_CFG, SE_S_CLK_CFG, SE_CLK_SEL as found */
++	uint32_t tx_depth, rx_depth;
++	uint8_t rxq[512];
++	unsigned rxn;
++	unsigned baud;                  /* UART baud currently programmed by wl_baud() */
++	unsigned tx_extra_us;           /* extra TX completion slack (flow control held by the controller) */
++	bool ibs_asleep, ibs_ack_pending;       /* hci_qca in-band sleep: controller asleep / WAKE_ACK owed */
++	unsigned ibs_logged, rx_st, rx_left, raw_budget, ibs_sleeps;   /* IBS log budget, H4 parser state, raw RX log budget, SLEEP_INDs seen */
++	unsigned ev_cc, ev_other;       /* events seen while downloading firmware */
++	unsigned bt_fw, bt_baud, bt_fast, bt_ibs, bt_poweroff;
++	unsigned bt_nvmdelay, bt_probe, bt_nowake, bt_rfr, bt_noflow;   /* sweetbt* boot-args */
++	unsigned bt_hci, bt_sk, bt_log, bt_setaddr;     /* sweetbt=1 (iOS transport), sweetbtsk, sweetbtlog, sweetbtaddr */
++	/* iOS transport (sweetbt=1): continuous RX, clean H4 packets for userland */
++	bool xport;
++	volatile int32_t tx_waiters;    /* threads waiting for the UART lock: the RX loop steps aside */
++	unsigned ibs_xlog;              /* IBS log budget in transport mode */
++	unsigned xs_st, xs_type, xs_have, xs_total;     /* RX H4 framer */
++	uint8_t xs_pkt[4100];
++	uint64_t xs_bytes, xs_polls;    /* UART RX statistics (transport mode) */
++	unsigned xs_maxburst, xs_maxwords, xs_fifo_err, xs_garbage, xs_oversize, xs_ibs_wake, xs_ibs_wake_fail;
++	uint8_t bdaddr[6];              /* wanted BD_ADDR, most significant byte first */
++	unsigned stage, delay_s;
++	int sleep_chan;
++	bool started;
++} wl;
++
++/* the GENI UART and the HCI state of the stage: held by the RX loop per poll and by every TX */
++static LCK_GRP_DECLARE(wl_hw_grp, "sweet_bt_uart");
++static LCK_MTX_DECLARE(wl_hw_lock, &wl_hw_grp);
++
++static void wl_rx_stop(void);
++
++static uint32_t
++wl_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wl_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++wl_sleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&wl.sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++wl_map(void)
++{
++	/* Never the apps SMMU or SMEM here (see the top of the file). */
++	if (!wl.gcc) {
++		wl.gcc = ml_io_map(WL_GCC_PA, WL_GCC_SIZE);
++	}
++	if (!wl.tlmm) {
++		wl.tlmm = ml_io_map(WL_TLMM_S_PA, 0x50000);
++	}
++	if (!wl.se) {
++		wl.se = ml_io_map(WL_SE3_PA, 0x4000);
++	}
++	if (!wl.wrap) {
++		wl.wrap = ml_io_map(WL_QUP0_PA, 0x1000);        /* optional: version only */
++	}
++	return wl.gcc && wl.tlmm && wl.se;
++}
++
++/* ---------------------------------------------------------------- probe */
++
++static bool
++cbcr_on(uint32_t off)
++{
++	uint32_t v = wl_rd(wl.gcc, off);
++	return v != 0xffffffffu && !(v & (1u << 31));
++}
++
++static void
++wl_dump_gcc(void)
++{
++	static const struct { const char *name; uint32_t off; } clk[] = {
++		{ "wrap0 m_ahb", CBCR_M_AHB }, { "wrap0 s_ahb", CBCR_S_AHB }, { "wrap0 s3", CBCR_S3 },
++		{ "mss cfg_ahb", 0x8a000 }, { "mss q6_memnoc_axi", 0x8a154 }, { "mss snoc_axi", 0x8a150 },
++		{ "mss mfab_axis", 0x8a004 }, { "boot_rom_ahb", 0x38004 }, { "prng_ahb", 0x34004 },
++	};
++	for (unsigned i = 0; i < sizeof(clk) / sizeof(clk[0]); i++) {
++		uint32_t v = wl_rd(wl.gcc, clk[i].off);
++		printf("SWEET BT: GCC %-18s CBCR %#x = %#010x (%s)\n", clk[i].name, clk[i].off, v,
++		    (v & (1u << 31)) ? "off" : "on");
++	}
++	printf("SWEET BT: GCC vote 0x5200c=%#x 0x52004=%#x (mss_gpll0_div bit17)\n",
++	    wl_rd(wl.gcc, GCC_VOTE_WRAP0), wl_rd(wl.gcc, 0x52004));
++}
++
++
++static void
++wl_dump_gpio(void)
++{
++	static const char *const role[] = { "CTS", "RFR", "TX", "RX" };
++	for (unsigned i = 0; i < 4; i++) {
++		uint32_t cfg = wl_rd(wl.tlmm, wl_uart_pins[i].pin * 0x1000u);
++		uint32_t io = wl_rd(wl.tlmm, wl_uart_pins[i].pin * 0x1000u + 4);
++		printf("SWEET BT: TLMM SOUTH gpio%u (%s) ctl=%#x func=%u pull=%u drv=%u oe=%u in=%u\n",
++		    wl_uart_pins[i].pin, role[i], cfg, (cfg >> 2) & 0xf, cfg & 3, (cfg >> 6) & 7, (cfg >> 9) & 1, io & 1);
++	}
++}
++
++static bool
++wl_se_clocks_ok(void)
++{
++	return cbcr_on(CBCR_M_AHB) && cbcr_on(CBCR_S_AHB) && cbcr_on(CBCR_S3);
++}
++
++static void
++wl_dump_se(void)
++{
++	if (!wl_se_clocks_ok()) {
++		printf("SWEET BT: SE3 clocks are gated (ABL left them off): SE3 registers NOT read\n");
++		return;
++	}
++	uint32_t fw = wl_rd(wl.se, SE_FW_REV);
++	uint32_t hw0 = wl_rd(wl.se, SE_HW_PARAM_0), hw1 = wl_rd(wl.se, SE_HW_PARAM_1);
++	printf("SWEET BT: SE3 fw-rev %#x protocol %u (2 = UART) if-disable %#x status %#x clk-sel %#x\n",
++	    fw, (fw >> 8) & 0xff, wl_rd(wl.se, SE_IF_DISABLE), wl_rd(wl.se, SE_STATUS),
++	    wl_rd(wl.se, SE_CLK_SEL));
++	printf("SWEET BT: SE3 hw-param0 %#x hw-param1 %#x\n", hw0, hw1);
++}
++
++static bool
++wl_wrv(vm_offset_t base, const char *name, uint32_t off, uint32_t val, uint32_t mask)
++{
++	wl_wr(base, off, val);
++	uint32_t rb = wl_rd(base, off);
++	bool ok = ((rb ^ val) & mask) == 0;
++	printf("SWEET BT: write %s+%#x <- %#010x, read back %#010x (mask %#x) %s\n", name, off, val,
++	    rb, mask, ok ? "ok" : "MISMATCH");
++	return ok;
++}
++
++static bool
++wl_clocks_on(void)
++{
++	wl.vote_before = wl_rd(wl.gcc, GCC_VOTE_WRAP0);
++	wl_wr(wl.gcc, GCC_VOTE_WRAP0, wl.vote_before | VOTE_M_AHB | VOTE_S_AHB | VOTE_S3);
++	for (unsigned i = 0; i < 2000 && !wl_se_clocks_ok(); i++) {
++		delay(10);
++	}
++	if (!wl_se_clocks_ok()) {
++		printf("SWEET BT: SE3 clock branches did not come on: m_ahb %#x s_ahb %#x s3 %#x\n",
++		    wl_rd(wl.gcc, CBCR_M_AHB), wl_rd(wl.gcc, CBCR_S_AHB), wl_rd(wl.gcc, CBCR_S3));
++		return false;
++	}
++	return true;
++}
++
++static void
++wl_clocks_off(void)
++{
++	/* put back only the bits we added */
++	uint32_t now = wl_rd(wl.gcc, GCC_VOTE_WRAP0);
++	uint32_t add = (VOTE_M_AHB | VOTE_S_AHB | VOTE_S3) & ~wl.vote_before;
++	wl_wr(wl.gcc, GCC_VOTE_WRAP0, now & ~add);
++}
++
++/* ------------------------------------------------ TLMM: qup6 UART pins */
++
++#define TLMM_FUNC_PULL_DRV_MASK 0x1ffu      /* pull [1:0], func [5:2], drive [8:6]; bit 9 (OE) kept */
++
++static bool
++wl_pins_uart(void)
++{
++	bool ok = true;
++	for (unsigned i = 0; i < 4; i++) {
++		uint32_t off = wl_uart_pins[i].pin * 0x1000u;
++		uint32_t cfg = wl_rd(wl.tlmm, off);
++		if (cfg == 0xffffffffu) {
++			printf("SWEET BT: TLMM gpio%u reads all ones: stop\n", wl_uart_pins[i].pin);
++			return false;
++		}
++		wl.pin_orig[i] = cfg;
++	}
++	wl.pins_saved = true;
++	for (unsigned i = 0; i < 4; i++) {
++		uint32_t off = wl_uart_pins[i].pin * 0x1000u;
++		uint32_t cfg = (wl.pin_orig[i] & ~TLMM_FUNC_PULL_DRV_MASK) | (WL_QUP3_FUNC << 2) |
++		    wl_uart_pins[i].pull | (wl_uart_pins[i].drive << 6);
++		printf("SWEET BT: TLMM gpio%u (%s): was %#x -> func %u pull %u drive %u mA\n",
++		    wl_uart_pins[i].pin, wl_uart_pins[i].role, wl.pin_orig[i], WL_QUP3_FUNC,
++		    wl_uart_pins[i].pull, 2 * (wl_uart_pins[i].drive + 1));
++		ok &= wl_wrv(wl.tlmm, "TLMM", off, cfg, TLMM_FUNC_PULL_DRV_MASK);
++	}
++	return ok;
++}
++
++static void
++wl_pins_restore(void)
++{
++	if (!wl.pins_saved) {
++		return;
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		(void)wl_wrv(wl.tlmm, "TLMM(restore)", wl_uart_pins[i].pin * 0x1000u, wl.pin_orig[i],
++		    TLMM_FUNC_PULL_DRV_MASK);
++	}
++	wl.pins_saved = false;
++}
++
++/* ------------------------------------------------ GCC: S3 RCG (non-DFS) */
++
++/* gcc-sdm845.c ftbl_gcc_qupv3_wrap0_s0_clk_src; hid = 2 * div - 1 as the F() macro stores it */
++static const struct wl_rcg_row {
++	uint32_t hz;
++	uint8_t src, hid;
++	uint16_t m, n;
++} wl_ftbl[] = {
++	{ 7372800, P_GPLL0_OUT_EVEN, 1, 384, 15625 },
++	{ 14745600, P_GPLL0_OUT_EVEN, 1, 768, 15625 },
++	{ 19200000, P_BI_TCXO, 1, 0, 0 },
++	{ 29491200, P_GPLL0_OUT_EVEN, 1, 1536, 15625 },
++	{ 32000000, P_GPLL0_OUT_EVEN, 1, 8, 75 },
++	{ 48000000, P_GPLL0_OUT_EVEN, 1, 4, 25 },
++	{ 64000000, P_GPLL0_OUT_EVEN, 1, 16, 75 },
++	{ 80000000, P_GPLL0_OUT_EVEN, 1, 4, 15 },
++	{ 96000000, P_GPLL0_OUT_EVEN, 1, 8, 25 },
++	{ 100000000, P_GPLL0_OUT_EVEN, 5, 0, 0 },
++	{ 102400000, P_GPLL0_OUT_EVEN, 1, 128, 375 },
++	{ 112000000, P_GPLL0_OUT_EVEN, 1, 28, 75 },
++	{ 117964800, P_GPLL0_OUT_EVEN, 1, 6144, 15625 },
++	{ 120000000, P_GPLL0_OUT_EVEN, 4, 0, 0 },
++	{ 128000000, P_GPLL0_OUT_MAIN, 1, 16, 75 },
++};
++#define WL_NFTBL        (sizeof(wl_ftbl) / sizeof(wl_ftbl[0]))
++
++static uint64_t wl_gpll0_main_hz = GPLL0_HZ, wl_gpll0_even_hz = GPLL0_HZ / 2;
++
++/* Hz a row really produces from the measured GPLL0 */
++static uint64_t
++wl_row_hz(const struct wl_rcg_row *r)
++{
++	uint64_t parent = r->src == P_BI_TCXO ? XO_HZ :
++	    r->src == P_GPLL0_OUT_MAIN ? wl_gpll0_main_hz : wl_gpll0_even_hz;
++	uint64_t hz = parent * 2 / (r->hid + 1);
++	if (r->n) {
++		hz = hz * r->m / r->n;
++	}
++	return hz;
++}
++
++/* Read GPLL0 and the even post-divider; the ftbl rates assume 600 / 300 MHz. */
++static bool
++wl_gpll0_check(void)
++{
++	uint32_t mode = wl_rd(wl.gcc, PLL_MODE), l = wl_rd(wl.gcc, PLL_L_VAL);
++	uint32_t user = wl_rd(wl.gcc, PLL_USER_CTL), frac = wl_rd(wl.gcc, PLL_FRAC) & 0xffffu;
++	unsigned pd = (user >> 8) & 0xf;
++	unsigned div = pd == 0 ? 1 : pd == 1 ? 2 : pd == 3 ? 4 : pd == 7 ? 8 : 0;
++	uint64_t main_hz = XO_HZ * (l & 0xffffu) + ((XO_HZ * frac) >> 16);
++	uint64_t even_hz = div ? main_hz / div : 0;
++	unsigned skip = 0;
++
++	printf("SWEET BT: GPLL0 mode %#x (lock %u) L %u frac %#x user-ctl %#x vote 0x52000=%#x -> main %llu Hz, "
++	    "even (post-div %u) %llu Hz\n", mode, mode >> 31, l, frac, user, wl_rd(wl.gcc, 0x52000), main_hz,
++	    div, even_hz);
++	(void)PE_parse_boot_argn("sweetwlanskippll", &skip, sizeof(skip));
++	if (!(mode & PLL_LOCK_DET)) {
++		printf("SWEET BT: GPLL0 is not locked: the S3 RCG source is dead, stop\n");
++		return false;
++	}
++	bool main_ok = main_hz > GPLL0_HZ - GPLL0_HZ / 1000 && main_hz < GPLL0_HZ + GPLL0_HZ / 1000;
++	bool even_ok = even_hz > GPLL0_HZ / 2 - GPLL0_HZ / 2000 && even_hz < GPLL0_HZ / 2 + GPLL0_HZ / 2000;
++	if (!main_ok || !even_ok) {
++		if (skip) {
++			printf("SWEET BT: GPLL0 rates off the expected 600/300 MHz but sweetwlanskippll=1: using the "
++			    "nominal ftbl anyway (baud will be off)\n");
++			return true;
++		}
++		printf("SWEET BT: GPLL0 is not 600 MHz / even 300 MHz (decode of PLL regs may be wrong; "
++		    "sweetwlanskippll=1 overrides): stop\n");
++		return false;
++	}
++	wl_gpll0_main_hz = main_hz;
++	wl_gpll0_even_hz = even_hz;
++	printf("SWEET BT: GPLL0 600 MHz / GPLL0_OUT_EVEN 300 MHz confirmed\n");
++	return true;
++}
++
++/* clk-rcg2.c update_config(): set CMD_UPDATE, wait for the hardware to clear it */
++static bool
++wl_rcg_update(void)
++{
++	uint32_t cmd = wl_rd(wl.gcc, RCG_S3 + RCG_CMD);
++	wl_wr(wl.gcc, RCG_S3 + RCG_CMD, cmd | CMD_UPDATE);
++	for (unsigned i = 0; i < 2000; i++) {
++		if (!(wl_rd(wl.gcc, RCG_S3 + RCG_CMD) & CMD_UPDATE)) {
++			printf("SWEET BT: RCG CMD %#x -> UPDATE set (wrote %#x), cleared after %u polls, cmd now %#x\n",
++			    cmd, cmd | CMD_UPDATE, i, wl_rd(wl.gcc, RCG_S3 + RCG_CMD));
++			return true;
++		}
++		delay(10);
++	}
++	printf("SWEET BT: RCG UPDATE did not clear: cmd %#x\n", wl_rd(wl.gcc, RCG_S3 + RCG_CMD));
++	return false;
++}
++
++/* clk-rcg2.c __clk_rcg2_configure(): M, N, D, then CFG, then UPDATE */
++static bool
++wl_rcg_write(uint32_t m, uint32_t n, uint32_t d, uint32_t cfg_bits, bool with_mnd)
++{
++	uint32_t cfg;
++	bool ok = true;
++	if (with_mnd) {
++		ok &= wl_wrv(wl.gcc, "GCC", RCG_S3 + RCG_M, m & RCG_MND_MASK, RCG_MND_MASK);
++		ok &= wl_wrv(wl.gcc, "GCC", RCG_S3 + RCG_N, n & RCG_MND_MASK, RCG_MND_MASK);
++		ok &= wl_wrv(wl.gcc, "GCC", RCG_S3 + RCG_D, d & RCG_MND_MASK, RCG_MND_MASK);
++	}
++	cfg = (wl_rd(wl.gcc, RCG_S3 + RCG_CFG) & ~RCG_CFG_MASK) | (cfg_bits & RCG_CFG_MASK);
++	ok &= wl_wrv(wl.gcc, "GCC", RCG_S3 + RCG_CFG, cfg, RCG_CFG_MASK);
++	if (!ok) {
++		return false;
++	}
++	return wl_rcg_update();
++}
++
++/*
++ * DFS (clk-rcg2.c clk_rcg2_dfs): the RCG holds 8 preset performance levels and the serial engine picks
++ * one with SE_CLK_SEL (qcom-geni-se.c geni_se_clk_freq_match, as Linux runs sm7150's QUP clocks). sweet's
++ * touch SE7 RCG reads dfs=0x21. In DFS mode the RCG is never written: only SE_CLK_SEL and the divider.
++ */
++static bool wl_dfs;
++static uint64_t wl_dfs_hz[8];
++
++static uint64_t
++wl_dfs_level_hz(unsigned lvl)
++{
++	uint32_t cfg = wl_rd(wl.gcc, RCG_S3 + 0x1c + 0x24 * lvl);
++	uint32_t m = wl_rd(wl.gcc, RCG_S3 + 0x20 + 0x24 * lvl);
++	uint32_t nr = wl_rd(wl.gcc, RCG_S3 + 0x24 + 0x24 * lvl);
++	unsigned src = (cfg >> 8) & 7, hid = cfg & 0x1f, mode = (cfg >> 12) & 3;
++	uint64_t parent = src == 0 ? XO_HZ : src == 1 ? wl_gpll0_main_hz : src == 6 ? wl_gpll0_even_hz : 0;
++	if (!parent || cfg == 0xffffffffu) {
++		return 0;
++	}
++	uint64_t hz = parent * 2 / (hid + 1);
++	if (mode && m) {
++		uint32_t n = (~nr + m) & 0xffffu;
++		if (n == 0) {
++			return 0;
++		}
++		hz = hz * m / n;
++	}
++	return hz;
++}
++
++static bool
++wl_rcg_save(void)
++{
++	if (wl.rcg_saved) {
++		return true;
++	}
++	if (wl_rd(wl.gcc, RCG_S3 + RCG_DFS_ENABLE) & 1) {
++		wl_dfs = true;
++		for (unsigned l = 0; l < 8; l++) {
++			wl_dfs_hz[l] = wl_dfs_level_hz(l);
++			printf("SWEET BT: S3 DFS level %u: %llu Hz\n", l, wl_dfs_hz[l]);
++		}
++		printf("SWEET BT: S3 RCG in DFS mode (dfs-cmd %#x): levels picked through SE_CLK_SEL, RCG untouched\n",
++		    wl_rd(wl.gcc, RCG_S3 + RCG_DFS_ENABLE));
++		return true;
++	}
++	wl.rcg_orig[0] = wl_rd(wl.gcc, RCG_S3 + RCG_CFG);
++	wl.rcg_orig[1] = wl_rd(wl.gcc, RCG_S3 + RCG_M);
++	wl.rcg_orig[2] = wl_rd(wl.gcc, RCG_S3 + RCG_N);
++	wl.rcg_orig[3] = wl_rd(wl.gcc, RCG_S3 + RCG_D);
++	wl.rcg_saved = true;
++	printf("SWEET BT: S3 RCG saved: cmd %#x cfg %#x m %#x n %#x d %#x\n", wl_rd(wl.gcc, RCG_S3),
++	    wl.rcg_orig[0], wl.rcg_orig[1], wl.rcg_orig[2], wl.rcg_orig[3]);
++	return true;
++}
++
++static void
++wl_rcg_restore(void)
++{
++	if (wl_dfs || !wl.rcg_saved) {
++		return;
++	}
++	printf("SWEET BT: restoring the original S3 RCG config\n");
++	/* the saved CFG is written verbatim (HW_CLK_CTRL included): mask = all bits */
++	bool ok = wl_wrv(wl.gcc, "GCC(restore)", RCG_S3 + RCG_M, wl.rcg_orig[1], RCG_MND_MASK);
++	ok &= wl_wrv(wl.gcc, "GCC(restore)", RCG_S3 + RCG_N, wl.rcg_orig[2], RCG_MND_MASK);
++	ok &= wl_wrv(wl.gcc, "GCC(restore)", RCG_S3 + RCG_D, wl.rcg_orig[3], RCG_MND_MASK);
++	ok &= wl_wrv(wl.gcc, "GCC(restore)", RCG_S3 + RCG_CFG, wl.rcg_orig[0], RCG_CFG_MASK);
++	ok &= wl_rcg_update();
++	printf("SWEET BT: S3 RCG restore %s (cbcr s3 %#x)\n", ok ? "ok" : "FAILED", wl_rd(wl.gcc, CBCR_S3));
++	wl.rcg_saved = false;
++	wl.rcg_row = -1;
++}
++
++/* qcom_geni_serial.c get_clk_cfg(): first ftbl row that divides baud * oversampling exactly */
++static int
++wl_pick_row(unsigned baud, unsigned *div)
++{
++	uint64_t unit = (uint64_t)baud * wl.os;
++	for (unsigned i = 0; i < WL_NFTBL; i++) {
++		uint64_t hz = wl_ftbl[i].hz;
++		if (hz >= unit && hz % unit == 0 && hz / unit <= 4095) {
++			*div = (unsigned)(hz / unit);
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++/* log what each baud of interest needs; no register is touched */
++static void
++wl_baud_plan(void)
++{
++	static const unsigned bauds[] = { 2400, 115200, 3000000, WL_BT_OPER_BAUD };
++	for (unsigned i = 0; i < sizeof(bauds) / sizeof(bauds[0]); i++) {
++		unsigned div = 0;
++		int r = wl_pick_row(bauds[i], &div);
++		if (r < 0) {
++			printf("SWEET BT: baud plan %u: NO exact ftbl row (oversampling %u)\n", bauds[i], wl.os);
++			continue;
++		}
++		uint64_t hz = wl_row_hz(&wl_ftbl[r]);
++		printf("SWEET BT: baud plan %u: ftbl row %d %u Hz (src %u hid %u m %u n %u, measured %llu Hz) / "
++		    "(div %u * os %u) = %llu baud%s\n", bauds[i], r, wl_ftbl[r].hz, wl_ftbl[r].src,
++		    wl_ftbl[r].hid, wl_ftbl[r].m, wl_ftbl[r].n, hz, div, wl.os, hz / ((uint64_t)div * wl.os),
++		    hz == wl_ftbl[r].hz ? " exact" : " (GPLL0 off nominal)");
++	}
++}
++
++static bool
++wl_rcg_set_row(int r)
++{
++	const struct wl_rcg_row *f = &wl_ftbl[r];
++	uint32_t cfg = ((uint32_t)f->hid & CFG_SRC_DIV_MASK) | ((uint32_t)f->src << CFG_SRC_SEL_SHIFT);
++	if (f->n && f->m != f->n) {
++		cfg |= CFG_MODE_DUAL_EDGE;
++	}
++	/* M = m, N = ~(n - m), D = ~n (16 bit); HW_CLK_CTRL is cleared like Linux does */
++	printf("SWEET BT: S3 RCG -> %u Hz: src %u hid %u m %u n %u cfg %#x\n", f->hz, f->src, f->hid, f->m,
++	    f->n, cfg);
++	if (!wl_rcg_write(f->m, f->n ? ~(uint32_t)(f->n - f->m) : 0, f->n ? ~(uint32_t)f->n : 0, cfg, f->n != 0)) {
++		return false;
++	}
++	if (!cbcr_on(CBCR_S3)) {
++		printf("SWEET BT: S3 branch went off after the RCG update (cbcr %#x)\n", wl_rd(wl.gcc, CBCR_S3));
++		return false;
++	}
++	printf("SWEET BT: S3 RCG now cmd %#x cfg %#x m %#x n %#x d %#x, cbcr s3 %#x\n", wl_rd(wl.gcc, RCG_S3),
++	    wl_rd(wl.gcc, RCG_S3 + RCG_CFG), wl_rd(wl.gcc, RCG_S3 + RCG_M), wl_rd(wl.gcc, RCG_S3 + RCG_N),
++	    wl_rd(wl.gcc, RCG_S3 + RCG_D), wl_rd(wl.gcc, CBCR_S3));
++	return true;
++}
++
++/* program the RCG row and GENI divider for a baud rate (qcom_geni_serial_set_termios) */
++static bool
++wl_baud_dfs(unsigned baud)
++{
++	uint64_t unit = (uint64_t)baud * wl.os;
++	int lvl = -1;
++	unsigned div = 0;
++	for (unsigned l = 0; l < 8 && lvl < 0; l++) {
++		uint64_t hz = wl_dfs_hz[l];
++		if (hz >= unit && hz % unit == 0 && hz / unit <= 4095) {
++			lvl = (int)l;
++			div = (unsigned)(hz / unit);
++		}
++	}
++	if (lvl < 0) {
++		printf("SWEET BT: no DFS level gives %u baud exactly (oversampling %u)\n", baud, wl.os);
++		return false;
++	}
++	wl_rx_stop();
++	if (!wl.se_saved) {
++		wl.se_orig[0] = wl_rd(wl.se, SE_M_CLK_CFG);
++		wl.se_orig[1] = wl_rd(wl.se, SE_S_CLK_CFG);
++		wl.se_orig[2] = wl_rd(wl.se, SE_CLK_SEL);
++		wl.se_saved = true;
++	}
++	uint32_t ser = (div << 4) | 1u;
++	bool ok = wl_wrv(wl.se, "SE3", SE_CLK_SEL, (uint32_t)lvl, 0x7);
++	ok &= wl_wrv(wl.se, "SE3", SE_M_CLK_CFG, ser, 0xfff1u);
++	ok &= wl_wrv(wl.se, "SE3", SE_S_CLK_CFG, ser, 0xfff1u);
++	if (!ok) {
++		return false;
++	}
++	wl.baud = baud;
++	printf("SWEET BT: UART %u baud: DFS level %d (%llu Hz), GENI divider %u, oversampling %u\n",
++	    baud, lvl, wl_dfs_hz[lvl], div, wl.os);
++	return true;
++}
++
++static bool
++wl_baud(unsigned baud)
++{
++	if (wl_dfs) {
++		return wl_baud_dfs(baud);
++	}
++	unsigned div = 0;
++	int r = wl_pick_row(baud, &div);
++	if (r < 0) {
++		printf("SWEET BT: no exact S3 rate for %u baud (oversampling %u)\n", baud, wl.os);
++		return false;
++	}
++	wl_rx_stop();
++	if (!wl.se_saved) {
++		wl.se_orig[0] = wl_rd(wl.se, SE_M_CLK_CFG);
++		wl.se_orig[1] = wl_rd(wl.se, SE_S_CLK_CFG);
++		wl.se_orig[2] = wl_rd(wl.se, SE_CLK_SEL);
++		wl.se_saved = true;
++		printf("SWEET BT: SE3 clock regs saved: m_clk_cfg %#x s_clk_cfg %#x clk_sel %#x\n",
++		    wl.se_orig[0], wl.se_orig[1], wl.se_orig[2]);
++	}
++	if (wl.rcg_row != r) {
++		if (!wl_rcg_set_row(r)) {
++			return false;
++		}
++		wl.rcg_row = r;
++	}
++	uint32_t ser = (div << 4) | 1u;               /* CLK_DIV [15:4], SER_CLK_EN */
++	bool ok = wl_wrv(wl.se, "SE3", SE_CLK_SEL, 0, 0x7);   /* DFS off: level is unused */
++	ok &= wl_wrv(wl.se, "SE3", SE_M_CLK_CFG, ser, 0xfff1u);
++	ok &= wl_wrv(wl.se, "SE3", SE_S_CLK_CFG, ser, 0xfff1u);
++	if (!ok) {
++		return false;
++	}
++	wl.baud = baud;
++	printf("SWEET BT: UART %u baud: S3 root %llu Hz (ftbl row %d), GENI divider %u, oversampling %u\n",
++	    baud, wl_row_hz(&wl_ftbl[r]), r, div, wl.os);
++	return true;
++}
++
++static void
++wl_se_clk_restore(void)
++{
++	if (!wl.se_saved) {
++		return;
++	}
++	(void)wl_wrv(wl.se, "SE3(restore)", SE_M_CLK_CFG, wl.se_orig[0], 0xfff1u);
++	(void)wl_wrv(wl.se, "SE3(restore)", SE_S_CLK_CFG, wl.se_orig[1], 0xfff1u);
++	(void)wl_wrv(wl.se, "SE3(restore)", SE_CLK_SEL, wl.se_orig[2], 0x7);
++	wl.se_saved = false;
++}
++
++static void
++wl_flow(bool hw)
++{
++	uint32_t v = wl_rd(wl.se, SE_UART_TX_TRANS_CFG);
++	hw = hw && !wl.bt_noflow;                     /* sweetbtnoflow=1: CTS never honoured */
++	v = hw ? (v & ~UART_CTS_MASK) : (v | UART_CTS_MASK);
++	wl_wr(wl.se, SE_UART_TX_TRANS_CFG, v);
++}
++
++/* ms since boot, for the IBS / raw RX trace */
++static unsigned
++wl_ms(void)
++{
++	uint64_t t, ns;
++	clock_get_uptime(&t);
++	absolutetime_to_nanoseconds(t, &ns);
++	return (unsigned)(ns / 1000000ull);
++}
++
++/*
++ * Flow control state for the post-NVM diagnosis: the GENI UART config (CTS mask = bit 1 of TX_TRANS_CFG,
++ * auto RFR unless MANUAL_RFR bit 31 is set: bit 0 ready, bit 1 not ready), GENI_IOS (CTS pin level, bit 1,
++ * active low) and the four TLMM input levels (CTS gpio45, RFR gpio46, TX gpio47, RX gpio48).
++ */
++static void
++wl_flow_diag(const char *label)
++{
++	uint32_t pin[4];
++	for (unsigned i = 0; i < 4; i++) {
++		pin[i] = wl_rd(wl.tlmm, (45 + i) * 0x1000u + 4) & 1;
++	}
++	printf("SWEET BT: BT flow (%s) at %u ms: baud %u tx_trans_cfg %#x (CTS %s) rx_trans_cfg %#x manual_rfr %#x "
++	    "ios %#x (CTS pin %s) gpio in: CTS %u RFR %u TX %u RX %u, s_status %#x rx_fifo %#x\n", label,
++	    wl_ms(), wl.baud, wl_rd(wl.se, SE_UART_TX_TRANS_CFG),
++	    (wl_rd(wl.se, SE_UART_TX_TRANS_CFG) & UART_CTS_MASK) ? "ignored" : "honoured",
++	    wl_rd(wl.se, SE_UART_RX_TRANS_CFG), wl_rd(wl.se, SE_UART_MANUAL_RFR), wl_rd(wl.se, SE_GENI_IOS),
++	    (wl_rd(wl.se, SE_GENI_IOS) & 2) ? "high = controller not ready" : "low = controller ready", pin[0], pin[1],
++	    pin[2], pin[3], wl_rd(wl.se, SE_STATUS), wl_rd(wl.se, SE_RX_FIFO_STATUS));
++}
++
++/* geni_se_config_packing(8, 4, false, true, true) */
++static void
++wl_packing(void)
++{
++	uint32_t cfg[4] = { 0 };
++	for (int i = 0; i < 4; i++) {
++		cfg[i] = ((uint32_t)(i * 8) << 5) | (7u << 1);
++	}
++	cfg[3] |= 1u;                                 /* stop bit */
++	uint32_t c0 = cfg[0] | (cfg[1] << 10), c1 = cfg[2] | (cfg[3] << 10);
++	wl_wr(wl.se, SE_TX_PACKING0, c0);
++	wl_wr(wl.se, SE_TX_PACKING1, c1);
++	wl_wr(wl.se, SE_RX_PACKING0, c0);
++	wl_wr(wl.se, SE_RX_PACKING1, c1);
++	wl_wr(wl.se, SE_BYTE_GRAN, 0);
++}
++
++static bool
++wl_uart_open(void)
++{
++	uint32_t fw = wl_rd(wl.se, SE_FW_REV);
++	if (((fw >> 8) & 0xff) != SE_PROTO_UART) {
++		printf("SWEET BT: SE3 protocol is %u, not UART (QUP firmware not loaded for UART): stop\n",
++		    (fw >> 8) & 0xff);
++		return false;
++	}
++	if (wl_rd(wl.se, SE_STATUS) & ((1u << 0) | (1u << 12))) {
++		printf("SWEET BT: SE3 busy (status %#x): stop\n", wl_rd(wl.se, SE_STATUS));
++		return false;
++	}
++	/* qcom_geni_serial.c: sampling rate is halved for QUP hardware >= 2.5 */
++	wl.os = UART_OVERSAMPLING;
++	if (wl.wrap) {
++		uint32_t ver = wl_rd(wl.wrap, QUP_HW_VER_REG);
++		if (ver != 0 && ver != 0xffffffffu && ver >= QUP_SE_VERSION_2_5) {
++			wl.os = UART_OVERSAMPLING / 2;
++		}
++		printf("SWEET BT: QUP wrapper0 HW version %#x -> UART oversampling %u\n", ver, wl.os);
++	} else {
++		printf("SWEET BT: QUP wrapper0 not mapped: assuming UART oversampling %u\n", wl.os);
++	}
++	wl.tx_depth = (wl_rd(wl.se, SE_HW_PARAM_0) >> 16) & 0x3f;
++	wl.rx_depth = (wl_rd(wl.se, SE_HW_PARAM_1) >> 16) & 0x3f;
++	if (wl.tx_depth < 8 || wl.rx_depth < 8) {
++		printf("SWEET BT: odd FIFO depths tx %u rx %u (hw-param %#x/%#x): stop\n", wl.tx_depth,
++		    wl.rx_depth, wl_rd(wl.se, SE_HW_PARAM_0), wl_rd(wl.se, SE_HW_PARAM_1));
++		return false;
++	}
++	/* geni_se_io_init + io_set_mode + init */
++	wl_wr(wl.se, SE_CGC_CTRL, wl_rd(wl.se, SE_CGC_CTRL) | 0x7fu);
++	wl_wr(wl.se, SE_DMA_GENERAL_CFG, wl_rd(wl.se, SE_DMA_GENERAL_CFG) | 0xfu);
++	wl_wr(wl.se, SE_OUTPUT_CTRL, 0x7fu);
++	wl_wr(wl.se, SE_FORCE_DEFAULT, 1u);
++	wl_wr(wl.se, SE_GSI_EVENT_EN, 0);
++	wl_wr(wl.se, SE_M_IRQ_CLEAR, 0xffffffffu);
++	wl_wr(wl.se, SE_S_IRQ_CLEAR, 0xffffffffu);
++	wl_wr(wl.se, SE_DMA_TX_IRQ_CLR, 0xffffffffu);
++	wl_wr(wl.se, SE_DMA_RX_IRQ_CLR, 0xffffffffu);
++	/* geni_se_io_set_mode(): M/S GENI interrupts on, DMA TX/RX off (FIFO mode) */
++	wl_wr(wl.se, SE_IRQ_EN, (wl_rd(wl.se, SE_IRQ_EN) | GENI_M_IRQ_EN | GENI_S_IRQ_EN) &
++	    ~(DMA_TX_IRQ_EN | DMA_RX_IRQ_EN));
++	wl_wr(wl.se, SE_DMA_MODE_EN, wl_rd(wl.se, SE_DMA_MODE_EN) & ~1u);
++	wl_packing();
++	wl_wr(wl.se, SE_RX_WM, 2);
++	wl_wr(wl.se, SE_RX_RFR_WM, wl.rx_depth - 2);
++	wl_wr(wl.se, SE_UART_RX_STALE, 160);          /* DEFAULT_BITS_PER_CHAR * STALE_TIMEOUT */
++	wl_wr(wl.se, SE_UART_TX_WORD_LEN, 8);
++	wl_wr(wl.se, SE_UART_RX_WORD_LEN, 8);
++	wl_wr(wl.se, SE_UART_TX_STOP_LEN, 0);
++	wl_wr(wl.se, SE_UART_TX_PARITY, 0);
++	wl_wr(wl.se, SE_UART_RX_PARITY, 0);
++	wl_wr(wl.se, SE_UART_RX_TRANS_CFG, 0);
++	wl_wr(wl.se, SE_UART_TX_TRANS_CFG, UART_CTS_MASK);    /* flow control off */
++	wl_wr(wl.se, SE_UART_MANUAL_RFR, 0);
++	return true;
++}
++
++static void
++wl_rx_start(void)
++{
++	wl.rx_st = 0;
++	wl_wr(wl.se, SE_S_IRQ_CLEAR, 0xffffffffu);
++	wl_wr(wl.se, SE_S_CMD0, UART_START_READ << 27);
++}
++
++static void
++wl_rx_stop(void)
++{
++	if (wl_rd(wl.se, SE_STATUS) & (1u << 12)) {
++		wl_wr(wl.se, SE_S_CMD_CTRL, 1u << 2);     /* cancel */
++		for (unsigned i = 0; i < 2000 && (wl_rd(wl.se, SE_STATUS) & (1u << 12)); i++) {
++			delay(10);
++		}
++		if (wl_rd(wl.se, SE_STATUS) & (1u << 12)) {
++			wl_wr(wl.se, SE_S_CMD_CTRL, 1u << 1); /* abort */
++			for (unsigned i = 0; i < 2000 && (wl_rd(wl.se, SE_STATUS) & (1u << 12)); i++) {
++				delay(10);
++			}
++		}
++	}
++	wl_wr(wl.se, SE_S_IRQ_CLEAR, 0xffffffffu);
++}
++
++/*
++ * hci_qca.c in-band sleep (IBS): single bytes between H4 packets, 0xfe SLEEP_IND, 0xfd
++ * WAKE_IND, 0xfc WAKE_ACK. They are recognised only at a packet boundary (an event is
++ * 0x04, code, length, payload), acted on and kept out of wl.rxq. The ACK for a
++ * controller wake-up is sent later by wl_ibs_service(), never in the middle of a TX packet.
++ */
++#define IBS_SLEEP_IND   0xfeu
++#define IBS_WAKE_IND    0xfdu
++#define IBS_WAKE_ACK    0xfcu
++
++static void wl_xport_feed(uint8_t b);
++
++static void
++wl_rx_feed(uint8_t b)
++{
++	if (wl.xport) {
++		wl_xport_feed(b);
++		return;
++	}
++	if (wl.rx_st == 0 && b >= IBS_WAKE_ACK && b <= IBS_SLEEP_IND) {
++		const char *n = b == IBS_WAKE_ACK ? "WAKE_ACK" : b == IBS_WAKE_IND ? "WAKE_IND" : "SLEEP_IND";
++		if (b == IBS_SLEEP_IND) {
++			wl.ibs_asleep = true;
++			wl.ibs_sleeps++;
++		} else {
++			wl.ibs_asleep = false;
++			if (b == IBS_WAKE_IND) {
++				wl.ibs_ack_pending = true;
++			}
++		}
++		if (wl.ibs_logged < 16) {
++			wl.ibs_logged++;
++			printf("SWEET BT: BT IBS: RX %s (%#04x) at %u ms\n", n, b, wl_ms());
++		}
++		return;
++	}
++	if (wl.rxn < sizeof(wl.rxq)) {
++		wl.rxq[wl.rxn++] = b;
++	}
++	switch (wl.rx_st) {
++	case 0:
++		wl.rx_st = (b == 0x04) ? 1 : 0;         /* anything else: resync, like the event parsers do */
++		break;
++	case 1:
++		wl.rx_st = 2;
++		break;
++	case 2:
++		wl.rx_left = b;
++		wl.rx_st = b ? 3 : 0;
++		break;
++	default:
++		if (--wl.rx_left == 0) {
++			wl.rx_st = 0;
++		}
++		break;
++	}
++}
++
++/* drain the RX FIFO into wl.rxq */
++static void
++wl_rx_poll(void)
++{
++	/* qcom_geni_serial_isr(): ack RX events; a completed S command (stale/last) is re-armed */
++	uint32_t irq = wl_rd(wl.se, SE_S_IRQ_STATUS);
++	uint32_t st = wl_rd(wl.se, SE_RX_FIFO_STATUS);
++	if (irq & (S_CMD_DONE | S_RX_FIFO_RD_ERR | S_RX_FIFO_WR_ERR | S_RX_FIFO_WATERMARK | S_RX_FIFO_LAST)) {
++		if (irq & (S_RX_FIFO_RD_ERR | S_RX_FIFO_WR_ERR)) {
++			wl.xs_fifo_err++;
++			if (!wl.xport || wl.xs_fifo_err <= 8) {
++				printf("SWEET BT: UART RX FIFO error (s_irq %#x)\n", irq);
++			}
++		}
++		wl_wr(wl.se, SE_S_IRQ_CLEAR, irq);
++		if ((irq & S_CMD_DONE) && !(wl_rd(wl.se, SE_STATUS) & (1u << 12))) {
++			wl_wr(wl.se, SE_S_CMD0, UART_START_READ << 27);
++		}
++	}
++	uint32_t words = st & 0x1ffffffu;
++	wl.xs_polls++;
++	if (!words) {
++		return;
++	}
++	uint32_t bytes = 4 * (words - 1);
++	uint32_t lastv = (st >> 28) & 7;
++	bytes += ((st >> 31) && lastv) ? lastv : 4;
++	wl.xs_bytes += bytes;
++	if (bytes > wl.xs_maxburst) {
++		wl.xs_maxburst = bytes;
++	}
++	if (words > wl.xs_maxwords) {
++		wl.xs_maxwords = words;
++	}
++	uint8_t raw[32];
++	unsigned nraw = 0, total = bytes;
++	for (uint32_t w = 0; w < words; w++) {
++		uint32_t v = wl_rd(wl.se, SE_RX_FIFO);
++		for (unsigned k = 0; k < 4 && bytes; k++, bytes--) {
++			if (nraw < sizeof(raw)) {
++				raw[nraw++] = (uint8_t)(v >> (8 * k));
++			}
++			wl_rx_feed((uint8_t)(v >> (8 * k)));
++		}
++	}
++	if (wl.raw_budget) {
++		/* every RX batch as it came off the wire (IBS bytes included), until the budget is used up */
++		char line[3 * 32 + 1];
++		unsigned o = 0;
++		wl.raw_budget--;
++		for (unsigned i = 0; i < nraw; i++) {
++			o += (unsigned)snprintf(line + o, sizeof(line) - o, "%02x ", raw[i]);
++		}
++		printf("SWEET BT: BT RX raw at %u ms (%u bytes, baud %u): %s\n", wl_ms(), total, wl.baud, line);
++	}
++}
++
++static bool
++wl_tx(const uint8_t *buf, unsigned len, unsigned baud)
++{
++	if (len == 0 || len > 4u * (wl.tx_depth - 2)) {
++		return false;
++	}
++	for (unsigned i = 0; i < 1000 && (wl_rd(wl.se, SE_STATUS) & 1u); i++) {
++		delay(10);
++	}
++	wl_wr(wl.se, SE_M_IRQ_CLEAR, 0xffffffffu);
++	wl_wr(wl.se, SE_TX_WM, 2);
++	wl_wr(wl.se, SE_UART_TX_TRANS_LEN, len);
++	wl_wr(wl.se, SE_M_CMD0, UART_START_TX << 27);
++	for (unsigned i = 0; i < len; i += 4) {
++		uint32_t w = 0;
++		for (unsigned k = 0; k < 4 && i + k < len; k++) {
++			w |= (uint32_t)buf[i + k] << (8 * k);
++		}
++		wl_wr(wl.se, SE_TX_FIFO, w);
++	}
++	/* 12 bit times per byte plus 50 ms; flow control may hold the transmitter */
++	uint64_t us = ((uint64_t)len * 12 * 1000000ull) / baud + 50000 + wl.tx_extra_us;
++	bool done = false;
++	for (uint64_t t = 0; t < us; t += 20) {
++		if (wl_rd(wl.se, SE_M_IRQ_STATUS) & M_CMD_DONE) {
++			done = true;
++			break;
++		}
++		delay(20);
++	}
++	if (!done) {
++		wl_wr(wl.se, SE_M_CMD_CTRL, 1u << 1);     /* abort */
++		for (unsigned i = 0; i < 1000 && !(wl_rd(wl.se, SE_M_IRQ_STATUS) & M_CMD_ABORT); i++) {
++			delay(10);
++		}
++		wl_wr(wl.se, SE_M_IRQ_CLEAR, M_CMD_ABORT);
++		printf("SWEET BT: UART TX of %u bytes timed out (aborted)\n", len);
++		return false;
++	}
++	wl_wr(wl.se, SE_M_IRQ_CLEAR, M_CMD_DONE);
++	return true;
++}
++
++static void
++wl_power_pulse(bool on, unsigned baud)
++{
++	uint8_t b = on ? QCA_POWER_ON_PULSE : QCA_POWER_OFF_PULSE;
++	wl_rx_stop();
++	wl_flow(false);
++	(void)wl_tx(&b, 1, baud);
++	wl_sleep(on ? 100 : 10);
++	wl_rx_start();
++	wl.rxn = 0;
++}
++
++static void
++wl_print_hex(const char *what, const uint8_t *b, unsigned n)
++{
++	char line[3 * 48 + 1];
++	unsigned o = 0;
++	for (unsigned i = 0; i < n && o + 3 < sizeof(line); i++) {
++		o += (unsigned)snprintf(line + o, sizeof(line) - o, "%02x ", b[i]);
++	}
++	printf("SWEET BT: HCI %s: %s\n", what, line);
++}
++
++/* ---------------------------------------------------------------- HCI transport */
++
++#define WL_EVT_CC       1u      /* Command Complete / Command Status for the opcode */
++#define WL_EVT_VSE      2u      /* vendor specific event (0xff) */
++
++static uint8_t wl_pkt[4 + 255];
++
++/* drop the first n bytes of the RX queue */
++static void
++wl_rxq_drop(unsigned n)
++{
++	if (n >= wl.rxn) {
++		wl.rxn = 0;
++		return;
++	}
++	memmove(wl.rxq, wl.rxq + n, wl.rxn - n);
++	wl.rxn -= n;
++}
++
++/* the controller woke up on its own (0xfd): acknowledge it with 0xfc, between packets only */
++static void
++wl_ibs_service(void)
++{
++	if (wl.ibs_ack_pending) {
++		uint8_t b = IBS_WAKE_ACK;
++		wl.ibs_ack_pending = false;
++		(void)wl_tx(&b, 1, wl.baud ? wl.baud : 115200);
++		if (wl.ibs_logged < 16) {
++			wl.ibs_logged++;
++			printf("SWEET BT: BT IBS: TX WAKE_ACK (0xfc)\n");
++		}
++	}
++}
++
++/*
++ * host side (qca_enqueue + the tx_wait_timer of hci_qca.c): before a packet, wake a sleeping
++ * controller with 0xfd and wait for 0xfc (or the controller's own 0xfd) - 100 ms per attempt,
++ * up to 3 attempts, each one logged. A controller WAKE_IND while we wait counts as the answer
++ * (it is acknowledged by wl_ibs_service()).
++ */
++static void
++wl_ibs_wake(void)
++{
++	/* transport mode wakes the controller often: only the first 24 handshakes are logged */
++	bool v = !wl.xport || wl.ibs_xlog < 24;
++	if (!wl.ibs_asleep) {
++		return;
++	}
++	if (wl.xport) {
++		wl.ibs_xlog++;
++		wl.xs_ibs_wake++;
++	}
++	for (unsigned attempt = 1; attempt <= 3 && wl.ibs_asleep; attempt++) {
++		uint8_t b = IBS_WAKE_IND;
++		if (v) {
++			printf("SWEET BT: BT IBS: controller asleep, TX WAKE_IND (0xfd) attempt %u/3 at %u ms\n", attempt, wl_ms());
++		}
++		(void)wl_tx(&b, 1, wl.baud ? wl.baud : 115200);
++		for (unsigned t = 0; t < 100 && wl.ibs_asleep; t++) {
++			wl_rx_poll();
++			if (wl.ibs_asleep) {
++				delay(1000);
++			}
++		}
++		if (v) {
++			printf("SWEET BT: BT IBS: attempt %u: %s at %u ms\n", attempt, wl.ibs_asleep ? "no WAKE_ACK" :
++			    "WAKE_ACK/WAKE_IND received", wl_ms());
++		}
++	}
++	if (wl.ibs_asleep) {
++		wl.xs_ibs_wake_fail++;
++		printf("SWEET BT: BT IBS: no answer to 3 wake attempts, sending anyway\n");
++		wl.ibs_asleep = false;
++	}
++	wl_ibs_service();
++}
++
++/* TX of any length: split into pieces the FIFO accepts, keep the RX FIFO drained in between */
++static bool
++wl_tx_buf(const uint8_t *buf, unsigned len)
++{
++	unsigned chunk = 4u * (wl.tx_depth - 2);
++	while (len) {
++		unsigned n = MIN(len, chunk);
++		if (!wl_tx(buf, n, wl.baud ? wl.baud : 115200)) {
++			return false;
++		}
++		buf += n;
++		len -= n;
++		wl_rx_poll();
++	}
++	return true;
++}
++
++/* H4 command packet out, nothing waited for and the RX queue untouched */
++static bool
++wl_hci_send(uint16_t opcode, const uint8_t *params, unsigned plen)
++{
++	if (plen > 255) {
++		return false;
++	}
++	wl_ibs_service();
++	if (!wl.bt_nowake) {
++		wl_ibs_wake();
++	}
++	wl_pkt[0] = 0x01;
++	wl_pkt[1] = (uint8_t)opcode;
++	wl_pkt[2] = (uint8_t)(opcode >> 8);
++	wl_pkt[3] = (uint8_t)plen;
++	if (plen) {
++		memcpy(wl_pkt + 4, params, plen);
++	}
++	return wl_tx_buf(wl_pkt, 4 + plen);
++}
++
++/* does a run of unmatched bytes look like an HCI event with a damaged bit pattern? */
++static void
++wl_garbage_hint(const uint8_t *b, unsigned n)
++{
++	char a[3 * 16 + 1], r[3 * 16 + 1];
++	unsigned oa = 0, or = 0;
++	for (unsigned i = 0; i < n && i < 16; i++) {
++		uint8_t rev = 0;
++		for (unsigned k = 0; k < 8; k++) {
++			rev |= (uint8_t)(((b[i] >> k) & 1) << (7 - k));
++		}
++		oa += (unsigned)snprintf(a + oa, sizeof(a) - oa, "%02x ", b[i] & 0x7f);
++		or += (unsigned)snprintf(r + or, sizeof(r) - or, "%02x ", rev);
++	}
++	printf("SWEET BT: BT RX garbage hint (an event would start 04 xx len): MSB cleared: %s| bit reversed: %s\n", a, r);
++}
++
++/*
++ * Wait for one event of the wanted kind. The event and every byte before it are
++ * removed from the RX queue; rsp = event code, parameter length, parameters
++ * (at most 48 bytes).
++ */
++static int
++wl_hci_wait(uint16_t opcode, unsigned want, uint8_t *rsp, unsigned *rlen, unsigned timeout_ms)
++{
++	for (unsigned t = 0; t < timeout_ms; t++) {
++		wl_rx_poll();
++		wl_ibs_service();
++		unsigned pos = 0;
++		while (pos < wl.rxn) {
++			if (wl.rxq[pos] != 0x04) {
++				pos++;                      /* not an event: resync */
++				continue;
++			}
++			if (pos + 3 > wl.rxn) {
++				break;
++			}
++			unsigned elen = wl.rxq[pos + 2];
++			if (pos + 3 + elen > wl.rxn) {
++				break;
++			}
++			uint8_t evt = wl.rxq[pos + 1];
++			const uint8_t *d = &wl.rxq[pos + 3];
++			bool match = ((want & WL_EVT_CC) &&
++			    ((evt == 0x0e && elen >= 3 && (d[1] | (d[2] << 8)) == opcode) ||
++			    (evt == 0x0f && elen >= 4 && (d[2] | (d[3] << 8)) == opcode))) ||
++			    ((want & WL_EVT_VSE) && evt == 0xff);
++			if (match) {
++				*rlen = MIN(elen + 2, 48u);
++				rsp[0] = evt;
++				rsp[1] = (uint8_t)elen;
++				memcpy(rsp + 2, d, *rlen - 2);
++				wl_rxq_drop(pos + 3 + elen);
++				return 0;
++			}
++			pos += 3 + elen;
++		}
++		delay(1000);
++	}
++	if (wl.rxn) {
++		wl_print_hex("(unmatched RX bytes at timeout)", wl.rxq, MIN(wl.rxn, 48u));
++		wl_garbage_hint(wl.rxq, MIN(wl.rxn, 16u));
++	}
++	return ETIMEDOUT;
++}
++
++/* One HCI command; prints and returns the first matching event in rsp. */
++static int
++wl_hci_cmd(uint16_t opcode, const uint8_t *params, unsigned plen, uint8_t *rsp, unsigned *rlen,
++    unsigned timeout_ms)
++{
++	unsigned want = WL_EVT_CC | ((opcode >> 10) == 0x3f ? WL_EVT_VSE : 0);
++	int err = ETIMEDOUT;
++	/*
++	 * A controller that goes to sleep (SLEEP_IND) after taking our packet, or while we sent it,
++	 * may have dropped it: when no reply comes and it is asleep, wake it (wl_hci_send does that)
++	 * and send the command again, up to 3 sends in total. Otherwise keep waiting.
++	 */
++	for (unsigned attempt = 1; attempt <= 3; attempt++) {
++		unsigned sleeps = wl.ibs_sleeps;
++		wl.rxn = 0;
++		if (!wl_hci_send(opcode, params, plen)) {
++			return EIO;
++		}
++		if (attempt == 3) {
++			return wl_hci_wait(opcode, want, rsp, rlen, timeout_ms);
++		}
++		err = wl_hci_wait(opcode, want, rsp, rlen, MIN(timeout_ms, 500u));
++		if (!err) {
++			return 0;
++		}
++		if (!wl.ibs_asleep && wl.ibs_sleeps == sleeps) {
++			return wl_hci_wait(opcode, want, rsp, rlen, timeout_ms > 500 ? timeout_ms - 500 : 1);
++		}
++		printf("SWEET BT: BT IBS: no reply to command %#06x (send %u/3) and the controller went to sleep "
++		    "(%u SLEEP_IND, asleep %d) at %u ms: wake and resend\n", opcode, attempt, wl.ibs_sleeps - sleeps,
++		    wl.ibs_asleep, wl_ms());
++	}
++	return err;
++}
++
++/* consume every complete event already queued; false when one reports an error */
++static bool
++wl_evt_drain(const char *ctx)
++{
++	bool ok = true;
++	unsigned pos = 0;
++	wl_rx_poll();
++	wl_ibs_service();
++	while (pos < wl.rxn) {
++		if (wl.rxq[pos] != 0x04) {
++			pos++;
++			continue;
++		}
++		if (pos + 3 > wl.rxn) {
++			break;
++		}
++		unsigned elen = wl.rxq[pos + 2];
++		if (pos + 3 + elen > wl.rxn) {
++			break;
++		}
++		uint8_t evt = wl.rxq[pos + 1];
++		const uint8_t *d = &wl.rxq[pos + 3];
++		if (evt == 0x0e && elen >= 4) {
++			if (d[3] != 0) {
++				printf("SWEET BT: BT fw %s: Command Complete for %#06x status %#x\n", ctx,
++				    d[1] | (d[2] << 8), d[3]);
++				ok = false;
++			} else {
++				wl.ev_cc++;
++			}
++		} else if (evt == 0xff && elen >= 3 && d[0] == 0 && d[1] == 4 && d[2] != 0) {
++			printf("SWEET BT: BT fw %s: TLV download vendor event status %#x\n", ctx, d[2]);
++			ok = false;
++		} else {
++			wl.ev_other++;
++			if (wl.ev_other <= 8) {
++				wl_print_hex("BT fw event during download", &wl.rxq[pos], 3 + elen);
++			}
++		}
++		pos += 3 + elen;
++	}
++	wl_rxq_drop(pos);
++	return ok;
++}
++
++/* ---------------------------------------------------------------- QCA WCN3990 setup */
++/* drivers/bluetooth/btqca.[ch] + hci_qca.c qca_setup(), no IBS */
++
++#define QCA_EDL_PATCH_CMD_OPCODE        0xfc00u
++#define QCA_EDL_PATCH_VER_REQ_CMD       0x19u
++#define QCA_EDL_PATCH_TLV_REQ_CMD       0x1eu
++#define QCA_EDL_SET_BAUDRATE_OPCODE     0xfc48u
++#define QCA_MAX_SIZE_PER_TLV_SEGMENT    243u
++#define QCA_EDL_CMD_REQ_RES_EVT         0x00u
++#define QCA_EDL_APP_VER_RES_EVT         0x02u
++#define QCA_EDL_TVL_DNLD_RES_EVT        0x04u
++#define QCA_EDL_TAG_ID_HCI              17u
++#define QCA_EDL_TAG_ID_DEEP_SLEEP       27u
++#define QCA_TLV_TYPE_PATCH              1u
++#define QCA_WCN3991_SOC_ID              0x40014320u
++#define WL_BT_FW_PATCH                  "crbtfw21.tlv"  /* fallback names (Android's, rom 2.1) */
++#define WL_BT_FW_NVM                    "crnv21.bin"
++
++
++struct wl_qca_ver {
++	uint32_t product_id, soc_id, soc_ver;
++	uint16_t patch_ver, rom_ver;
++	unsigned rom;                   /* get rom_ver of qca_uart_setup(): the 21 in crbtfw21 */
++};
++
++/* qca_read_soc_version(): EDL_PATCH_VER_REQ_CMD, struct qca_btsoc_version in the vendor event */
++static bool
++wl_qca_read_version(struct wl_qca_ver *v, const char *label)
++{
++	static const uint8_t req[1] = { QCA_EDL_PATCH_VER_REQ_CMD };
++	uint8_t rsp[48];
++	unsigned rlen = 0;
++	int err = wl_hci_cmd(QCA_EDL_PATCH_CMD_OPCODE, req, 1, rsp, &rlen, 1000);
++	if (err) {
++		printf("SWEET BT: QCA %s: no event (%d)\n", label, err);
++		return false;
++	}
++	wl_print_hex(label, rsp, rlen);
++	/* rsp: evt, len, edl.cresp, edl.rtype, product_id le32, patch_ver le16, rom_ver le16, soc_id le32 */
++	if (rsp[0] != 0xff || rlen < 16 || rsp[2] != QCA_EDL_CMD_REQ_RES_EVT || rsp[3] != QCA_EDL_APP_VER_RES_EVT) {
++		printf("SWEET BT: QCA %s: not a version response\n", label);
++		return false;
++	}
++	v->product_id = le32(rsp + 4);
++	v->patch_ver = le16(rsp + 8);
++	v->rom_ver = le16(rsp + 10);
++	v->soc_id = le32(rsp + 12);
++	/* btqca.c: upper 2 bytes from the SoC id, lower 2 bytes the ROM version */
++	v->soc_ver = (v->soc_id << 16) | v->rom_ver;
++	/* qca_uart_setup(): rom_ver = ((soc_ver & 0x0f00) >> 4) | (soc_ver & 0x0f) */
++	v->rom = ((v->soc_ver & 0x00000f00u) >> 4) | (v->soc_ver & 0x0000000fu);
++	printf("SWEET BT: BT fw QCA %s: product ID %#010x, patch version %#06x, ROM version %#06x, SoC ID %#010x "
++	    "-> soc_ver %#010x, rom_ver %#04x\n", label, v->product_id, v->patch_ver, v->rom_ver, v->soc_id,
++	    v->soc_ver, v->rom);
++	return true;
++}
++
++/* enum qca_baudrate of btqca.h */
++static int
++wl_qca_baud_code(unsigned baud)
++{
++	switch (baud) {
++	case 115200:  return 0;
++	case 230400:  return 5;
++	case 460800:  return 7;
++	case 921600:  return 10;
++	case 1000000: return 11;
++	case 2000000: return 13;
++	case 3000000: return 14;
++	case 3200000: return 17;
++	default:      return -1;
++	}
++}
++
++/* HCI Read Local Version at the current baud, decoded; Read_Local_Version_Information */
++static bool
++wl_hci_read_local_version(const char *label)
++{
++	uint8_t rsp[48];
++	unsigned rlen = 0;
++	int err = wl_hci_cmd(0x1001, NULL, 0, rsp, &rlen, 1000);
++	if (err) {
++		printf("SWEET BT: HCI Read Local Version (%s): no event (%d)\n", label, err);
++		return false;
++	}
++	wl_print_hex(label, rsp, rlen);
++	if (rsp[0] != 0x0e || rlen < 14 || rsp[5] != 0) {
++		printf("SWEET BT: HCI Read Local Version (%s): bad reply\n", label);
++		return false;
++	}
++	printf("SWEET BT: HCI Read Local Version (%s): HCI version %u revision %#06x, LMP version %u, "
++	    "manufacturer %#06x, LMP subversion %#06x\n", label, rsp[6], le16(rsp + 7), rsp[9], le16(rsp + 10),
++	    le16(rsp + 12));
++	return true;
++}
++
++/*
++ * hci_qca.c qca_set_speed() for WCN399x: flow control off, EDL_SET_BAUDRATE_CMD
++ * (vendor 0xfc48, one byte qca_baudrate) goes out at the old speed without waiting,
++ * 10 ms for the controller, switch the host UART, flow control on, then the
++ * controller's vendor event arrives at the new speed (Linux drops it). Verified
++ * here with HCI Read Local Version at the new rate.
++ */
++static bool
++wl_qca_set_baud(unsigned baud)
++{
++	uint8_t rsp[48];
++	unsigned rlen = 0, old = wl.baud;
++	unsigned div = 0;
++	int code = wl_qca_baud_code(baud);
++	if (code < 0 || wl_pick_row(baud, &div) < 0) {
++		printf("SWEET BT: BT fw: %u baud not usable (QCA code %d, S3 row %d)\n", baud, code,
++		    wl_pick_row(baud, &div));
++		return false;
++	}
++	printf("SWEET BT: BT fw: EDL_SET_BAUDRATE_CMD %#06x code %#x (%u baud), host %u -> %u baud\n",
++	    QCA_EDL_SET_BAUDRATE_OPCODE, code, baud, old, baud);
++	wl_flow(false);
++	wl.rxn = 0;
++	uint8_t c = (uint8_t)code;
++	if (!wl_hci_send(QCA_EDL_SET_BAUDRATE_OPCODE, &c, 1)) {
++		printf("SWEET BT: BT fw: baud command TX failed\n");
++		return false;
++	}
++	wl_sleep(10);
++	if (!wl_baud(baud)) {
++		printf("SWEET BT: BT fw: host UART could not switch to %u baud\n", baud);
++		return false;
++	}
++	wl.rxn = 0;
++	wl_rx_start();
++	if (wl_hci_wait(QCA_EDL_SET_BAUDRATE_OPCODE, WL_EVT_CC | WL_EVT_VSE, rsp, &rlen, 100) == 0) {
++		wl_print_hex("baud change event at the new rate", rsp, rlen);
++	} else {
++		printf("SWEET BT: BT fw: no baud change event at %u baud (Linux drops it anyway)\n", baud);
++	}
++	wl_flow(true);
++	if (!wl_hci_read_local_version("at new baud")) {
++		printf("SWEET BT: BT fw: controller does not answer at %u baud\n", baud);
++		return false;
++	}
++	printf("SWEET BT: BT fw: controller answers at %u baud\n", baud);
++	return true;
++}
++
++/* qca_tlv_check_data(), TLV_TYPE_PATCH: log the header, return download_mode */
++static bool
++wl_qca_patch_check(const uint8_t *fw, size_t size, unsigned *mode)
++{
++	if (size < 28) {
++		printf("SWEET BT: BT fw patch: only %u bytes\n", (unsigned)size);
++		return false;
++	}
++	uint32_t type_len = le32(fw);
++	if ((type_len & 0xff) != QCA_TLV_TYPE_PATCH) {
++		printf("SWEET BT: BT fw patch: TLV type %#x is not a patch (1)\n", type_len & 0xff);
++		return false;
++	}
++	/* tlv_type_hdr {type_len} + tlv_type_patch {total_size, data_length, format_version, signature,
++	 * download_mode, reserved1, product_id, rom_build, patch_version, reserved2, entry} */
++	printf("SWEET BT: BT fw patch: TLV type %u length %u (file %u), total_size %u, data_length %u, "
++	    "format %u, signature %u, download_mode %u, product %#06x, rom_build %#06x, patch_version %#06x, "
++	    "entry %#x\n", type_len & 0xff, type_len >> 8, (unsigned)size, le32(fw + 4), le32(fw + 8), fw[12], fw[13], fw[14],
++	    le16(fw + 16), le16(fw + 18), le16(fw + 20), le32(fw + 24));
++	if ((type_len >> 8) != size - 4) {
++		printf("SWEET BT: BT fw patch: note: TLV length %u != file size - 4\n", type_len >> 8);
++	}
++	*mode = fw[14] <= 3 ? fw[14] : 0;
++	return true;
++}
++
++struct wl_nvm_scan {
++	unsigned start, ntags, idx17, idx27, stop_idx, stop_tag;
++};
++
++/* walk tlv_type_nvm entries {tag_id, tag_len, reserve1, reserve2, data[tag_len]} from start */
++static void
++wl_nvm_scan_at(const uint8_t *d, size_t limit, unsigned start, struct wl_nvm_scan *s)
++{
++	unsigned idx = start, prev = 0;
++	memset(s, 0, sizeof(*s));
++	s->start = start;
++	while (idx + 12 <= limit) {
++		unsigned id = le16(d + idx), len = le16(d + idx + 2);
++		if (id == 0 || id > 0x400 || id <= prev || idx + 12 + len > limit) {
++			s->stop_tag = id;
++			break;
++		}
++		if (id == QCA_EDL_TAG_ID_HCI) {
++			s->idx17 = idx;
++		} else if (id == QCA_EDL_TAG_ID_DEEP_SLEEP) {
++			s->idx27 = idx;
++		}
++		s->ntags++;
++		prev = id;
++		idx += 12 + len;
++	}
++	s->stop_idx = idx;
++}
++
++/*
++ * qca_tlv_check_data(), TLV_TYPE_NVM: HCI transport tag (17): data[0] |= 0x80
++ * (software in-band sleep), UART baud rate code in data[2] on WCN3990 (data[1] only
++ * on WCN3991 and later: btqca.c 'soc_type >= QCA_WCN3991'); deep sleep
++ * tag (27): data[0] |= 0x01. Linux enables both because it runs IBS; this stage
++ * has no IBS (a sleeping controller would need the 0xfd/0xfc/0xfe protocol), so
++ * unless sweetbtibs=1 the two bits are cleared instead.
++ */
++static bool
++wl_qca_nvm_edit(uint8_t *fw, size_t size, int baud_code)
++{
++	if (size < 16) {
++		printf("SWEET BT: BT fw NVM: only %u bytes\n", (unsigned)size);
++		return false;
++	}
++	uint32_t type_len = le32(fw);
++	size_t limit = MIN(size, (size_t)4 + (type_len >> 8));
++	printf("SWEET BT: BT fw NVM: TLV type %u length %u (file %u)\n", type_len & 0xff, type_len >> 8, (unsigned)size);
++	struct wl_nvm_scan a, b;
++	wl_nvm_scan_at(fw, limit, 4, &a);       /* Linux: tlv->data */
++	wl_nvm_scan_at(fw, limit, 8, &b);       /* some images carry one more header word */
++	const struct wl_nvm_scan *s = b.ntags > a.ntags ? &b : &a;
++	if (s->start != 4) {
++		printf("SWEET BT: BT fw NVM: tags start at offset %u (extra header word %#010x), not at 4 as "
++		    "in Linux's struct tlv_type_hdr\n", s->start, le32(fw + 4));
++	}
++	printf("SWEET BT: BT fw NVM: %u tags from offset %u, stopped at %u (tag id %#x); HCI tag 17 at %u, "
++	    "deep sleep tag 27 at %u\n", s->ntags, s->start, s->stop_idx, s->stop_tag, s->idx17, s->idx27);
++	if (s->ntags < 3) {
++		printf("SWEET BT: BT fw NVM: tag layout not recognised, NVM sent unmodified\n");
++		return true;
++	}
++	if (s->idx17 && le16(fw + s->idx17 + 2) >= 3) {
++		/*
++		 * WCN3990: the baud code is data[2]; data[1] is another UART
++		 * setting (0x01 in both Android's and linux-firmware's crnv21).
++		 * Writing the baud into data[1] (0118-0132) garbled every event
++		 * after the NVM took effect ('84 08 81 20 08' for a reset reply).
++		 */
++		uint8_t *t = fw + s->idx17 + 12;
++		uint8_t old0 = t[0], old1 = t[1], old2 = t[2];
++		t[0] = wl.bt_ibs ? (t[0] | 0x80) : (t[0] & ~0x80);
++		t[2] = (uint8_t)baud_code;
++		printf("SWEET BT: BT fw NVM: HCI tag: data[0] %#04x -> %#04x (IBS %s), data[1] %#04x kept, "
++		    "data[2] (baud) %#04x -> %#04x\n", old0, t[0], wl.bt_ibs ? "on" : "off", old1, old2, t[2]);
++	} else {
++		printf("SWEET BT: BT fw NVM: no HCI tag 17, baud not patched\n");
++	}
++	if (s->idx27 && le16(fw + s->idx27 + 2) >= 1) {
++		uint8_t *t = fw + s->idx27 + 12;
++		uint8_t old0 = t[0];
++		t[0] = wl.bt_ibs ? (t[0] | 0x01) : (t[0] & ~0x01);
++		printf("SWEET BT: BT fw NVM: deep sleep tag: data[0] %#04x -> %#04x (deep sleep %s)\n", old0, t[0],
++		    wl.bt_ibs ? "on" : "off");
++	} else {
++		printf("SWEET BT: BT fw NVM: no deep sleep tag 27\n");
++	}
++	return true;
++}
++
++/*
++ * qca_download_firmware() + qca_tlv_send_segment(): the whole TLV file (header
++ * included) goes out in vendor 0xfc00 commands {0x1e, len, data[len]}, 243 bytes
++ * per segment. download_mode (patch header; NVM is always 0): bit 0 = no vendor
++ * event for the segment, bit 1 = no command complete. WCN399x patches say 3: only
++ * the last segment (or any short one) is acknowledged, by the vendor event
++ * {cresp 0, rtype 4, result}; mode 1 waits for the command complete instead.
++ */
++static bool
++wl_qca_send_tlv(const char *what, const uint8_t *fw, size_t size, unsigned mode)
++{
++	unsigned total = (unsigned)((size + QCA_MAX_SIZE_PER_TLV_SEGMENT - 1) / QCA_MAX_SIZE_PER_TLV_SEGMENT);
++	unsigned seg = 0, next_pct = 10;
++	size_t off = 0;
++	bool cc_wait = (mode == 1);
++	uint8_t cmd[QCA_MAX_SIZE_PER_TLV_SEGMENT + 2], rsp[48];
++	unsigned rlen;
++
++	wl.rxn = 0;
++	wl.ev_cc = wl.ev_other = 0;
++	wl.tx_extra_us = 500000;
++	printf("SWEET BT: BT fw %s: %u bytes in %u segments of %u, download_mode %u (%s)\n", what, (unsigned)size, total,
++	    QCA_MAX_SIZE_PER_TLV_SEGMENT, mode, mode == 3 ? "only the last segment is acknowledged" :
++	    mode == 1 ? "command complete per segment" : "vendor event per segment");
++	while (off < size) {
++		unsigned n = (unsigned)MIN(size - off, (size_t)QCA_MAX_SIZE_PER_TLV_SEGMENT);
++		bool last = (off + n >= size) || n < QCA_MAX_SIZE_PER_TLV_SEGMENT;
++		unsigned m = last ? 0 : mode;   /* "the last segment is always acked regardless of download mode" */
++		cmd[0] = QCA_EDL_PATCH_TLV_REQ_CMD;
++		cmd[1] = (uint8_t)n;
++		memcpy(cmd + 2, fw + off, n);
++		if (!wl_hci_send(QCA_EDL_PATCH_CMD_OPCODE, cmd, n + 2)) {
++			printf("SWEET BT: BT fw %s: segment %u/%u: TX failed\n", what, seg + 1, total);
++			goto fail;
++		}
++		if (m == 0 || m == 2) {
++			if (wl_hci_wait(QCA_EDL_PATCH_CMD_OPCODE, WL_EVT_VSE, rsp, &rlen, last ? 10000 : 2000)) {
++				printf("SWEET BT: BT fw %s: segment %u/%u: no vendor event\n", what, seg + 1, total);
++				goto fail;
++			}
++			if (rlen < 5 || rsp[2] != QCA_EDL_CMD_REQ_RES_EVT || rsp[3] != QCA_EDL_TVL_DNLD_RES_EVT ||
++			    rsp[4] != 0) {
++				printf("SWEET BT: BT fw %s: segment %u/%u: TLV with invalid response or error status\n",
++				    what, seg + 1, total);
++				wl_print_hex("segment vendor event", rsp, rlen);
++				goto fail;
++			}
++		} else if (m == 1 && cc_wait) {
++			if (wl_hci_wait(QCA_EDL_PATCH_CMD_OPCODE, WL_EVT_CC, rsp, &rlen, 100)) {
++				printf("SWEET BT: BT fw %s: segment %u/%u: no command complete, not waiting for them "
++				    "any more\n", what, seg + 1, total);
++				cc_wait = false;
++			} else if (rsp[0] == 0x0e && rlen >= 6 && rsp[5] != 0) {
++				printf("SWEET BT: BT fw %s: segment %u/%u: command complete status %#x\n", what,
++				    seg + 1, total, rsp[5]);
++				goto fail;
++			}
++		}
++		if (!wl_evt_drain(what)) {
++			printf("SWEET BT: BT fw %s: segment %u/%u: controller reported an error\n", what, seg + 1, total);
++			goto fail;
++		}
++		off += n;
++		seg++;
++		while (next_pct <= 100 && (uint64_t)seg * 100 >= (uint64_t)total * next_pct) {
++			printf("SWEET BT: BT fw %s: segment %u/%u (%u%%), %u/%u bytes\n", what, seg, total, next_pct,
++			    (unsigned)off, (unsigned)size);
++			next_pct += 10;
++		}
++	}
++	wl.tx_extra_us = 0;
++	printf("SWEET BT: BT fw %s: download complete, last segment acknowledged (%u command complete, %u other "
++	    "events along the way)\n", what, wl.ev_cc, wl.ev_other);
++	return true;
++fail:
++	wl.tx_extra_us = 0;
++	printf("SWEET BT: BT fw %s: download FAILED after %u/%u segments (%u/%u bytes)\n", what, seg, total, (unsigned)off,
++	    (unsigned)size);
++	return false;
++}
++
++/* Linux name first, then Android's file names */
++static bool
++wl_qca_fw_load(const char *name, const char *fallback, void **buf, size_t *len)
++{
++	if (sweet_bt_fw_get(name, buf, len)) {
++		printf("SWEET BT: BT fw: loaded %s (%u bytes)\n", name, (unsigned)*len);
++		return true;
++	}
++	if (strcmp(name, fallback) == 0) {
++		printf("SWEET BT: BT fw: %s not in the ADT (/arm-io/bluetooth fw-<name>)\n", name);
++		return false;
++	}
++	printf("SWEET BT: BT fw: %s not found, falling back to %s\n", name, fallback);
++	if (sweet_bt_fw_get(fallback, buf, len)) {
++		printf("SWEET BT: BT fw: loaded %s (%u bytes)\n", fallback, (unsigned)*len);
++		return true;
++	}
++	printf("SWEET BT: BT fw: %s not found either\n", fallback);
++	return false;
++}
++
++/*
++ * First command after the NVM. Linux (qca_uart_setup) sends HCI Reset (10 s timeout) right away, with
++ * QCA_IBS_DISABLED set so the host ignores IBS entirely during setup (no wake handshake, SLEEP_IND from the
++ * controller is only noted). Here: sweetbtnowake=1 (default) does the same; with sweetbtprobe=1 (default)
++ * a silent controller is probed further: for the current baud and then 115200, 3200000 and 921600 (the speed
++ * the controller may have fallen back to or switched to when the NVM applied) the Reset is tried directly
++ * and again after an explicit 0xfd wake handshake, 1.5 s each, with the raw RX bytes (sweetbtraw budget)
++ * and the flow control state logged for every step.
++ */
++static int
++wl_bt_post_nvm_reset(uint8_t *rsp, unsigned *rlen)
++{
++	static const unsigned cand[] = { 0, 115200, 3200000, 921600 };
++	unsigned first = wl.baud, div;
++	int err = ETIMEDOUT;
++
++	wl_flow_diag("after NVM");
++	if (wl.bt_rfr) {
++		wl_wr(wl.se, SE_UART_MANUAL_RFR, (1u << 31) | 1u);      /* RFR forced ready */
++		printf("SWEET BT: BT flow: RFR forced ready (sweetbtrfr=1)\n");
++		wl_flow_diag("RFR forced");
++	}
++	if (!wl.bt_probe) {
++		return wl_hci_cmd(0x0c03, NULL, 0, rsp, rlen, 10000);   /* qca_send_reset */
++	}
++	for (unsigned i = 0; i < sizeof(cand) / sizeof(cand[0]); i++) {
++		unsigned baud = cand[i] ? cand[i] : first;
++		if (i > 0 && baud == first) {
++			continue;
++		}
++		if (baud != wl.baud) {
++			if (wl_pick_row(baud, &div) < 0 || !wl_baud(baud)) {
++				printf("SWEET BT: BT probe: cannot run the UART at %u baud, skipped\n", baud);
++				continue;
++			}
++			wl.rxn = 0;
++			wl_rx_start();
++		}
++		for (unsigned wake = 0; wake < 2; wake++) {
++			wl.raw_budget = 16;
++			wl.rxn = 0;
++			wl_flow_diag(wake ? "probe, before wake" : "probe, before reset");
++			printf("SWEET BT: BT probe: HCI Reset at %u baud, %s at %u ms\n", baud,
++			    wake ? "after a 0xfd wake handshake" : "sent directly", wl_ms());
++			if (wake) {
++				wl.ibs_asleep = true;
++				wl_ibs_wake();
++			}
++			if (!wl_hci_send(0x0c03, NULL, 0)) {
++				printf("SWEET BT: BT probe: Reset TX failed\n");
++				continue;
++			}
++			err = wl_hci_wait(0x0c03, WL_EVT_CC, rsp, rlen, 1500);
++			wl_flow_diag(err ? "probe, no reply" : "probe, reply");
++			if (!err) {
++				printf("SWEET BT: BT probe: Reset answered at %u baud (%s)\n", baud,
++				    wake ? "after wake" : "direct");
++				return 0;
++			}
++		}
++	}
++	return err;
++}
++
++/*
++ * qca_uart_setup() for QCA_WCN3990 plus hci_qca.c qca_setup(). Order here:
++ * rampatch, 10 ms, NVM, HCI Reset, QCA baud change to wl.bt_baud + Read Local Version
++ * there, Read BD_ADDR. (sweetbtfast=1: baud change first, as Linux does, so the
++ * 223 kB go out at the operating speed instead of 115200.)
++ */
++static bool
++wl_bt_fw(const struct wl_qca_ver *v)
++{
++	char pname[32], nname[32];
++	void *pbuf = NULL, *nbuf = NULL;
++	size_t plen = 0, nlen = 0;
++	unsigned mode = 0, div = 0;
++	uint8_t rsp[48];
++	unsigned rlen = 0;
++	bool ok = false;
++	int err;
++
++	snprintf(pname, sizeof(pname), "crbtfw%02x.tlv", v->rom);
++	snprintf(nname, sizeof(nname), v->soc_id == QCA_WCN3991_SOC_ID ? "crnv%02xu.bin" : "crnv%02x.bin", v->rom);
++	printf("SWEET BT: BT fw: btqca.c names for WCN3990 soc_ver %#010x: qca/%s, qca/%s%s\n", v->soc_ver, pname,
++	    nname, (!strcmp(pname, WL_BT_FW_PATCH) && !strcmp(nname, WL_BT_FW_NVM)) ? " (same as the Android files)" :
++	    " (differs from the Android files crbtfw21.tlv/crnv21.bin)");
++	int oper_code = wl_qca_baud_code(wl.bt_baud);
++	if (oper_code < 0 || wl_pick_row(wl.bt_baud, &div) < 0) {
++		printf("SWEET BT: BT fw: sweetbtbaud=%u has no QCA code or no exact S3 rate: no download\n", wl.bt_baud);
++		return false;
++	}
++	if (!wl_qca_fw_load(pname, WL_BT_FW_PATCH, &pbuf, &plen) || !wl_qca_fw_load(nname, WL_BT_FW_NVM, &nbuf, &nlen)) {
++		printf("SWEET BT: BT fw: firmware files not available: no download\n");
++		goto out;
++	}
++	/* NVM baud tag: the speed the controller will find itself at after the NVM (Linux: the operating speed) */
++	unsigned dl_baud = wl.bt_fast ? wl.bt_baud : 115200;
++	if (!wl_qca_patch_check(pbuf, plen, &mode) || !wl_qca_nvm_edit(nbuf, nlen, wl_qca_baud_code(dl_baud))) {
++		goto out;
++	}
++	printf("SWEET BT: BT fw: patch version in file %#06x, in controller %#06x\n", le16((uint8_t *)pbuf + 20),
++	    v->patch_ver);
++	if (wl.bt_fast && !wl_qca_set_baud(wl.bt_baud)) {
++		goto out;
++	}
++	if (!wl_qca_send_tlv("patch", pbuf, plen, mode)) {
++		goto out;
++	}
++	wl_sleep(10);           /* "give the controller some time to get ready to receive the NVM" */
++	if (!wl_qca_send_tlv("NVM", nbuf, nlen, 0)) {
++		goto out;
++	}
++	printf("SWEET BT: BT fw: waiting %u ms after the NVM (sweetbtnvmdelay; Linux: none)\n", wl.bt_nvmdelay);
++	wl_sleep(wl.bt_nvmdelay);
++	wl.raw_budget = 40;     /* log the raw RX bytes (with timestamps) around the reset and the wake-up */
++	/*
++	 * qca_send_reset(): plain HCI Reset, HCI_INIT_TIMEOUT (10 s). Linux has no further delay after the NVM
++	 * (only the 10 ms before it). The controller restarts with the patch and may announce itself with an
++	 * IBS WAKE_IND first (boot 0124: "00 fd"), which has to be acknowledged before it sends anything.
++	 */
++	{
++		for (unsigned i = 0; i < 20; i++) {     /* up to 200 ms: let a pending WAKE_IND in and answer it */
++			wl_rx_poll();
++			wl_ibs_service();
++			wl_sleep(10);
++		}
++	}
++	err = wl_bt_post_nvm_reset(rsp, &rlen);
++	if (err) {
++		printf("SWEET BT: BT fw: HCI Reset after download: no event (%d)\n", err);
++		goto out;
++	}
++	wl_print_hex("Reset event after download", rsp, rlen);
++	wl.bt_nowake = 0;       /* setup's QCA_IBS_DISABLED ends with the reset: from here on the wake handshake applies */
++	{
++		struct wl_qca_ver nv;
++		(void)wl_qca_read_version(&nv, "version after download");
++	}
++	if (!wl.bt_fast || wl.baud != wl.bt_baud) {
++		/* the probe may have found the controller at another speed than the one we set */
++		if (wl.baud != wl.bt_baud) {
++			printf("SWEET BT: BT fw: controller is at %u baud, not %u: changing again\n", wl.baud, wl.bt_baud);
++		}
++		if (!wl_qca_set_baud(wl.bt_baud)) {
++			goto out;
++		}
++	} else if (!wl_hci_read_local_version("after download")) {
++		goto out;
++	}
++	err = wl_hci_cmd(0x1009, NULL, 0, rsp, &rlen, 1000);        /* Read_BD_ADDR */
++	if (err || rsp[0] != 0x0e || rlen < 12 || rsp[5] != 0) {
++		printf("SWEET BT: BT fw: Read BD_ADDR failed (%d)\n", err);
++		goto out;
++	}
++	printf("SWEET BT: BT fw BD_ADDR %02x:%02x:%02x:%02x:%02x:%02x\n", rsp[11], rsp[10], rsp[9], rsp[8],
++	    rsp[7], rsp[6]);
++	ok = true;
++out:
++	if (pbuf) {
++		sweet_bt_fw_put(pbuf, plen);
++	}
++	if (nbuf) {
++		sweet_bt_fw_put(nbuf, nlen);
++	}
++	return ok;
++}
++
++/* ---------------------------------------------------------------- iOS HCI transport (sweetbt=1) */
++
++#define WL_BD_DEFAULT   { 0x02, 0x00, 0x5e, 0x77, 0xb0, 0x01 }  /* tools/mkadt.py mac-address-bluetooth0 */
++#define QCA_EDL_WRITE_BD_ADDR_OPCODE    0xfc14u                 /* btqca.h EDL_WRITE_BD_ADDR_OPCODE */
++
++/* ADT /arm-io/bluetooth local-mac-address (what bluetoothd/BlueTool read), else the synthetic default */
++static void
++wl_bt_adt_bdaddr(uint8_t out[6])
++{
++	static const uint8_t def[6] = WL_BD_DEFAULT;
++	DTEntry node;
++	const void *data = NULL;
++	unsigned int size = 0;
++
++	memcpy(out, def, 6);
++	if (SecureDTLookupEntry(NULL, "/arm-io/bluetooth", &node) == kSuccess &&
++	    SecureDTGetProperty(node, "local-mac-address", &data, &size) == kSuccess && size == 6) {
++		memcpy(out, data, 6);
++		printf("SWEET BT: ADT /arm-io/bluetooth local-mac-address %02x:%02x:%02x:%02x:%02x:%02x\n", out[0],
++		    out[1], out[2], out[3], out[4], out[5]);
++	} else {
++		printf("SWEET BT: no ADT /arm-io/bluetooth local-mac-address, using %02x:%02x:%02x:%02x:%02x:%02x\n",
++		    out[0], out[1], out[2], out[3], out[4], out[5]);
++	}
++}
++
++/* Read_BD_ADDR into addr (most significant byte first) */
++static bool
++wl_bt_read_bdaddr(uint8_t addr[6])
++{
++	uint8_t rsp[48];
++	unsigned rlen = 0;
++	int err = wl_hci_cmd(0x1009, NULL, 0, rsp, &rlen, 1000);
++	if (err || rsp[0] != 0x0e || rlen < 12 || rsp[5] != 0) {
++		printf("SWEET BT: Read BD_ADDR failed (%d)\n", err);
++		return false;
++	}
++	for (unsigned i = 0; i < 6; i++) {
++		addr[i] = rsp[11 - i];
++	}
++	return true;
++}
++
++/*
++ * qca_set_bdaddr() of btqca.c: vendor 0xfc14, baswap()ed: most significant byte first, the
++ * answer is a vendor event (or a Command Complete). The ADT value is what userland believes
++ * (local-mac-address), so the controller has to report the same one in Read_BD_ADDR.
++ */
++static void
++wl_bt_set_bdaddr(const uint8_t want[6])
++{
++	uint8_t cur[6], par[6], rsp[48];
++	unsigned rlen = 0;
++	int err;
++
++	if (!wl_bt_read_bdaddr(cur)) {
++		return;
++	}
++	printf("SWEET BT: controller BD_ADDR %02x:%02x:%02x:%02x:%02x:%02x, wanted %02x:%02x:%02x:%02x:%02x:%02x\n",
++	    cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], want[0], want[1], want[2], want[3], want[4], want[5]);
++	if (!memcmp(cur, want, 6)) {
++		printf("SWEET BT: BD_ADDR already matches\n");
++		return;
++	}
++	for (unsigned i = 0; i < 6; i++) {
++		par[i] = want[i];	/* boot 0137: LSB first came back byte-reversed */
++	}
++	err = wl_hci_cmd(QCA_EDL_WRITE_BD_ADDR_OPCODE, par, 6, rsp, &rlen, 1000);
++	if (err) {
++		printf("SWEET BT: set BD_ADDR (0xfc14): no event (%d)\n", err);
++	} else {
++		wl_print_hex("set BD_ADDR (0xfc14) reply", rsp, rlen);
++	}
++	for (unsigned pass = 0; pass < 2; pass++) {
++		if (wl_bt_read_bdaddr(cur) && !memcmp(cur, want, 6)) {
++			printf("SWEET BT: BD_ADDR now %02x:%02x:%02x:%02x:%02x:%02x%s\n", cur[0], cur[1], cur[2], cur[3],
++			    cur[4], cur[5], pass ? " (after HCI Reset)" : "");
++			return;
++		}
++		if (pass == 0) {
++			/* some controllers apply the address on the next reset */
++			printf("SWEET BT: BD_ADDR not applied yet (%02x:%02x:%02x:%02x:%02x:%02x): HCI Reset and read again\n",
++			    cur[0], cur[1], cur[2], cur[3], cur[4], cur[5]);
++			(void)wl_hci_cmd(0x0c03, NULL, 0, rsp, &rlen, 3000);
++		}
++	}
++	printf("SWEET BT: BD_ADDR MISMATCH after 0xfc14: userland will see %02x:%02x:%02x:%02x:%02x:%02x from the ADT "
++	    "but the controller reports another; set BT_DEVICE_ADDRESS accordingly\n", want[0], want[1], want[2],
++	    want[3], want[4], want[5]);
++}
++
++/*
++ * RX framing for userland. One byte at a time, from wl_rx_poll() under the UART lock. IBS bytes
++ * (0xfc WAKE_ACK, 0xfd WAKE_IND, 0xfe SLEEP_IND) are only valid between packets, as in
++ * hci_qca.c; they are acted on here and never reach the socket. Everything else is framed
++ * into whole H4 packets (event 04: code, len; ACL 02: handle, len16; SCO 03: handle, len8;
++ * ISO 05: handle, len14) and passed on; an unknown type byte is dropped (resync, as the Apple
++ * readers do).
++ */
++static void
++wl_xport_feed(uint8_t b)
++{
++	static const uint8_t hdr[6] = { 0, 3, 4, 3, 2, 4 };    /* header bytes after the type byte, indexed by type: 1 cmd, 2 acl, 3 sco, 4 evt, 5 iso */
++
++	if (wl.xs_st == 0) {
++		if (b >= IBS_WAKE_ACK && b <= IBS_SLEEP_IND) {
++			if (b == IBS_SLEEP_IND) {
++				wl.ibs_asleep = true;
++				wl.ibs_sleeps++;
++			} else {
++				wl.ibs_asleep = false;
++				if (b == IBS_WAKE_IND) {
++					wl.ibs_ack_pending = true;
++				}
++			}
++			if (wl.ibs_xlog < 24) {
++				wl.ibs_xlog++;
++				printf("SWEET BT: BT IBS: RX %s (%#04x) at %u ms\n", b == IBS_WAKE_ACK ? "WAKE_ACK" :
++				    b == IBS_WAKE_IND ? "WAKE_IND" : "SLEEP_IND", b, wl_ms());
++			}
++			return;
++		}
++		if (b < 2 || b > 5) {
++			/* 0x01 (command) never comes from a controller; anything else is garbage */
++			if (wl.xs_garbage++ < 8) {
++				printf("SWEET BT: RX: byte %#04x between packets is not an H4 type, dropped\n", b);
++			}
++			return;
++		}
++		wl.xs_pkt[0] = b;
++		wl.xs_have = 1;
++		wl.xs_type = b;
++		wl.xs_total = 0;
++		wl.xs_st = 1;
++		return;
++	}
++	wl.xs_pkt[wl.xs_have++] = b;
++	if (wl.xs_st == 1 && wl.xs_have == 1u + hdr[wl.xs_type]) {
++		unsigned pl;
++		switch (wl.xs_type) {
++		case 4:  pl = wl.xs_pkt[2]; break;
++		case 3:  pl = wl.xs_pkt[3]; break;
++		case 2:  pl = wl.xs_pkt[3] | (wl.xs_pkt[4] << 8); break;
++		default: pl = (wl.xs_pkt[3] | (wl.xs_pkt[4] << 8)) & 0x3fff; break;
++		}
++		wl.xs_total = wl.xs_have + pl;
++		if (wl.xs_total > sizeof(wl.xs_pkt)) {
++			if (wl.xs_oversize++ < 8) {
++				printf("SWEET BT: RX: %u byte H4 packet (type %u) does not fit, dropped\n", wl.xs_total, wl.xs_type);
++			}
++			wl.xs_st = 0;
++			return;
++		}
++		wl.xs_st = 2;
++	}
++	if (wl.xs_st == 2 && wl.xs_have == wl.xs_total) {
++		bt_hci_rx_packet(wl.xs_pkt, wl.xs_have);
++		wl.xs_st = 0;
++	}
++}
++
++/* a TX packet from userland (the kctl send path): wake the controller if it sleeps, then transmit */
++static bool
++wl_xport_tx(const uint8_t *pkt, unsigned len)
++{
++	bool ok;
++
++	os_atomic_add(&wl.tx_waiters, 1, relaxed);
++	lck_mtx_lock(&wl_hw_lock);
++	os_atomic_sub(&wl.tx_waiters, 1, relaxed);
++	wl_ibs_service();
++	wl_ibs_wake();
++	ok = wl_tx_buf(pkt, len);
++	lck_mtx_unlock(&wl_hw_lock);
++	return ok;
++}
++
++/* termios speed request: the line stays at the speed the firmware step left it at */
++static unsigned
++wl_xport_baud(unsigned requested)
++{
++	(void)requested;
++	return wl.baud;
++}
++
++static const struct bt_hci_ops wl_xport_ops = { wl_xport_tx, wl_xport_baud };
++
++static void
++wl_sleep_us(unsigned us)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
++	(void)assert_wait_deadline(&wl.sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++wl_xport_start(void)
++{
++	uint8_t want[6];
++
++	if (wl.baud != wl.bt_baud) {
++		printf("SWEET BT: transport not started: UART is at %u baud, not %u\n", wl.baud, wl.bt_baud);
++		return false;
++	}
++	wl_bt_adt_bdaddr(want);
++	memcpy(wl.bdaddr, want, 6);
++	if (wl.bt_setaddr) {
++		wl_bt_set_bdaddr(want);
++	}
++	wl.xport = true;
++	wl.raw_budget = 0;
++	wl.ibs_xlog = 0;
++	wl.xs_st = 0;
++	wl.rxn = 0;
++	wl_rx_stop();
++	wl_flow(true);                  /* lossless at 3 Mbaud depends on RFR/CTS */
++	wl_rx_start();
++	bt_hci_register(&wl_xport_ops, wl.bt_sk, wl.bt_log);
++	printf("SWEET BT: transport up: UART %u baud, RX FIFO %u words, ring 64 KiB, IBS %s, BD_ADDR %02x:%02x:%02x:%02x:%02x:%02x\n",
++	    wl.baud, wl.rx_depth, wl.bt_ibs ? "in the NVM (handled here)" : "off in the NVM (handled here if it appears)",
++	    want[0], want[1], want[2], want[3], want[4], want[5]);
++	return true;
++}
++
++/*
++ * The RX loop, forever on the stage thread. Polled, not interrupt driven (no GENI IRQ plumbing in
++ * this tree): hardware flow control keeps it lossless. The FIFO holds rx_depth words; RFR drops at
++ * rx_depth - 2 words, so after the poll that last drained the FIFO the controller can send
++ * (rx_depth - 2) * 4 bytes before it is held off: about 190 us at 3 Mbaud (10 bits per byte) for
++ * a 16-word FIFO. While traffic flows the loop therefore polls every ~30 us; after 200 empty
++ * polls it sleeps 300 us per round (first byte of a burst waits at most that, and the FIFO plus
++ * RFR absorb it), 2 ms when no client is connected. The ring (64 KiB) only absorbs a slow
++ * userland. A line "SWEET BT: UART RX ..." every 10 s shows the measured maximum FIFO fill
++ * (max words vs depth) and FIFO error count; a FIFO error would mean the margin was exceeded.
++ */
++static void
++wl_xport_run(void)
++{
++	unsigned idle = 0, last_ms = wl_ms(), lines = 0;
++	uint64_t last_bytes = 0;
++
++	for (;;) {
++		bool got;
++		uint64_t b0;
++
++		if (os_atomic_load(&wl.tx_waiters, relaxed) > 0) {
++			wl_sleep_us(50);        /* let a transmitter take the lock */
++		}
++		lck_mtx_lock(&wl_hw_lock);
++		b0 = wl.xs_bytes;
++		wl_rx_poll();
++		wl_ibs_service();
++		got = wl.xs_bytes != b0;
++		lck_mtx_unlock(&wl_hw_lock);
++		bt_hci_rx_service();
++		idle = got ? 0 : idle + 1;
++		if (idle < 200) {
++			delay(30);
++		} else {
++			wl_sleep_us(bt_hci_connected() ? 300 : 2000);
++		}
++		if (wl_ms() - last_ms >= 10000) {
++			last_ms = wl_ms();
++			if (lines < 60 && (wl.xs_bytes != last_bytes || wl.xs_fifo_err)) {
++				lines++;
++				last_bytes = wl.xs_bytes;
++				printf("SWEET BT: UART RX %llu B in %llu polls, max burst %u B / %u FIFO words (depth %u), FIFO errors %u, "
++				    "garbage %u, IBS: sleeps %u wakes %u (failed %u)\n", wl.xs_bytes, wl.xs_polls, wl.xs_maxburst,
++				    wl.xs_maxwords, wl.rx_depth, wl.xs_fifo_err, wl.xs_garbage, wl.ibs_sleeps, wl.xs_ibs_wake,
++				    wl.xs_ibs_wake_fail);
++				bt_hci_stats_periodic(false);
++			}
++		}
++	}
++}
++
++static const struct { const char *res; unsigned mv; } wl_bt_rails[] = {
++	{ "ldoa10", 1800 }, { "ldoc1", 1800 }, { "ldoc2", 1304 }, { "ldoc10", 3312 },
++};
++
++static void
++wl_bt(void)
++{
++	uint8_t rsp[48];
++	unsigned rlen = 0, n = 0;
++	int err;
++
++	wl.rcg_row = -1;
++	if (!wl_clocks_on()) {
++		return;
++	}
++	if (!wl_gpll0_check() || !wl_rcg_save()) {
++		goto out_clocks;
++	}
++	/* pins first (Linux order: pinctrl default state, then the UART probes) */
++	if (!wl_pins_uart()) {
++		printf("SWEET BT: UART pin mux did not read back: stop\n");
++		goto out_restore;
++	}
++	wl_dump_gpio();
++	if (!wl_uart_open()) {
++		goto out_restore;
++	}
++	wl_baud_plan();
++	for (n = 0; n < sizeof(wl_bt_rails) / sizeof(wl_bt_rails[0]); n++) {
++		err = sweet_rpmh_vreg_set(wl_bt_rails[n].res, wl_bt_rails[n].mv, true);
++		printf("SWEET BT: rail %s %u mV -> %d\n", wl_bt_rails[n].res, wl_bt_rails[n].mv, err);
++		if (err) {
++			goto out_restore;
++		}
++		wl_sleep(2);
++	}
++	wl_sleep(10);
++	/* qca_regulator_init(): 2400 baud power-off pulse, then 115200 baud power-on pulse */
++	if (!wl_baud(2400)) {
++		goto out_restore;
++	}
++	wl_power_pulse(false, 2400);
++	if (!wl_baud(115200)) {
++		goto out_restore;
++	}
++	wl_power_pulse(true, 115200);
++	wl_flow(true);
++	wl_rx_poll();
++	printf("SWEET BT: after power-on pulse: %u stray RX bytes\n", wl.rxn);
++	wl.rxn = 0;
++
++	err = wl_hci_cmd(0x0c03, NULL, 0, rsp, &rlen, 1000);        /* HCI_Reset */
++	if (err) {
++		printf("SWEET BT: HCI Reset: no event (%d)\n", err);
++	} else {
++		wl_print_hex("Reset event", rsp, rlen);
++	}
++	err = wl_hci_cmd(0x1001, NULL, 0, rsp, &rlen, 1000);        /* Read_Local_Version_Information */
++	if (err) {
++		printf("SWEET BT: HCI Read Local Version: no event (%d)\n", err);
++	} else {
++		wl_print_hex("Read Local Version", rsp, rlen);
++	}
++	{
++		struct wl_qca_ver qv;
++		if (wl_qca_read_version(&qv, "patch version (product/patch/rom/soc follow the header)")) {
++			if (wl.bt_fw) {
++				bool fwok = wl_bt_fw(&qv);
++				printf("SWEET BT: BT fw %s\n", fwok ? "setup complete (patch + NVM downloaded, controller up at the "
++				    "operating baud)" : "setup FAILED or skipped (see above)");
++				if (wl.bt_hci) {
++					/* sweetbt=1: keep the chip, the UART clocks and the pins; the loop never returns */
++					if (fwok && wl_xport_start()) {
++						wl_xport_run();
++					}
++					printf("SWEET BT: transport not started (see above): normal shutdown of the stage\n");
++				}
++			} else {
++				printf("SWEET BT: BT fw: sweetbtfw=0, no download\n");
++			}
++		}
++	}
++	/*
++	 * hci_qca qca_power_off(): 2400 baud power-off pulse (the rails are NOT voted off, see below).
++	 * Only with sweetbtpoweroff=1; by default the controller stays powered (and keeps its firmware)
++	 * so it can be used later.
++	 */
++	wl_rx_stop();
++	if (wl.bt_poweroff) {
++		if (wl_baud(2400)) {
++			wl_power_pulse(false, 2400);
++			printf("SWEET BT: BT power-off pulse sent (sweetbtpoweroff=1)\n");
++		}
++	} else {
++		printf("SWEET BT: BT controller left powered (no power-off pulse; sweetbtpoweroff=1 sends it)\n");
++	}
++out_restore:
++	/*
++	 * The rails are never voted off by this stage. An APPS-DRV RPMh "off" vote also
++	 * drops any "on" vote ABL placed through this DRV: boot 0116hw panicked right
++	 * after voting ldoa7 (1.8 V) off, so something else on the board needs it
++	 * (0117 made keep=1 the default; 0118 removes the off path and sweetwlankeep).
++	 */
++	printf("SWEET BT: rails left on (%u of %u voted by this stage)\n", n,
++	    (unsigned)(sizeof(wl_bt_rails) / sizeof(wl_bt_rails[0])));
++	wl_rx_stop();
++	wl_se_clk_restore();
++	wl_rcg_restore();
++	wl_pins_restore();
++out_clocks:
++	wl_clocks_off();
++	printf("SWEET BT: bluetooth stage done\n");
++}
++
++/* ---------------------------------------------------------------- thread */
++
++static void
++wl_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	printf("SWEET BT: stage %u starts in %u s\n", wl.stage, wl.delay_s);
++	wl_sleep(wl.delay_s * 1000u);
++	if (!wl_map()) {
++		printf("SWEET BT: MMIO mapping failed\n");
++		goto out;
++	}
++	wl_dump_gcc();
++	wl_dump_gpio();
++	wl_dump_se();
++	wl_bt();
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_bt_init(void)
++{
++	unsigned stage = 0, delay_s = 30;
++	thread_t thread;
++
++	if (wl.started) {
++		return;
++	}
++	(void)PE_parse_boot_argn("sweetwlan", &stage, sizeof(stage));
++	{
++		unsigned bt = 0;
++		(void)PE_parse_boot_argn("sweetbt", &bt, sizeof(bt));
++		if (bt) {
++			stage = 2;      /* sweetbt=1 implies the BT stage */
++		}
++	}
++	if (stage != 2) {
++		return;                 /* off by default: no log line, no mapping */
++	}
++	(void)PE_parse_boot_argn("sweetwlandelay", &delay_s, sizeof(delay_s));
++	/* Bluetooth firmware (stage 2): sweetbtfw=1 (default) downloads rampatch + NVM when the files exist */
++	wl.bt_fw = 1;
++	wl.bt_baud = 3000000;           /* 3200000 is the dtsi max-speed and also has an exact S3 rate */
++	(void)PE_parse_boot_argn("sweetbtfw", &wl.bt_fw, sizeof(wl.bt_fw));
++	(void)PE_parse_boot_argn("sweetbtbaud", &wl.bt_baud, sizeof(wl.bt_baud));
++	(void)PE_parse_boot_argn("sweetbtfast", &wl.bt_fast, sizeof(wl.bt_fast));       /* 1: baud change before the download */
++	(void)PE_parse_boot_argn("sweetbtibs", &wl.bt_ibs, sizeof(wl.bt_ibs));          /* 1: Linux NVM IBS/deep-sleep bits */
++	(void)PE_parse_boot_argn("sweetbtpoweroff", &wl.bt_poweroff, sizeof(wl.bt_poweroff));
++	wl.bt_setaddr = 1;              /* sweetbt=1: program the ADT local-mac-address with 0xfc14 */
++	wl.bt_log = 64;                 /* sweetbt=1: HCI packet trace lines */
++	(void)PE_parse_boot_argn("sweetbt", &wl.bt_hci, sizeof(wl.bt_hci));             /* 1: keep the controller, serve com.apple.uart.bluetooth */
++	(void)PE_parse_boot_argn("sweetbtsk", &wl.bt_sk, sizeof(wl.bt_sk));             /* 1: also register com.apple.uart.sk.bluetooth */
++	(void)PE_parse_boot_argn("sweetbtlog", &wl.bt_log, sizeof(wl.bt_log));
++	(void)PE_parse_boot_argn("sweetbtaddr", &wl.bt_setaddr, sizeof(wl.bt_setaddr));
++	wl.bt_nvmdelay = 10;            /* ms after the NVM; Linux: 0 (10 ms only between patch and NVM) */
++	wl.bt_probe = 1;                /* silent after the NVM: try 115200/3200000/921600, with and without wake */
++	wl.bt_nowake = 1;               /* Linux QCA_IBS_DISABLED during setup: no 0xfd wake before commands */
++	(void)PE_parse_boot_argn("sweetbtnvmdelay", &wl.bt_nvmdelay, sizeof(wl.bt_nvmdelay));
++	(void)PE_parse_boot_argn("sweetbtprobe", &wl.bt_probe, sizeof(wl.bt_probe));
++	(void)PE_parse_boot_argn("sweetbtnowake", &wl.bt_nowake, sizeof(wl.bt_nowake));
++	(void)PE_parse_boot_argn("sweetbtrfr", &wl.bt_rfr, sizeof(wl.bt_rfr));          /* 1: force RFR ready after the NVM */
++	(void)PE_parse_boot_argn("sweetbtnoflow", &wl.bt_noflow, sizeof(wl.bt_noflow)); /* 1: ignore CTS (no hw flow control) */
++	wl.started = true;
++	wl.stage = stage;
++	wl.delay_s = delay_s;
++	if (kernel_thread_start(wl_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET BT: kernel_thread_start failed\n");
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_bt_hci.c b/bsd/dev/sweet_bt_hci.c
+new file mode 100644
+index 0000000..17ee0ff
+--- /dev/null
++++ b/bsd/dev/sweet_bt_hci.c
+@@ -0,0 +1,760 @@
++/*
++ * Poco F1 (beryllium) Bluetooth HCI transport for iOS userland.
++ *
++ * What bluetoothd (BT_HCI_TRANSPORT=H4BC:POSIX:com.apple.uart.bluetooth,3000000) and BlueTool
++ * open on A11: a PF_SYSTEM / SYSPROTO_CONTROL SOCK_STREAM socket on the kernel control
++ * "com.apple.uart.bluetooth", read and written as a plain H4 byte stream, termios through
++ * get/setsockopt(SYSPROTO_CONTROL, TIOCGETA = 0x40487413 / TIOCSETA = 0x80487414, struct termios).
++ * docs/BT_IOS_TRANSPORT.md has the evidence.
++ *
++ * The chip side lives in bsd/dev/beryllium_wlan.c (power, firmware, UART, in-band sleep). It hands
++ * this file complete, IBS-free H4 packets (bt_hci_rx_packet) and takes complete H4 packets to
++ * transmit (struct bt_hci_ops.tx); this file owns the 64 KiB RX ring, the kctl and the termios
++ * answers. Off by default: only registered by the BT stage when boot-arg sweetbt=1 and the
++ * controller came up (sweetwlan=2).
++ *
++ * Lock order: the UART lock (beryllium_wlan.c) is taken before bt.lock; nothing here calls into
++ * the socket layer with either held (ctl_enqueuedata is called with neither).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/kern_control.h>
++#include <sys/kpi_mbuf.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <libkern/libkern.h>
++#include <machine/atomic.h>
++#include <pexpert/pexpert.h>
++
++struct bt_hci_ops {
++	bool (*tx)(const uint8_t *pkt, unsigned len);   /* one complete H4 packet to the UART (wakes the controller) */
++	unsigned (*baud)(unsigned requested);           /* termios speed request: returns the speed in effect */
++};
++
++void bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_budget);
++void bt_hci_rx_packet(const uint8_t *pkt, unsigned len);
++void bt_hci_rx_service(void);
++void bt_hci_stats_periodic(bool force);
++bool bt_hci_connected(void);
++
++#define BT_CTL_NAME     "com.apple.uart.bluetooth"
++#define BT_CTL_NAME_SK  "com.apple.uart.sk.bluetooth"
++#define BT_RING_SIZE    65536u          /* RX ring: 218 ms of a saturated 3 Mbaud line */
++#define BT_RING_MASK    (BT_RING_SIZE - 1)
++#define BT_STAGE_SIZE   4096u           /* bytes per ctl_enqueuedata */
++#define BT_PKT_MAX      4100u           /* 1 + 4 + 4095: enough for ACL (1021 classic / 251 LE) and events */
++#define BT_CTL_RECV     (128u * 1024)
++#define BT_CTL_SEND     (64u * 1024)
++
++#define BT_TIOCGETA     0x40487413u     /* _IOR('t', 19, struct termios), what bluetoothd/BlueTool pass as the option name */
++#define BT_TIOCSETA     0x80487414u     /* _IOW('t', 20, ...) */
++#define BT_TIOCSETAW    0x80487415u
++#define BT_TIOCSETAF    0x80487416u
++#define BT_CRTSCTS      0x30000ul       /* CCTS_OFLOW | CRTS_IFLOW */
++
++/* Darwin LP64 struct termios (72 bytes): tcflag_t / speed_t are unsigned long */
++struct bt_termios {
++	unsigned long c_iflag, c_oflag, c_cflag, c_lflag;
++	unsigned char c_cc[20];
++	unsigned long c_ispeed, c_ospeed;
++};
++_Static_assert(sizeof(struct bt_termios) == 72, "struct termios size");
++
++static LCK_GRP_DECLARE(bt_grp, "sweet_bt_hci");
++static LCK_MTX_DECLARE(bt_lock, &bt_grp);
++
++static struct {
++	const struct bt_hci_ops *ops;
++	kern_ctl_ref ref[2];
++	unsigned nref;
++	bool up;                        /* ctl registered */
++	bool connected;
++	kern_ctl_ref conn_ref;
++	uint32_t conn_unit;
++	unsigned epoch;                 /* bumped on connect: a flush that raced a reset must not advance rd */
++	uint32_t rd, wr;                /* free-running ring counters */
++	unsigned log_budget;
++	/* TX framer (userland writes are a byte stream; the UART gets whole packets) */
++	uint8_t txb[BT_PKT_MAX];
++	unsigned txn, txtotal;
++	struct bt_termios tio;
++	/* statistics */
++	unsigned ring_peak, rx_pkts, rx_drop_pkts, rx_drop_nc, enq_fail, enq_ok;
++	uint64_t rx_bytes, tx_bytes;
++	unsigned tx_pkts, tx_fail, tx_garbage, tios_get, tios_set, baud_req_ignored;
++	unsigned connects;
++	unsigned last_rx_pkts, last_tx_pkts;
++	unsigned compat, compat_fixed, compat_local, err_budget;       /* sweetbtcompat; rewritten / kernel-answered commands */
++} bt;
++
++static uint8_t bt_ring[BT_RING_SIZE];
++static uint8_t bt_stage[BT_STAGE_SIZE];         /* only the single consumer (RX thread) uses it */
++
++/* ------------------------------------------------------------ logging */
++
++static const char *
++bt_h4_name(uint8_t t)
++{
++	switch (t) {
++	case 1:  return "cmd";
++	case 2:  return "acl";
++	case 3:  return "sco";
++	case 4:  return "evt";
++	case 5:  return "iso";
++	default: return "???";
++	}
++}
++
++static void
++bt_log_pkt(const char *dir, const uint8_t *p, unsigned n)
++{
++	char hex[3 * 16 + 1];
++	unsigned o = 0, i;
++
++	if (bt.log_budget == 0) {
++		return;
++	}
++	bt.log_budget--;
++	for (i = 0; i < n && i < 16; i++) {
++		o += (unsigned)snprintf(hex + o, sizeof(hex) - o, "%02x ", p[i]);
++	}
++	if (p[0] == 1 && n >= 4) {
++		printf("SWEET BT: %s cmd opcode %#06x plen %u (%u bytes): %s\n", dir, p[1] | (p[2] << 8), p[3], n, hex);
++	} else if (p[0] == 4 && n >= 3) {
++		printf("SWEET BT: %s evt %#04x plen %u (%u bytes): %s\n", dir, p[1], p[2], n, hex);
++	} else {
++		printf("SWEET BT: %s %s (%u bytes): %s\n", dir, bt_h4_name(p[0]), n, hex);
++	}
++}
++
++/* ------------------------------------------------------------ RX: UART -> ring -> socket */
++
++bool
++bt_hci_connected(void)
++{
++	return os_atomic_load(&bt.connected, relaxed);
++}
++
++/*
++ * bluetoothd's HCI init (OI stack) treats any failed command as fatal ("HCI initialization
++ * failed"; with 0238+0239 v2 a SIGABRT in Stack_Init). The WCN3990 answers Command Complete with
++ * status 0x01 (Unknown HCI Command) to commands Apple's Broadcom controllers know: the Broadcom
++ * vendor commands of bluetoothd's bcm_vsc.c (0xfce2, 0xfce9, 0xfd47, 0xfd48 on boot
++ * combo2-0240b-bt0239v2). sweetbtcompat=1 turns such an answer into success for standard
++ * commands (OGF != 0x3f), =2 (default) also for vendor commands: the reply then has no return
++ * parameters, which bcm_vsc.c's sub-opcode checker accepts (it returns true on an empty reply);
++ * a read that needs its parameters still fails in bluetoothd and shows up in the log. Every rewrite and every other non-zero status is logged (own budget), so the
++ * next missing command shows up even after the packet trace budget is spent.
++ */
++#define BT_COMPAT_PAD   16u             /* parameter bytes in a rewritten Command Complete */
++
++/* First parameter byte of the last few commands sent, by opcode (for rewritten replies). */
++static struct { uint16_t op; uint8_t p0; } bt_last_cmd[8];
++static unsigned bt_last_cmd_next;
++
++static void
++bt_cmd_note(const uint8_t *cmd, unsigned len)
++{
++	const unsigned n = sizeof(bt_last_cmd) / sizeof(bt_last_cmd[0]);
++	unsigned op, i;
++
++	if (len < 4 || cmd[0] != 1) {
++		return;
++	}
++	op = cmd[1] | (cmd[2] << 8);
++	for (i = 0; i < n && bt_last_cmd[i].op != op; i++) {
++	}
++	if (i == n) {                   /* one slot per opcode: the newest command wins */
++		i = bt_last_cmd_next++ % n;
++	}
++	bt_last_cmd[i].op = (uint16_t)op;
++	bt_last_cmd[i].p0 = cmd[3] != 0 && len >= 5 ? cmd[4] : 0;
++}
++
++static unsigned
++bt_cmd_param0(unsigned op)
++{
++	for (unsigned i = 0; i < sizeof(bt_last_cmd) / sizeof(bt_last_cmd[0]); i++) {
++		if (bt_last_cmd[i].op == op) {
++			return bt_last_cmd[i].p0;
++		}
++	}
++	return 0;
++}
++
++/*
++ * Command watchdog. Boot combo6-0244-bt0239v4: the WCN3990 never answered 0xfce9 sub-opcode 1
++ * (Broadcom LE Meta Enable Features, while it answers the other 0xfce9 sub-opcodes with 0x01), and
++ * bluetoothd gave up: "BD_VSC_LE_META_ENA_FEATURES timedout waiting for controller", "Notifying BT
++ * Firmware Crashed", restart reason 3602. A command sent to the controller that gets neither Command
++ * Complete nor Command Status within BT_CMD_WATCHDOG_MS is answered here like a rewritten one
++ * (success, first parameter byte + zeros). Only one command is tracked (bluetoothd keeps one in
++ * flight: Num_HCI_Command_Packets 1); a late real answer just arrives as an extra event.
++ */
++#define BT_CMD_WATCHDOG_MS      800u
++
++static struct {
++	uint16_t op;
++	uint8_t p0;
++	bool on;
++	uint64_t t;             /* mach_absolute_time of the transmit */
++} bt_pend;
++static unsigned bt_watchdog_fired;
++
++static void
++bt_pend_set(const uint8_t *cmd, unsigned len)
++{
++	if (len >= 4 && cmd[0] == 1) {
++		bt_pend.op = (uint16_t)(cmd[1] | (cmd[2] << 8));
++		bt_pend.p0 = cmd[3] != 0 && len >= 5 ? cmd[4] : 0;
++		bt_pend.t = mach_absolute_time();
++		os_atomic_store(&bt_pend.on, true, release);
++	}
++}
++
++static void
++bt_pend_answered(const uint8_t *p, unsigned len)
++{
++	unsigned op;
++
++	if (len < 7 || p[0] != 4 || !os_atomic_load(&bt_pend.on, acquire)) {
++		return;
++	}
++	if (p[1] == 0x0e) {
++		op = p[4] | (p[5] << 8);
++	} else if (p[1] == 0x0f) {
++		op = p[5] | (p[6] << 8);
++	} else {
++		return;
++	}
++	if (op == bt_pend.op) {
++		os_atomic_store(&bt_pend.on, false, relaxed);
++	}
++}
++
++static void
++bt_pend_check(void)
++{
++	uint64_t ns;
++	uint8_t ev[7 + 16];
++	unsigned i;
++
++	if (!bt.compat || !os_atomic_load(&bt_pend.on, acquire)) {
++		return;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - bt_pend.t, &ns);
++	if (ns < (uint64_t)BT_CMD_WATCHDOG_MS * 1000000ull) {
++		return;
++	}
++	os_atomic_store(&bt_pend.on, false, relaxed);
++	ev[0] = 4;
++	ev[1] = 0x0e;
++	ev[2] = 4 + 16;
++	ev[3] = 1;
++	ev[4] = (uint8_t)bt_pend.op;
++	ev[5] = (uint8_t)(bt_pend.op >> 8);
++	ev[6] = 0;
++	ev[7] = bt_pend.p0;
++	for (i = 8; i < sizeof(ev); i++) {
++		ev[i] = 0;
++	}
++	bt_watchdog_fired++;
++	printf("SWEET BT: compat: opcode %#06x (OGF %#x OCF %#05x, first parameter %#04x) not answered by the controller "
++	    "within %u ms, answered as success by the kernel (%u so far)\n", bt_pend.op, bt_pend.op >> 10,
++	    bt_pend.op & 0x3ff, bt_pend.p0, BT_CMD_WATCHDOG_MS, bt_watchdog_fired);
++	bt_hci_rx_packet(ev, sizeof(ev));
++}
++
++/*
++ * Commands bluetoothd's init sends unconditionally and fails on when the controller does not list
++ * them (Read Local Supported Commands): { opcode, octet, bit } of the supported-commands mask. They
++ * are answered here with success and never reach the WCN3990. Boot 2026-10-24 combo-0240b-bt0239:
++ * mask octet 18 = 0x83, so bit 3 (Write Default Erroneous Data Reporting) was clear and the OI stack
++ * failed locally: "OI_HCICMD_WriteDefaultErroneousDataReporting (status=628)", "HCI initialization
++ * failed", restart reason 108, without sending the command.
++ */
++static const struct { uint16_t op; uint8_t octet, bit; } bt_local_cmds[] = {
++	{ 0x0c5b, 18, 3 },      /* Write Default Erroneous Data Reporting */
++};
++
++static bool
++bt_hci_local_answer(const uint8_t *cmd, unsigned len)
++{
++	unsigned op, i;
++	uint8_t ev[7];
++
++	if (!bt.compat || len < 4 || cmd[0] != 1) {
++		return false;
++	}
++	op = cmd[1] | (cmd[2] << 8);
++	for (i = 0; i < sizeof(bt_local_cmds) / sizeof(bt_local_cmds[0]); i++) {
++		if (bt_local_cmds[i].op == op) {
++			break;
++		}
++	}
++	if (i == sizeof(bt_local_cmds) / sizeof(bt_local_cmds[0])) {
++		return false;
++	}
++	ev[0] = 4;
++	ev[1] = 0x0e;                   /* Command Complete */
++	ev[2] = 4;
++	ev[3] = 1;                      /* Num_HCI_Command_Packets */
++	ev[4] = cmd[1];
++	ev[5] = cmd[2];
++	ev[6] = 0;                      /* success */
++	bt.compat_local++;
++	printf("SWEET BT: compat: opcode %#06x answered by the kernel (not sent to the controller, %u so far)\n",
++	    op, bt.compat_local);
++	bt_hci_rx_packet(ev, sizeof(ev));
++	return true;
++}
++
++static unsigned
++bt_hci_compat(uint8_t *p, unsigned len)
++{
++	unsigned op, st;
++
++	if (len < 7 || p[0] != 4) {
++		return len;
++	}
++	if (p[1] == 0x0e) {                     /* Command Complete: 04 0e plen ncmd op op status */
++		op = p[4] | (p[5] << 8);
++		st = p[6];
++	} else if (p[1] == 0x0f) {              /* Command Status: 04 0f plen status ncmd op op */
++		op = p[5] | (p[6] << 8);
++		st = p[3];
++	} else {
++		return len;
++	}
++	if (st == 0) {
++		if (bt.compat && p[1] == 0x0e && op == 0x1002 && len >= 7 + 64) {
++			/* Read Local Supported Commands: list the commands answered by bt_hci_local_answer */
++			for (unsigned i = 0; i < sizeof(bt_local_cmds) / sizeof(bt_local_cmds[0]); i++) {
++				uint8_t *b = &p[7 + bt_local_cmds[i].octet];
++				uint8_t was = *b;
++
++				*b |= (uint8_t)(1u << bt_local_cmds[i].bit);
++				printf("SWEET BT: compat: supported commands octet %u %#04x -> %#04x (opcode %#06x)\n",
++				    bt_local_cmds[i].octet, was, *b, bt_local_cmds[i].op);
++			}
++		}
++		return len;
++	}
++	if (bt.compat && p[1] == 0x0e && st == 0x0c &&
++	    (op == 0x2006 || op == 0x2007 || op == 0x200a || op == 0x200b || op == 0x200c)) {
++		/*
++		 * Command Disallowed for an LE command that changes or reads state the controller is busy
++		 * with: Set Advertising Parameters / Read Advertising Channel Tx Power / Set Advertising
++		 * Enable / Set Scan Parameters / Set Scan Enable while advertising or scanning. Apple's
++		 * Broadcom firmware accepts these; the WCN3990 follows the spec. Boot combo8: bluetoothd
++		 * sets new scan parameters while its first passive scan runs, gets 0x0c, logs "Could not
++		 * start LE scan (leScanParamsLPCoreCb): STATUS 712" and restarts (reason 712). Answered as
++		 * success, return parameters (if any) kept as they are: the running scan or advertising
++		 * simply keeps its previous parameters.
++		 */
++		p[6] = 0;
++		bt.compat_fixed++;
++		printf("SWEET BT: compat: LE opcode %#06x Command Disallowed by the controller, answered as success (%u so far)\n",
++		    op, bt.compat_fixed);
++		return len;
++	}
++	if (bt.compat && p[1] == 0x0e && len == 7 && op != 0 &&
++	    st == 0x01 && ((op >> 10) != 0x3f || bt.compat >= 2)) {
++		/*
++		 * Success instead of Unknown HCI Command (0x01), or Command Disallowed (0x0c) for LE Read
++		 * Advertising Physical Channel Tx Power. bluetoothd's reply parsers read return
++		 * parameters on success: bcm_vsc.c's sub-opcode checker compares the first byte with the
++		 * command's sub-opcode (its first parameter), _BCM_CreateMultiAdvInstParser (0xfd48) reads a
++		 * 1-byte instance, LE 0x2007 a 1-byte Tx power; the generic status-only parser ignores the
++		 * rest. So the reply carries the command's first parameter byte followed by zeros
++		 * (BT_COMPAT_PAD bytes in all). Boot combo5-0243-bt0239v3: an empty success for 0xfd48
++		 * tripped "ByteStream_NumReadBytesAvail(*pBs) >= 1" (abort in bcm_vsc.c:827).
++		 */
++		/*
++		 * The sub-opcode byte must be the one of the command this answers: bcm_vsc.c matches
++		 * 0xfce9/0xfd23 replies to their pending command by it. Combo7: an older 0xfce9 entry gave
++		 * 0x32 instead of 0x01 for LE Meta Enable Features, its completion never ran and
++		 * bluetoothd restarted after 15 s ("timedout waiting for controller", reason 3602).
++		 */
++		unsigned i, p0 = op == bt_pend.op ? bt_pend.p0 : bt_cmd_param0(op);
++
++		p[2] = 4 + BT_COMPAT_PAD;
++		p[6] = 0;
++		p[7] = (uint8_t)p0;
++		for (i = 1; i < BT_COMPAT_PAD; i++) {
++			p[7 + i] = 0;
++		}
++		bt.compat_fixed++;
++		printf("SWEET BT: compat: opcode %#06x (OGF %#x OCF %#05x) status %#04x from the controller, answered as success "
++		    "with %u parameter bytes (first %#04x) (%u so far)\n", op, op >> 10, op & 0x3ff, st, BT_COMPAT_PAD, p0,
++		    bt.compat_fixed);
++		return 7 + BT_COMPAT_PAD;
++	}
++	if (bt.err_budget) {
++		bt.err_budget--;
++		printf("SWEET BT: %s for opcode %#06x (OGF %#x OCF %#05x): status %#04x\n",
++		    p[1] == 0x0e ? "Command Complete" : "Command Status", op, op >> 10, op & 0x3ff, st);
++	}
++	return len;
++}
++
++/* Called by the UART RX path (under the UART lock) with one complete, IBS-free H4 packet. */
++void
++bt_hci_rx_packet(const uint8_t *pkt, unsigned len)
++{
++	uint8_t ev[3 + 255];
++	unsigned used, i;
++
++	if (!os_atomic_load(&bt.connected, relaxed)) {
++		bt.rx_drop_nc++;
++		return;
++	}
++	if (pkt[0] == 4 && len >= 7 && len <= 3 + 255 && (pkt[1] == 0x0e || pkt[1] == 0x0f)) {
++		bt_pend_answered(pkt, len);
++		/* Command Complete / Status: bt_hci_compat may rewrite it (and make it longer) */
++		for (i = 0; i < len; i++) {
++			ev[i] = pkt[i];
++		}
++		len = bt_hci_compat(ev, len);
++		pkt = ev;
++	}
++	lck_mtx_lock(&bt_lock);
++	used = bt.wr - bt.rd;
++	if (BT_RING_SIZE - used < len) {
++		bt.rx_drop_pkts++;              /* whole packets only: the H4 framing must survive */
++		lck_mtx_unlock(&bt_lock);
++		return;
++	}
++	for (i = 0; i < len; i++) {
++		bt_ring[(bt.wr + i) & BT_RING_MASK] = pkt[i];
++	}
++	bt.wr += len;
++	if (used + len > bt.ring_peak) {
++		bt.ring_peak = used + len;
++	}
++	bt.rx_pkts++;
++	bt.rx_bytes += len;
++	bt_log_pkt("RX", pkt, len);
++	lck_mtx_unlock(&bt_lock);
++}
++
++/*
++ * Called by the RX thread every iteration, without the UART lock. Moves ring bytes into the
++ * socket. A full socket buffer (userland slow) is plain flow control: the bytes stay in the
++ * ring and the next call retries; if the ring itself fills, whole packets are dropped above.
++ */
++void
++bt_hci_rx_service(void)
++{
++	bt_pend_check();
++	for (unsigned loops = 0; loops < 16; loops++) {
++		kern_ctl_ref ref;
++		uint32_t unit, rd;
++		unsigned n, ep, i;
++		errno_t err;
++
++		lck_mtx_lock(&bt_lock);
++		if (!bt.connected) {
++			lck_mtx_unlock(&bt_lock);
++			return;
++		}
++		ref = bt.conn_ref;
++		unit = bt.conn_unit;
++		ep = bt.epoch;
++		rd = bt.rd;
++		n = bt.wr - rd;
++		if (n > BT_STAGE_SIZE) {
++			n = BT_STAGE_SIZE;
++		}
++		for (i = 0; i < n; i++) {
++			bt_stage[i] = bt_ring[(rd + i) & BT_RING_MASK];
++		}
++		lck_mtx_unlock(&bt_lock);
++		if (n == 0) {
++			return;
++		}
++		err = ctl_enqueuedata(ref, unit, bt_stage, n, 0);
++		if (err != 0) {
++			bt.enq_fail++;          /* ENOBUFS: socket buffer full, retry next round */
++			return;
++		}
++		bt.enq_ok++;
++		lck_mtx_lock(&bt_lock);
++		if (bt.epoch == ep) {
++			bt.rd = rd + n;
++		}
++		lck_mtx_unlock(&bt_lock);
++	}
++}
++
++/* ------------------------------------------------------------ TX: socket -> H4 framer -> UART */
++
++static unsigned
++bt_tx_hdrlen(uint8_t type)
++{
++	switch (type) {
++	case 1:  return 3;      /* opcode, plen */
++	case 2:  return 4;      /* handle, dlen16 */
++	case 3:  return 3;      /* handle, dlen8 */
++	case 5:  return 4;      /* handle, dlen14 */
++	default: return 0;
++	}
++}
++
++static unsigned
++bt_tx_paylen(const uint8_t *p)
++{
++	switch (p[0]) {
++	case 1:  return p[3];
++	case 2:  return p[3] | (p[4] << 8);
++	case 3:  return p[3];
++	default: return (p[3] | (p[4] << 8)) & 0x3fff;
++	}
++}
++
++static void
++bt_tx_feed(const uint8_t *p, size_t n)
++{
++	for (size_t i = 0; i < n; i++) {
++		uint8_t b = p[i];
++
++		if (bt.txn == 0) {
++			if (bt_tx_hdrlen(b) == 0) {
++				if (bt.tx_garbage++ < 8) {
++					printf("SWEET BT: TX: byte %#04x is not an H4 packet type, dropped\n", b);
++				}
++				continue;
++			}
++			bt.txtotal = 0;
++		}
++		bt.txb[bt.txn++] = b;
++		if (bt.txtotal == 0 && bt.txn == 1 + bt_tx_hdrlen(bt.txb[0])) {
++			bt.txtotal = bt.txn + bt_tx_paylen(bt.txb);
++			if (bt.txtotal > sizeof(bt.txb)) {
++				printf("SWEET BT: TX: %s packet of %u bytes does not fit, dropped\n", bt_h4_name(bt.txb[0]),
++				    bt.txtotal);
++				bt.txn = bt.txtotal = 0;
++				continue;
++			}
++		}
++		if (bt.txtotal != 0 && bt.txn == bt.txtotal) {
++			bt_log_pkt("TX", bt.txb, bt.txn);
++			bt_cmd_note(bt.txb, bt.txn);
++			if (bt_hci_local_answer(bt.txb, bt.txn)) {
++				bt.tx_pkts++;
++			} else if ((bt_pend_set(bt.txb, bt.txn), bt.ops->tx(bt.txb, bt.txn))) {
++				bt.tx_pkts++;
++				bt.tx_bytes += bt.txn;
++			} else {
++				bt.tx_fail++;
++				printf("SWEET BT: TX: UART transmit of a %s packet (%u bytes) failed\n",
++				    bt_h4_name(bt.txb[0]), bt.txn);
++			}
++			bt.txn = bt.txtotal = 0;
++		}
++	}
++}
++
++static errno_t
++bt_ctl_send(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, mbuf_t m, int flags)
++{
++#pragma unused(ref, unit, unitinfo, flags)
++	mbuf_t seg;
++
++	for (seg = m; seg != NULL; seg = mbuf_next(seg)) {
++		size_t len = mbuf_len(seg);
++		if (len != 0) {
++			bt_tx_feed((const uint8_t *)mbuf_data(seg), len);
++		}
++	}
++	mbuf_freem(m);
++	return 0;
++}
++
++/* ------------------------------------------------------------ connect / disconnect / termios */
++
++static errno_t
++bt_ctl_connect(kern_ctl_ref ref, struct sockaddr_ctl *sac, void **unitinfo)
++{
++	lck_mtx_lock(&bt_lock);
++	if (bt.connected) {
++		lck_mtx_unlock(&bt_lock);
++		printf("SWEET BT: connect refused: already connected (unit %u)\n", bt.conn_unit);
++		return EBUSY;
++	}
++	bt.connected = true;
++	bt.conn_ref = ref;
++	bt.conn_unit = sac->sc_unit;
++	bt.rd = bt.wr = 0;
++	bt.epoch++;
++	bt.txn = bt.txtotal = 0;
++	bt.connects++;
++	lck_mtx_unlock(&bt_lock);
++	*unitinfo = &bt;
++	printf("SWEET BT: client connected (ctl id %u unit %u)\n", sac->sc_id, sac->sc_unit);
++	return 0;
++}
++
++static errno_t
++bt_ctl_disconnect(kern_ctl_ref ref, u_int32_t unit, void *unitinfo)
++{
++#pragma unused(ref, unitinfo)
++	lck_mtx_lock(&bt_lock);
++	if (bt.connected && bt.conn_unit == unit) {
++		bt.connected = false;
++		bt.rd = bt.wr = 0;
++		bt.epoch++;
++		bt.txn = bt.txtotal = 0;
++	}
++	lck_mtx_unlock(&bt_lock);
++	printf("SWEET BT: client disconnected (unit %u)\n", unit);
++	bt_hci_stats_periodic(true);
++	return 0;
++}
++
++static errno_t
++bt_ctl_setopt(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, int opt, void *data, size_t len)
++{
++#pragma unused(ref, unit, unitinfo)
++	switch ((unsigned)opt) {
++	case BT_TIOCSETA:
++	case BT_TIOCSETAW:
++	case BT_TIOCSETAF: {
++		struct bt_termios t;
++		unsigned actual;
++
++		if (data == NULL || len != sizeof(t)) {
++			return EINVAL;
++		}
++		memcpy(&t, data, sizeof(t));
++		bt.tios_set++;
++		/*
++		 * The controller's speed was fixed by the vendor baud command during the firmware
++		 * step (3 Mbaud, HW flow control). Accept whatever userland asks for, keep the line as
++		 * it is and answer with the speed really in effect (the get returns it too).
++		 */
++		actual = bt.ops->baud((unsigned)t.c_ospeed);
++		if (t.c_ospeed != actual && bt.baud_req_ignored++ < 8) {
++			printf("SWEET BT: termios set: requested %lu baud, line stays at %u\n", t.c_ospeed, actual);
++		}
++		if (!(t.c_cflag & BT_CRTSCTS) && bt.baud_req_ignored < 8) {
++			printf("SWEET BT: termios set: hardware flow control off requested, kept on\n");
++		}
++		if (bt.tios_set <= 4) {
++			printf("SWEET BT: termios set (opt %#x): iflag %#lx oflag %#lx cflag %#lx lflag %#lx speed %lu/%lu\n",
++			    (unsigned)opt, t.c_iflag, t.c_oflag, t.c_cflag, t.c_lflag, t.c_ispeed, t.c_ospeed);
++		}
++		t.c_ispeed = t.c_ospeed = actual;
++		t.c_cflag |= BT_CRTSCTS;
++		bt.tio = t;
++		return 0;
++	}
++	default:
++		return ENOTSUP;
++	}
++}
++
++static errno_t
++bt_ctl_getopt(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, int opt, void *data, size_t *len)
++{
++#pragma unused(ref, unit, unitinfo)
++	if ((unsigned)opt != BT_TIOCGETA) {
++		return ENOTSUP;
++	}
++	if (data == NULL) {
++		*len = sizeof(bt.tio);
++		return 0;
++	}
++	if (*len < sizeof(bt.tio)) {
++		return EINVAL;
++	}
++	bt.tio.c_ispeed = bt.tio.c_ospeed = bt.ops->baud(0);
++	bt.tio.c_cflag |= BT_CRTSCTS;
++	memcpy(data, &bt.tio, sizeof(bt.tio));
++	*len = sizeof(bt.tio);
++	if (bt.tios_get++ < 4) {
++		printf("SWEET BT: termios get: speed %lu cflag %#lx\n", bt.tio.c_ospeed, bt.tio.c_cflag);
++	}
++	return 0;
++}
++
++/* ------------------------------------------------------------ statistics */
++
++void
++bt_hci_stats_periodic(bool force)
++{
++	if (!bt.up) {
++		return;
++	}
++	if (!force && bt.last_rx_pkts == bt.rx_pkts && bt.last_tx_pkts == bt.tx_pkts) {
++		return;
++	}
++	bt.last_rx_pkts = bt.rx_pkts;
++	bt.last_tx_pkts = bt.tx_pkts;
++	printf("SWEET BT: HCI: rx %u pkts / %llu B (ring peak %u of %u B, dropped %u pkts full + %u not connected, "
++	    "socket full %u of %u enqueues), tx %u pkts / %llu B (%u failed, %u garbage), connects %u\n",
++	    bt.rx_pkts, bt.rx_bytes, bt.ring_peak, BT_RING_SIZE, bt.rx_drop_pkts, bt.rx_drop_nc, bt.enq_fail,
++	    bt.enq_fail + bt.enq_ok, bt.tx_pkts, bt.tx_bytes, bt.tx_fail, bt.tx_garbage, bt.connects);
++}
++
++/* ------------------------------------------------------------ registration */
++
++static errno_t
++bt_reg_one(const char *name, kern_ctl_ref *out)
++{
++	struct kern_ctl_reg r;
++
++	bzero(&r, sizeof(r));
++	strlcpy(r.ctl_name, name, sizeof(r.ctl_name));
++	r.ctl_flags = CTL_FLAG_REG_SOCK_STREAM;         /* not privileged: bluetoothd and BlueTool run as mobile */
++	r.ctl_sendsize = BT_CTL_SEND;
++	r.ctl_recvsize = BT_CTL_RECV;
++	r.ctl_connect = bt_ctl_connect;
++	r.ctl_disconnect = bt_ctl_disconnect;
++	r.ctl_send = bt_ctl_send;
++	r.ctl_setopt = bt_ctl_setopt;
++	r.ctl_getopt = bt_ctl_getopt;
++	return ctl_register(&r, out);
++}
++
++void
++bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_budget)
++{
++	errno_t err;
++
++	if (bt.up) {
++		return;
++	}
++	bt.ops = ops;
++	bt.log_budget = log_budget;
++	bt.compat = 2;
++	bt.err_budget = 64;
++	(void)PE_parse_boot_argn("sweetbtcompat", &bt.compat, sizeof(bt.compat));
++	printf("SWEET BT: compat %u (unknown commands answered as success: %s)\n", bt.compat,
++	    bt.compat >= 2 ? "standard and Broadcom vendor" : bt.compat ? "standard only" : "off");
++	/* raw mode as bluetoothd would set it (cfmakeraw, 8N1, hw flow control); the speed is filled in on get */
++	bt.tio.c_cflag = 0x38B00ul;
++	bt.tio.c_ispeed = bt.tio.c_ospeed = ops->baud(0);
++	err = bt_reg_one(BT_CTL_NAME, &bt.ref[0]);
++	printf("SWEET BT: kernel control %s registered: %d\n", BT_CTL_NAME, (int)err);
++	if (err != 0) {
++		return;
++	}
++	bt.nref = 1;
++	bt.up = true;
++	if (sk_alias) {
++		/*
++		 * Same stream under the Skywalk name. bluetoothd would still need the IOAOSSKY* socket
++		 * options for it (not implemented), so this is only useful for plain-socket clients.
++		 */
++		err = bt_reg_one(BT_CTL_NAME_SK, &bt.ref[1]);
++		printf("SWEET BT: kernel control %s registered: %d\n", BT_CTL_NAME_SK, (int)err);
++		if (err == 0) {
++			bt.nref = 2;
++		}
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index f703dfd..6e4d6d3 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -513,6 +513,49 @@ out:
+ 	return error;
+ }
+ 
++/*
++ * Bluetooth rails (bsd/dev/sweet_bt.c, sweet DT bt_wcn3990): vdd-io L10A, xtal L1C, core L2C,
++ * pa L10C, each within its DT range; voltage, HPM, then enable, like vreg_enable. Only "on":
++ * an APPS "off" vote also drops what ABL voted through this DRV (Bergamota boot 0116hw).
++ */
++int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);
++int
++sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable)
++{
++	static const struct { const char *name; unsigned min_mv, max_mv; } bt[] = {
++		{ "ldoa10", 1704, 1900 }, { "ldoc1", 1704, 1900 }, { "ldoc2", 1245, 1350 }, { "ldoc10", 3200, 3400 },
++	};
++	bool ok = false;
++	for (unsigned i = 0; res && i < sizeof(bt) / sizeof(bt[0]); i++) {
++		ok |= !strcmp(res, bt[i].name) && mv >= bt[i].min_mv && mv <= bt[i].max_mv;
++	}
++	if (!ok || !enable) {
++		printf("SWEET RPMH: BT rail vote %s %u mV %s refused\n", res ? res : "(null)", mv, enable ? "on" : "off");
++		return EPERM;
++	}
++	for (unsigned tries = 0; __atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE); tries++) {
++		if (tries >= 200) {
++			return EBUSY;
++		}
++		delay(1000);
++	}
++	int error = EIO;
++	struct rh_res found = {0};
++	if (!rh_poisoned) {
++		error = rh_map();
++		if (!error) {
++			error = rh_lookup(res, RH_VRM, &found);
++		}
++		if (!error) {
++			const uint32_t offsets[3] = {0, 8, 4};
++			const uint32_t values[3] = {mv, 7, 1};
++			error = rh_send_cmds(res, found.addr, 15u, offsets, values, 3, RH_TIMEOUT_US, NULL);
++		}
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ static bool
+ rh_arc_name(const char *res)
+ {
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index bc95207..4555c38 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -57,6 +57,7 @@ extern void sweet_touch_init(void);
+ extern void sweet_gpu_probe(void);
+ extern int sweet_native_adreno_reserve_pool(void);
+ extern void sweet_smmu_probe_start(void);
++extern void sweet_bt_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -664,6 +665,7 @@ sweet_ufs_init(void)
+ 	(void)sweet_native_adreno_reserve_pool();   /* owned-BO pool while memory is unfragmented (0147) */
+ 	sweet_pmem_init();       /* /dev/pmem (sweetpmem=1): bsd/dev/sweet_pmem.c, from ios-flame 0094 */
+ 	sweet_smmu_probe_start();   /* sweetsmmuprobe=1: BCM votes + apps SMMU ID read (0149) */
++	sweet_bt_init();         /* sweetbt=1: WCN3990 Bluetooth over QUP0 SE3, com.apple.uart.bluetooth (bsd/dev/sweet_bt.c) */
+ 	flame_wlan_init();       /* /dev/wlan, en0 + Apple80211 for wifid: bsd/dev/flame_wlan.c, from ios-flame 0123 */
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();

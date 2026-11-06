@@ -1,0 +1,104 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b7f0949..4bf04d3 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -388,6 +388,29 @@ sweet_bl_number(OSObject *object, uint64_t *out)
+ 	return true;
+ }
+ 
++static void
++sweet_bl_log(const char *process, const char *prefix, OSDictionary *dict, int depth)
++{
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
++	if (it == NULL) {
++		return;
++	}
++	while (OSSymbol *key = OSDynamicCast(OSSymbol, it->getNextObject())) {
++		OSObject *v = dict->getObject(key);
++		OSNumber *n = OSDynamicCast(OSNumber, v);
++		OSDictionary *child = OSDynamicCast(OSDictionary, v);
++		IOLog("SWEET BL: %s set %s%s %s %llu bits=%u\n", process, prefix, key->getCStringNoCopy(),
++		    v ? v->getMetaClass()->getClassName() : "null", n ? n->unsigned64BitValue() : 0ULL,
++		    n ? n->numberOfBits() : 0);
++		if (child != NULL && depth < 2) {
++			char nested[64];
++			snprintf(nested, sizeof(nested), "%s%s.", prefix, key->getCStringNoCopy());
++			sweet_bl_log(process, nested, child, depth + 1);
++		}
++	}
++	it->release();
++}
++
+ IOReturn
+ AppleARMBacklight::setProperties(OSObject *properties)
+ {
+@@ -395,23 +418,41 @@ AppleARMBacklight::setProperties(OSObject *properties)
+ 	if (dict == NULL) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	if (fLogged < 12) {
+-		/* Record the exact keys CoreBrightness/backboardd use on this build. */
++	if (fLogged < 48) {
++		/* Record the exact keys and values CoreBrightness/backboardd use. */
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+-		OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
+-		if (it != NULL) {
+-			while (OSSymbol *key = OSDynamicCast(OSSymbol, it->getNextObject())) {
+-				OSObject *v = dict->getObject(key);
+-				uint64_t n = 0;
+-				const bool numeric = sweet_bl_number(v, &n);
+-				IOLog("SWEET BL: %s setProperties key %s %s %llu\n", name, key->getCStringNoCopy(),
+-				    v ? v->getMetaClass()->getClassName() : "null", numeric ? n : 0);
+-			}
+-			it->release();
+-		}
++		sweet_bl_log(name, "", dict, 0);
+ 		++fLogged;
+ 	}
++	/* 0127 hardware: backboardd sends brightness-nits, brightness-nits-cap,
++	 * DisplayBrightness{...}, DisplayBrightnessSliderPosition, CompensationTweak. */
++	uint64_t nits = 0;
++	if (sweet_bl_number(dict->getObject("brightness-nits"), &nits) && nits) {
++		/* CoreBrightness sends nits * 65536 (IOFixed SInt32), as Bergamota 0249
++		 * also measured on iOS 18; a negative value means off. */
++		if (nits & 0x80000000ULL) {
++			nits = 0;
++		}
++		const uint64_t mnits = ((nits & 0xffffffffULL) * 1000) >> 16;
++		const uint64_t clamped = mnits > SWEET_BL_PEAK_MNITS ? SWEET_BL_PEAK_MNITS : mnits;
++		const uint32_t level = SWEET_BL_MIN + (uint32_t)((clamped * (SWEET_BL_MAX - SWEET_BL_MIN)) / SWEET_BL_PEAK_MNITS);
++		request(level, (uint32_t)((clamped * SWEET_BL_SCALE) / SWEET_BL_PEAK_MNITS));
++		return kIOReturnSuccess;
++	}
++	OSDictionary *display = OSDynamicCast(OSDictionary, dict->getObject("DisplayBrightness"));
++	uint64_t position = 0;
++	if (display != NULL && (sweet_bl_number(display->getObject("value"), &position) ||
++	    sweet_bl_number(display->getObject("brightness"), &position)) && position > 1) {
++		const uint64_t v = position > SWEET_BL_SCALE ? SWEET_BL_SCALE : position;
++		request(SWEET_BL_MIN + (uint32_t)((v * (SWEET_BL_MAX - SWEET_BL_MIN)) / SWEET_BL_SCALE), (uint32_t)v);
++		return kIOReturnSuccess;
++	}
++	if (sweet_bl_number(dict->getObject("DisplayBrightnessSliderPosition"), &position) && position > 1) {
++		const uint64_t v = position > SWEET_BL_SCALE ? SWEET_BL_SCALE : position;
++		request(SWEET_BL_MIN + (uint32_t)((v * (SWEET_BL_MAX - SWEET_BL_MIN)) / SWEET_BL_SCALE), (uint32_t)v);
++		return kIOReturnSuccess;
++	}
+ 	OSDictionary *params = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
+ 	OSDictionary *source = params != NULL ? params : dict;
+ 	uint64_t value = 0;
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+index 58f3b81..4363b60 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -35,7 +35,9 @@ struct Backend {
+  bool slot_open[4]={false,false,false,false};
+  unsigned extra_slots=3;
+ } backend;
+-enum : uint64_t {ExtraWindowStart=0x70000000,ExtraWindowBytes=0x10000000};
++/* 0x70000000.. holds the kernel's CP firmware/ring/fence (A618_CP_IOVA): the
++ * 0129 windows overlapped it and every extra BoMap was refused as Busy. */
++enum : uint64_t {ExtraWindowStart=0x80000000,ExtraWindowBytes=0x10000000};
+ /* Processes that receive a Metal device besides backboardd. AegirPoster (the
+  * configured iOS 16 wallpaper) aborts without one; sweetm2extra=0 disables. */
+ bool extra_client(const char *name)

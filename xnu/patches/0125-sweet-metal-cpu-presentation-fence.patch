@@ -1,0 +1,124 @@
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -27,8 +27,10 @@
+  NativeAdrenoStatus status;
+  NativeAdrenoAbiDeviceInfo info{};
+  int (*health)(void *)=nullptr;
+- bool published=false,opened=false,lost=false;
++ bool published=false,opened=false,lost=false,cpu_present=false;
+ } backend;
++// Release/acquire publishes the completed backend to the framebuffer workloop.
++static bool presentation_ready=false;
+ bool healthy()
+ {
+  if(backend.lost)return false;
+@@ -46,6 +48,27 @@
+  if(result) {backend.lost=true;backend.status.noteFault();}
+  return result;
+ }
++}
++/* The panel is CPU-copied, unlike a display engine that consumes a GPU fence.
++ * Hold the shared submission/VM gate across quiescence and the source copy so
++ * another submit cannot overwrite its source during the CPU read. This waits
++ * real CP fences; it never declares pending work complete. */
++extern "C" int sweet_native_adreno_cpu_present_begin()
++{
++ if(!__atomic_load_n(&presentation_ready,__ATOMIC_ACQUIRE) || !backend.cpu_present)return 0;
++ IOLockLock(backend.lock);
++ const uint64_t began=backend.clock.now_us(backend.clock.cookie);
++ const IOReturn result=quiesce();
++ static unsigned presents=0;
++ if(++presents<=4 || presents%120==0)
++  IOLog("SWEET RENDER: CPU present gate %u wait_us=%llu result=%#x\n",presents,
++    backend.clock.now_us(backend.clock.cookie)-began,result);
++ if(result) {IOLockUnlock(backend.lock);return -1;}
++ return 1;
++}
++extern "C" void sweet_native_adreno_cpu_present_end()
++{
++ IOLockUnlock(backend.lock);
+ }
+ class AGXDeviceUserClient : public IOUserClient {
+  OSDeclareDefaultStructors(AGXDeviceUserClient)
+@@ -266,6 +289,10 @@
+  } else IOLog("SWEET GLES: native A618 transport published; Metal discovery disabled for GLES boot\n");
+  provider->setProperty("model","Adreno 618");
+  provider->setProperty("NativeAdrenoABI",NativeAdrenoAbiVersion,32);
++ int present_wait=0;PE_parse_boot_argn("sweetpresentwait",&present_wait,sizeof(present_wait));
++ backend.cpu_present=mtl==2 && gles!=1 && present_wait==1;
++ __atomic_store_n(&presentation_ready,true,__ATOMIC_RELEASE);
++ if(backend.cpu_present)IOLog("SWEET RENDER: CPU presentation fence gate enabled\n");
+  backend.published=true;provider->registerService();
+  IOLog("SWEET RENDER: NativeAdreno ABI + Metal discovery published on live A618 context\n");
+  /* Metal.framework probes IOAcceleratorES once, when backboardd initializes
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -50,6 +50,9 @@
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#include "unixnu/NativeAdrenoMemory.h"
++extern "C" int sweet_native_adreno_cpu_present_begin();
++extern "C" void sweet_native_adreno_cpu_present_end();
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -355,9 +358,40 @@
+ 	}
+ }
+ 
++/* Noncoherent A618 writes need a real physical cache acquire. The ARM64
++ * IOMemoryDescriptor coherent-I/O shortcut is only a barrier on this kernel.
++ * Surface descriptors remain prepared/pinned for the retained surface's life.
++ * CIVAC preserves dirty neighbouring bytes on partially used source pages. */
++static IOReturn sweet_fb_acquire(SweetSurface *s,uint64_t first,uint64_t last)
++{
++ const uint64_t start=first&~UINT64_C(4095),end=(last+4095)&~UINT64_C(4095);
++ if(last<=first || end<last || end>s->memory->getLength())return kIOReturnBadArgument;
++ for(uint64_t offset=start;offset<end;) {
++  IOByteCount span=0;
++  const uint64_t physical=s->memory->getPhysicalSegment(offset,&span,kIOMemoryMapperNone);
++  uint64_t bytes=span<end-offset?span:end-offset;
++  if(!physical || !bytes || ((physical|bytes)&4095))return kIOReturnUnsupported;
++  const IOReturn result=NativeAdrenoMaintainPhysicalPages(physical,(size_t)bytes,NativeAdrenoCleanInvalidate);
++  if(result)return result;
++  offset+=bytes;
++ }
++ return kIOReturnSuccess;
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
++	/* RAII releases the GPU gate on every return. No framebuffer client lock
++	 * is held while waiting for GPU completion. Zero keeps early CPU boots. */
++	struct PresentGate {
++		int state;
++		PresentGate():state(sweet_native_adreno_cpu_present_begin()) {}
++		~PresentGate(){if(state>0)sweet_native_adreno_cpu_present_end();}
++	} gate;
++	if(gate.state<0) {
++		IOLockLock(fLock);fDirty=true;IOLockUnlock(fLock);
++		return; // retain the last complete panel frame after a GPU fault
++	}
+ 	uint32_t mask = get32(rec, 0x104);
+ 
+ 
+@@ -436,6 +470,17 @@
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
++		}
++		if (src != 0 && bpe == 4 && gate.state>0) {
++			const uint64_t first=(uint64_t)s->offset+(uint64_t)sy*s->bytesPerRow+(uint64_t)sx*4;
++			const IOReturn result=sweet_fb_acquire(s,first,last);
++			if(result) {
++				static unsigned refusals=0;
++				if(++refusals<=4 || refusals%120==0)
++					IOLog("SWEET FB: CPU source acquire refused result=%#x\n",result);
++				IOLockLock(fLock);fDirty=true;IOLockUnlock(fLock);
++				src=0;
++			}
+ 		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {

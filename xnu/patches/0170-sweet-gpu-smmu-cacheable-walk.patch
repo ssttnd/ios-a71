@@ -1,0 +1,35 @@
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp b/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp
+index 0d0b6f4..38a3df1 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp
+@@ -141,7 +141,10 @@ extern "C" int sweet_native_adreno_prepare_vm(const a618_smmu_io *hardware,
+  error=NativeAdrenoPrepareSmmuMemory(&state.tables,32,36,ArenaStart,ArenaBytes,0,
+      ArenaBytes/4096,&state.arena,&state.live,&state.visibility);
+  if(error)return failed("table preparation",error);
+- state.config={&state.arena.config,nullptr,&state.live.tables,nullptr,id0,id2,0x62,0,0,1,1};
++ uint32_t walk=0;
++ PE_parse_boot_argn("sweetsmmuwalk",&walk,sizeof(walk));
++ printf("SWEET ADRENO: GPU SMMU table walks %s (sweetsmmuwalk=%u)\n",walk?"cacheable (inner WBWA)":"outer non-cacheable",walk);
++ state.config={&state.arena.config,nullptr,&state.live.tables,nullptr,id0,id2,0x62,walk?1u:0u,0,1,1};
+  ArmSmmu4KProgramResult programmed{};
+  status=ArmSmmu4KProgramDisabledContext(&state.io,0,&state.config,PollBudget,&programmed);
+  if(status)return failed("context programming",(IOReturn)status);
+diff --git a/iokit/Kernel/arm/unixnu/ArmSmmu4KContext.c b/iokit/Kernel/arm/unixnu/ArmSmmu4KContext.c
+index 2977dae..30a4a32 100644
+--- a/iokit/Kernel/arm/unixnu/ArmSmmu4KContext.c
++++ b/iokit/Kernel/arm/unixnu/ArmSmmu4KContext.c
+@@ -59,10 +59,12 @@ ArmSmmu4KStatus ArmSmmu4KEncodeContext(const ArmSmmu4KContextConfig *c,
+     if(c->profile==1) {
+         if(c->id0!=0x48016605 || c->id2!=0x7511 || !c->lower || c->upper ||
+             c->lower->input_bits!=32 || c->lower->output_bits!=36 || c->asid!=0x62 ||
+-            c->coherent_walk || c->stall_on_fault || !c->continue_after_fault)return ArmSmmu4KUnsupported;
++            c->stall_on_fault || !c->continue_after_fault)return ArmSmmu4KUnsupported;
+         /* Measured0106: EPD1 with unusedTG1 zero, TTBR1zero, CFIEdisabled.
+          * The board polls faults synchronously and never enables unhandled IRQs. */
+-        v.tcr=0x802020;v.ttbr1=0;v.sctlr=0x1127;
++        /* 0170: coherent_walk=1 (boot-arg sweetsmmuwalk=1): inner-shareable write-back walks instead of outer non-cacheable ones.
++         * The tables are non-cacheable pages of ours, so the walker cannot see stale CPU lines either way. */
++        v.tcr=c->coherent_walk?0x803520:0x802020;v.ttbr1=0;v.sctlr=0x1127;
+     }
+     v.reserved_zero=0;
+     *out=v;

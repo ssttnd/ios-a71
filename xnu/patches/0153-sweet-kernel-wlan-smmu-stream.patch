@@ -1,0 +1,108 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index c393551..f703dfd 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -959,6 +959,91 @@ out:
+  * ID registers from a thread of its own, logging before each read so a stall
+  * is visible as the last line. Votes stay in place for wland's SMMU step.
+  */
++/*
++ * 0153 (sweetsmmuwlan=1): wland's smmu_wlan_identity() done here at boot,
++ * where the apps-SMMU reads work, so wland (told by the boot-arg) never
++ * touches the SMMU. Same policy: WLAN SID 0x240 mask 1 -> the lowest free SMR
++ * and a free context bank with translation off (CBAR 0x1f000 = S1 translate,
++ * S2 bypass as ABL's banks; CBA2R AArch64; SCTLR 0xe0 = fault reporting, M=0).
++ */
++#define SMMU_WLAN_SID   0x240u
++#define SMMU_WLAN_MASK  0x1u
++static bool
++smmu_sid_match(uint32_t smr, uint32_t sid, uint32_t mask)
++{
++	uint32_t id = smr & 0x7fff, m = (smr >> 16) & 0x7fff;
++	return ((id ^ sid) & ~(m | mask) & 0x7fff) == 0;
++}
++static void
++sweet_smmu_wlan_stream(volatile uint32_t *gr0, uint32_t id0, uint32_t id1)
++{
++	const uint32_t nsmr = id0 & 0xff, ncb = id1 & 0xff;
++	const uint64_t psize = (id1 >> 31) ? 0x10000 : 0x1000, npage = 1ull << (((id1 >> 28) & 7) + 1);
++	if (psize != 0x1000 || nsmr > 128 || ncb > 128 || (npage + ncb) * psize > 0x100000) {
++		printf("SWEET SMMU: WLAN stream: unexpected geometry smr=%u cb=%u page=%#llx x %llu\n", nsmr, ncb, psize, npage);
++		return;
++	}
++	volatile uint32_t *gr1 = (volatile uint32_t *)ml_io_map(0x15000000 + psize, psize);
++	if (!gr1) {
++		return;
++	}
++	uint64_t used[2] = {0, 0};
++	int slot = -1;
++	for (uint32_t i = 0; i < nsmr; i++) {
++		const uint32_t smr = gr0[(0x800 + 4 * i) / 4], s2cr = gr0[(0xc00 + 4 * i) / 4];
++		if (!(smr >> 31)) {
++			if (slot < 0) {
++				slot = (int)i;
++			}
++			continue;
++		}
++		if (((s2cr >> 16) & 3) == 0) {
++			used[(s2cr & 0xff) / 64] |= 1ull << ((s2cr & 0xff) % 64);
++		}
++		if (smmu_sid_match(smr, SMMU_WLAN_SID, SMMU_WLAN_MASK)) {
++			printf("SWEET SMMU: WLAN stream: SMR%u %#x already matches (S2CR %#x)\n", i, smr, s2cr);
++			return;
++		}
++	}
++	int cb = -1;
++	volatile uint32_t *cbp = NULL;
++	for (uint32_t c = 0; c < ncb && cb < 0; c++) {
++		if (used[c / 64] & (1ull << (c % 64)) || gr1[c] != 0) {
++			continue;
++		}
++		volatile uint32_t *page = (volatile uint32_t *)ml_io_map(0x15000000 + (npage + c) * psize, psize);
++		if (page && !(page[0] & 1)) {
++			cb = (int)c;
++			cbp = page;
++		}
++	}
++	if (slot < 0 || cb < 0) {
++		printf("SWEET SMMU: WLAN stream: no free SMR/bank (SMR %d, bank %d)\n", slot, cb);
++		return;
++	}
++	cbp[0x58 / 4] = 0xffffffff;     /* FSR clear */
++	cbp[0x20 / 4] = 0;              /* TTBR0 */
++	cbp[0x24 / 4] = 0;
++	cbp[0x30 / 4] = 0;              /* TCR */
++	cbp[0x10 / 4] = 0;              /* TCR2 */
++	cbp[0x38 / 4] = 0;              /* MAIR */
++	cbp[0x3c / 4] = 0;
++	gr1[(0x800 + 4 * cb) / 4] = 0x00000001;          /* CBA2R: AArch64 */
++	gr1[cb] = 0x0001f000;                             /* CBAR */
++	cbp[0] = 0x000000e0;                              /* SCTLR last */
++	gr0[(0xc00 + 4 * slot) / 4] = (uint32_t)cb;       /* S2CR: translate via the bank */
++	gr0[(0x800 + 4 * slot) / 4] = (1u << 31) | (SMMU_WLAN_MASK << 16) | SMMU_WLAN_SID;
++	gr0[0x70 / 4] = 0;                                /* sTLBGSYNC */
++	for (int i = 0; i < 1000 && (gr0[0x74 / 4] & 1); i++) {
++		delay(1000);
++	}
++	const uint32_t smr = gr0[(0x800 + 4 * slot) / 4], s2cr = gr0[(0xc00 + 4 * slot) / 4];
++	const bool ok = (smr >> 31) && smmu_sid_match(smr, SMMU_WLAN_SID, SMMU_WLAN_MASK) &&
++	    ((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == (uint32_t)cb;
++	printf("SWEET SMMU: WLAN %#x/%#x -> CB%d via SMR%d: SMR %#x S2CR %#x SCTLR %#x CBAR %#x -> %s\n",
++	    SMMU_WLAN_SID, SMMU_WLAN_MASK, cb, slot, smr, s2cr, cbp[0], gr1[cb], ok ? "ok" : "NOT as written");
++}
++
+ static void
+ sweet_smmu_probe_thread(void *arg, wait_result_t wr)
+ {
+@@ -979,6 +1064,11 @@ sweet_smmu_probe_thread(void *arg, wait_result_t wr)
+ 	extern uint32_t sweet_pmem_probe_read(uint64_t pa);
+ 	printf("SWEET SMMU: reading ID0 through the /dev/pmem window path next\n");
+ 	printf("SWEET SMMU: pmem-path ID0=%#x\n", sweet_pmem_probe_read(0x15000020));
++	int wlan = 0;
++	PE_parse_boot_argn("sweetsmmuwlan", &wlan, sizeof(wlan));
++	if (wlan) {
++		sweet_smmu_wlan_stream(smmu, id0, id1);
++	}
+ }
+ 
+ void sweet_smmu_probe_start(void);

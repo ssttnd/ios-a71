@@ -1,0 +1,86 @@
+diff --git a/bsd/dev/sweet_adreno_cp.h b/bsd/dev/sweet_adreno_cp.h
+--- a/bsd/dev/sweet_adreno_cp.h
++++ b/bsd/dev/sweet_adreno_cp.h
+@@ -6,9 +6,11 @@
+ #define A618_CP_SQE_OFFSET 0x4000u
+ #define A618_CP_RING_OFFSET 0xc000u
+ #define A618_CP_FENCE_OFFSET 0x14000u
++#define A618_CP_SHADOW_OFFSET (A618_CP_FENCE_OFFSET + 0x100u)
+ #define A618_CP_IOVA 0x70000000u
+ #define A618_CP_RING_IOVA (A618_CP_IOVA + 0x8000u)
+ #define A618_CP_FENCE_IOVA (A618_CP_IOVA + 0x10000u)
++#define A618_CP_SHADOW_IOVA (A618_CP_FENCE_IOVA + 0x100u)
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+diff --git a/bsd/dev/sweet_adreno_cp.c b/bsd/dev/sweet_adreno_cp.c
+--- a/bsd/dev/sweet_adreno_cp.c
++++ b/bsd/dev/sweet_adreno_cp.c
+@@ -11,6 +11,7 @@
+ #include "sweet_adreno_cp.h"
+ #define CP_RB_BASE 0x2000u
+ #define CP_RB_CNTL 0x2008u
++#define CP_RB_RPTR_ADDR 0x2010u
+ #define CP_RB_RPTR 0x2018u
+ #define CP_RB_WPTR 0x201cu
+ #define CP_SQE_CNTL 0x2020u
+@@ -74,17 +75,24 @@
+  const struct a618_dma_region *memory, const uint32_t *words, unsigned count,
+  void (*barrier)(void *), void *cookie, struct a618_cp_result *result)
+ {
+- if (result->poisoned || !count || count >= 8192) return EINVAL;
+- result->rptr = gpu->read(gpu->cookie, CP_RB_RPTR);
++ if (result->poisoned || !count || count > 8188) return EINVAL;
++ /* This SQE version requires WHERE_AM_I. Its memory shadow is the consumer
++  * position; CP_RB_RPTR is not used as completion evidence. */
++ volatile uint32_t *shadow = (volatile uint32_t *)(memory->cpu + A618_CP_SHADOW_OFFSET);
++ barrier(cookie);
++ result->rptr = *shadow;
+  if (result->rptr >= 8192 || result->wptr >= 8192) return EIO;
+  unsigned available = (result->rptr + 8192 - result->wptr - 1) % 8192;
+- if (count > available) return ENOSPC;
++ unsigned total = count + 3;
++ if (total > available) return ENOSPC;
+  volatile uint32_t *ring = (volatile uint32_t *)(memory->cpu + A618_CP_RING_OFFSET);
+  for (unsigned i = 0; i < count; ++i) ring[(result->wptr + i) % 8192] = words[i];
+- barrier(cookie);
+- result->wptr = (result->wptr + count) % 8192;
++ const uint32_t update[] = {packet7(0x62, 2), A618_CP_SHADOW_IOVA, 0};
++ for (unsigned i = 0; i < 3; ++i) ring[(result->wptr + count + i) % 8192] = update[i];
++ barrier(cookie);
++ result->wptr = (result->wptr + total) % 8192;
+  gpu->write(gpu->cookie, CP_RB_WPTR, result->wptr);
+- result->submitted += count;
++ result->submitted += total;
+  /* GMU may drop a GX write when its fence is closed: bounded retry, not a
+   * read of CP_WPTR as an assumed proof of command execution. */
+  for (unsigned us = 0; us < 1000; us += 10) {
+@@ -97,10 +105,12 @@
+  }
+  for (unsigned us = 0; us < 10000; us += 10) {
+   if (cp_fault(gpu, gmu, result)) goto failed;
+-  result->rptr = gpu->read(gpu->cookie, CP_RB_RPTR);
++  barrier(cookie);
++  result->rptr = *shadow;
++  if (result->rptr >= 8192) goto failed;
+   result->status = gpu->read(gpu->cookie, RBBM_STATUS);
+   if (result->rptr == result->wptr && !(result->status & ~1u)) {
+-   result->completed += count; return 0;
++   result->completed += total; return 0;
+   }
+   gpu->delay_us(gpu->cookie, 10);
+  }
+@@ -225,6 +235,13 @@
+  gpu->write(gpu->cookie, CP_PROTECT_CNTL, 0xb);
+  write_address(gpu, CP_SQE_INSTR_BASE, A618_CP_IOVA);
+  write_address(gpu, CP_RB_BASE, A618_CP_RING_IOVA);
++ volatile uint32_t *shadow = (volatile uint32_t *)(memory->cpu + A618_CP_SHADOW_OFFSET);
++ *shadow = 0;
++ barrier(cookie);
++ write_address(gpu, CP_RB_RPTR_ADDR, A618_CP_SHADOW_IOVA);
++ /* Reject a truncated or dropped shadow-base write before SQE starts. */
++ if (gpu->read(gpu->cookie, CP_RB_RPTR_ADDR) != A618_CP_SHADOW_IOVA ||
++     gpu->read(gpu->cookie, CP_RB_RPTR_ADDR + 4)) goto failed;
+  gpu->write(gpu->cookie, CP_RB_CNTL, (1u << 27) | (2u << 8) | 12u);
+  gpu->write(gpu->cookie, CP_SQE_CNTL, 1);
+  uint32_t init[] = {packet7(0x48, 8), 0x2f, 3, 0x20000000, 0, 0, 0, 0, 0};

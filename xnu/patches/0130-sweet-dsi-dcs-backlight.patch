@@ -1,0 +1,298 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a25116d..b7f0949 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -46,10 +46,12 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
++#include <libkern/c++/OSCollectionIterator.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
++#include <kern/thread_call.h>
+ #include <sys/proc.h>
+ #include "unixnu/NativeAdrenoMemory.h"
+ extern "C" int sweet_native_adreno_cpu_present_begin();
+@@ -94,6 +96,38 @@ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
+ class IOMobileFramebufferUserClient;
+ 
++/*
++ * Real panel brightness for the Xiaomi K6 38/0c/0a AMOLED (live FDT:
++ * bl_ctrl_dcs, levels 8..2047, DCS long write 0x51 hi lo in LP mode, sw DMA
++ * trigger). The ABL leaves DSI0 (0xae94000, dsi-ctrl-hw-v2.3) streaming in
++ * video mode. A command is queued through the controller's TPG DMA FIFO
++ * exactly as the downstream SM6150 dsi_ctrl_hw_cmn_kickoff_fifo_command():
++ * no memory fetch, so no display-SMMU mapping is involved; the command engine
++ * is enabled only for the transfer, and embedded mode sends it in blanking.
++ *
++ * iOS finds the backlight by IOPropertyMatch {backlight-control: true}
++ * (CoreBrightness BLControl, PowerLog AppleARMBacklight) and reads
++ * IODisplayParameters/brightness/{min,max,value}. setProperties() accepts
++ * brightness as a number or {value}, top level or inside IODisplayParameters,
++ * or BrightnessMilliNits, and logs what userland actually sent.
++ * sweetbl=N (8..2047) sends one level after start, as a hardware check.
++ */
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++	volatile uint32_t *fDsi;
++	IOLock        *fLock;
++	thread_call_t  fCall;
++	uint32_t       fWanted, fSent, fValue, fFailures;
++	unsigned       fLogged;
++	static void    applyCall(thread_call_param_t owner, thread_call_param_t);
++	int            sendLevel(uint32_t level);
++	void           publish(void);
++	void           request(uint32_t level, uint32_t value);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
+ class AppleCLCD : public IOMobileFramebuffer {
+ 	OSDeclareDefaultStructors(AppleCLCD);
+ 
+@@ -245,9 +279,241 @@ AppleCLCD::start(IOService *provider)
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	int backlight = 1;
++	PE_parse_boot_argn("sweetbacklight", &backlight, sizeof(backlight));
++	if (backlight) {
++		AppleARMBacklight *bl = new AppleARMBacklight;
++		if (bl == NULL || !bl->init() || !bl->attach(this) || !bl->start(this)) {
++			IOLog("SWEET BL: backlight service not started\n");
++			if (bl != NULL) {
++				bl->detach(this);
++				bl->release();
++			}
++		}
++	}
++	return true;
++}
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define SWEET_DSI0_PA           0x0ae94000ULL
++#define DSI_REG_CTRL            0x004
++#define DSI_REG_DMA_CTRL        0x03c
++#define DSI_REG_DMA_LENGTH      0x04c
++#define DSI_REG_ACK_ERR         0x068
++#define DSI_REG_DMA_TRIGGER     0x090
++#define DSI_REG_TIMEOUT_STATUS  0x0c0
++#define DSI_REG_INT_CTRL        0x110
++#define DSI_REG_TPG_CTRL        0x15c
++#define DSI_REG_TPG_DMA_DATA    0x17c
++#define DSI_REG_TPG_FIFO_RESET  0x1ec
++#define DSI_REG_VERSION         0x1f4
++#define SWEET_BL_MIN            8u
++#define SWEET_BL_MAX            2047u
++#define SWEET_BL_SCALE          65536u
++#define SWEET_BL_PEAK_MNITS     420000u   /* panel-peak-brightness 4200000 x 0.1 mnit */
++
++bool
++AppleARMBacklight::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	fLock = IOLockAlloc();
++	fCall = thread_call_allocate(&AppleARMBacklight::applyCall, this);
++	fDsi = (volatile uint32_t *)ml_io_map(SWEET_DSI0_PA, 0x400);
++	if (fLock == NULL || fCall == NULL || fDsi == NULL) {
++		return false;
++	}
++	const uint32_t ctrl = fDsi[DSI_REG_CTRL / 4], version = fDsi[DSI_REG_VERSION / 4];
++	IOLog("SWEET BL: DSI0 version=%#x ctrl=%#x dma_ctrl=%#x int=%#x\n", version, ctrl,
++	    fDsi[DSI_REG_DMA_CTRL / 4], fDsi[DSI_REG_INT_CTRL / 4]);
++	if ((ctrl & 3) != 3) {
++		IOLog("SWEET BL: DSI0 is not enabled in video mode; no backlight control\n");
++		return false;
++	}
++	/* The bootloader's level is not readable without a DCS read; report the
++	 * middle of the range until userland sets one. */
++	fValue = SWEET_BL_SCALE / 2;
++	fWanted = fSent = 0;
++	setName("backlight");
++	setProperty("backlight-control", true);
++	setProperty("DisplayStateControlSupported", false);
++	publish();
++	registerService();
++	IOLog("SWEET BL: AppleARMBacklight published (DCS 0x51, levels %u..%u)\n", SWEET_BL_MIN, SWEET_BL_MAX);
++	uint32_t test = 0;
++	if (PE_parse_boot_argn("sweetbl", &test, sizeof(test)) && test >= SWEET_BL_MIN && test <= SWEET_BL_MAX) {
++		request(test, (uint32_t)(((uint64_t)(test - SWEET_BL_MIN) * SWEET_BL_SCALE) / (SWEET_BL_MAX - SWEET_BL_MIN)));
++	}
++	return true;
++}
++
++void
++AppleARMBacklight::publish(void)
++{
++	OSDictionary *params = OSDictionary::withCapacity(1);
++	OSDictionary *brightness = OSDictionary::withCapacity(3);
++	OSNumber *min = OSNumber::withNumber(0ULL, 32);
++	OSNumber *max = OSNumber::withNumber(SWEET_BL_SCALE, 32);
++	OSNumber *value = OSNumber::withNumber(fValue, 32);
++	if (params && brightness && min && max && value) {
++		brightness->setObject("min", min);
++		brightness->setObject("max", max);
++		brightness->setObject("value", value);
++		params->setObject("brightness", brightness);
++		setProperty("IODisplayParameters", params);
++	}
++	OSSafeReleaseNULL(min);
++	OSSafeReleaseNULL(max);
++	OSSafeReleaseNULL(value);
++	OSSafeReleaseNULL(brightness);
++	OSSafeReleaseNULL(params);
++}
++
++static bool
++sweet_bl_number(OSObject *object, uint64_t *out)
++{
++	OSNumber *number = OSDynamicCast(OSNumber, object);
++	if (number == NULL) {
++		OSDictionary *dict = OSDynamicCast(OSDictionary, object);
++		number = dict != NULL ? OSDynamicCast(OSNumber, dict->getObject("value")) : NULL;
++	}
++	if (number == NULL) {
++		return false;
++	}
++	*out = number->unsigned64BitValue();
+ 	return true;
+ }
+ 
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	if (dict == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (fLogged < 12) {
++		/* Record the exact keys CoreBrightness/backboardd use on this build. */
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
++		if (it != NULL) {
++			while (OSSymbol *key = OSDynamicCast(OSSymbol, it->getNextObject())) {
++				OSObject *v = dict->getObject(key);
++				uint64_t n = 0;
++				const bool numeric = sweet_bl_number(v, &n);
++				IOLog("SWEET BL: %s setProperties key %s %s %llu\n", name, key->getCStringNoCopy(),
++				    v ? v->getMetaClass()->getClassName() : "null", numeric ? n : 0);
++			}
++			it->release();
++		}
++		++fLogged;
++	}
++	OSDictionary *params = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
++	OSDictionary *source = params != NULL ? params : dict;
++	uint64_t value = 0;
++	if (sweet_bl_number(source->getObject("brightness"), &value)) {
++		if (value > SWEET_BL_SCALE) {
++			value = SWEET_BL_SCALE;
++		}
++		const uint32_t level = SWEET_BL_MIN + (uint32_t)((value * (SWEET_BL_MAX - SWEET_BL_MIN)) / SWEET_BL_SCALE);
++		request(level, (uint32_t)value);
++		return kIOReturnSuccess;
++	}
++	if (sweet_bl_number(source->getObject("BrightnessMilliNits"), &value)) {
++		if (value > SWEET_BL_PEAK_MNITS) {
++			value = SWEET_BL_PEAK_MNITS;
++		}
++		const uint32_t level = SWEET_BL_MIN + (uint32_t)((value * (SWEET_BL_MAX - SWEET_BL_MIN)) / SWEET_BL_PEAK_MNITS);
++		request(level, (uint32_t)((value * SWEET_BL_SCALE) / SWEET_BL_PEAK_MNITS));
++		return kIOReturnSuccess;
++	}
++	return kIOReturnUnsupported;
++}
++
++/* Coalesce: only the newest level is sent, from thread context. */
++void
++AppleARMBacklight::request(uint32_t level, uint32_t value)
++{
++	IOLockLock(fLock);
++	fWanted = level;
++	fValue = value;
++	IOLockUnlock(fLock);
++	publish();
++	thread_call_enter(fCall);
++}
++
++void
++AppleARMBacklight::applyCall(thread_call_param_t owner, thread_call_param_t)
++{
++	AppleARMBacklight *bl = (AppleARMBacklight *)owner;
++	IOLockLock(bl->fLock);
++	const uint32_t level = bl->fWanted;
++	IOLockUnlock(bl->fLock);
++	if (level == 0 || level == bl->fSent || bl->fFailures >= 4) {
++		return;
++	}
++	const int error = bl->sendLevel(level);
++	if (error) {
++		++bl->fFailures;
++	} else {
++		bl->fSent = level;
++	}
++}
++
++int
++AppleARMBacklight::sendLevel(uint32_t level)
++{
++	volatile uint32_t *dsi = fDsi;
++	const uint32_t ctrl = dsi[DSI_REG_CTRL / 4];
++	if ((ctrl & 3) != 3) {
++		IOLog("SWEET BL: DSI0 left video mode (ctrl=%#x); level %u not sent\n", ctrl, level);
++		return ENODEV;
++	}
++	const uint32_t dma_ctrl = dsi[DSI_REG_DMA_CTRL / 4];
++	/* DCS long write: header {WC lsb, WC msb, data id 0x39, LAST|LONG}, then 0x51 hi lo, 0xff pad. */
++	const uint32_t words[2] = {
++		3u | (0x39u << 16) | (0xc0u << 24),
++		0x51u | ((level >> 8) << 8) | ((level & 0xff) << 16) | (0xffu << 24),
++	};
++	dsi[DSI_REG_CTRL / 4] = ctrl | (1u << 2);                       /* command engine on */
++	dsi[DSI_REG_INT_CTRL / 4] = dsi[DSI_REG_INT_CTRL / 4] | 1u;    /* W1C stale DMA done */
++	dsi[DSI_REG_TPG_CTRL / 4] = (1u << 1) | (1u << 2) | (3u << 16);
++	dsi[DSI_REG_TPG_DMA_DATA / 4] = words[0];
++	dsi[DSI_REG_TPG_DMA_DATA / 4] = words[1];
++	dsi[DSI_REG_DMA_CTRL / 4] = (dma_ctrl & ~((1u << 31) | (1u << 30))) | (1u << 26) | (1u << 28);
++	dsi[DSI_REG_DMA_LENGTH / 4] = sizeof(words);
++	__asm__ volatile("dsb sy" ::: "memory");
++	dsi[DSI_REG_DMA_TRIGGER / 4] = 1;
++	unsigned us;
++	for (us = 0; us < 50000 && !(dsi[DSI_REG_INT_CTRL / 4] & 1u); us += 50) {
++		IODelay(50);
++	}
++	const bool done = (dsi[DSI_REG_INT_CTRL / 4] & 1u) != 0;
++	const uint32_t ack = dsi[DSI_REG_ACK_ERR / 4], timeout = dsi[DSI_REG_TIMEOUT_STATUS / 4];
++	if (done) {
++		dsi[DSI_REG_INT_CTRL / 4] = dsi[DSI_REG_INT_CTRL / 4] | 1u;
++	}
++	dsi[DSI_REG_TPG_CTRL / 4] = 0;
++	dsi[DSI_REG_TPG_FIFO_RESET / 4] = 1;
++	IODelay(1);
++	dsi[DSI_REG_TPG_FIFO_RESET / 4] = 0;
++	dsi[DSI_REG_DMA_CTRL / 4] = dma_ctrl;
++	if (!(ctrl & (1u << 2))) {
++		dsi[DSI_REG_CTRL / 4] = dsi[DSI_REG_CTRL / 4] & ~(1u << 2);
++	}
++	static unsigned sent_logs = 0;
++	if (!done || sent_logs < 16) {
++		++sent_logs;
++		IOLog("SWEET BL: DCS 0x51 level %u %s after %u us ack_err=%#x timeout=%#x\n",
++		    level, done ? "sent" : "NOT acknowledged", us, ack, timeout);
++	}
++	return done ? 0 : ETIMEDOUT;
++}
++
+ /* Advance on an absolute cadence. Skip missed slots instead of queuing bursts. */
+ void
+ AppleCLCD::rearmVsync(void)

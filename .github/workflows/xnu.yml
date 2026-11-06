@@ -19,7 +19,7 @@ on:
         description: make -k (collect all compile errors in one run)
         default: "true"
   push:
-    branches: [main]
+    branches: [main, a71-gpu]
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
@@ -140,7 +140,7 @@ jobs:
       - name: Verify SEC_TS and GPU drivers in built kernel
         run: |
           strings out/kernel.development.sweet | grep "Samsung S6SY771"
-          strings out/kernel.development.sweet | grep "Qualcomm Adreno 618"
+          strings out/kernel.development.sweet | grep "SWEET GPU: GPUCC audit v2"
           strings out/kernel.development.sweet | grep "SWEET CPUFREQ: domain %u selected lut"
           strings out/kernel.development.sweet | grep "sweetbigcores"
           strings out/kernel.development.sweet | grep "SWEET DDR: memory bandwidth vote"
@@ -151,4 +151,40 @@ jobs:
         with:
           name: xnu-kernel
           path: out/
+          if-no-files-found: warn
+
+  # Early-boot check before a phone flash: panics in generic kernel code show here. QEMU has
+  # none of the phone's hardware, so a pass does not prove that it boots on the A71.
+  qemu-smoke:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: xnu-kernel
+          path: out
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-arm llvm
+          python3 tools/qemu-sweet.py --check-env || true
+      - name: Boot the kernel in QEMU
+        continue-on-error: true
+        run: |
+          python3 tools/mkadt.py /tmp/qemu.adt --qemu
+          python3 tools/mkpayload.py out/kernel.development.sweet /tmp/qemu.adt /tmp/payload.bin \
+            --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0'
+          python3 tools/qemu-sweet.py /tmp/payload.bin qemu-out --secs 60 --kernel out/kernel.development.sweet --fail-on-panic
+      - name: Show the result
+        if: always()
+        run: |
+          cat qemu-out/result.json || true
+          tail -n 60 qemu-out/fb.txt || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qemu-smoke
+          path: qemu-out/
           if-no-files-found: warn

@@ -1,0 +1,47 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 66fa3d8..86ff823 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -300,9 +300,34 @@ sweet_gpu_measure_khz(vm_offset_t core)
+ 	return (uint32_t)(((c1 - c0) * 1000000ULL) / ns);
+ }
+ 
++/* Read-only GPUCC view of the real GX clock (Lineage gpucc-sm6150.c): alpha
++ * PLLs at +0x0/+0x100 (L +4, ALPHA +8, ALPHA_U +0xc, USER_CTL +0x10) feed
++ * gpu_cc_gx_gfx3d_clk_src (CMD_RCGR 0x101c, CFG 0x1020: SRC_SEL [10:8],
++ * SRC_DIV [4:0]) through a CRC divider. Logged raw with the VCO estimate. */
++static void
++sweet_gpu_clock_regs(const char *tag)
++{
++	if (!sweet_gpucc) {
++		return;
++	}
++	for (unsigned pll = 0; pll < 2; ++pll) {
++		const uint32_t base = pll * 0x100u;
++		const uint32_t l = sweet_gpucc_read(base + 0x4) & 0xffffu;
++		const uint32_t alpha = sweet_gpucc_read(base + 0x8), alpha_u = sweet_gpucc_read(base + 0xc) & 0xffu;
++		const uint64_t frac = ((uint64_t)alpha_u << 32) | alpha;
++		const uint64_t khz = 19200ULL * l + ((19200ULL * frac) >> 40);
++		printf("SWEET ADRENO: %s GPU PLL%u mode=%#x L=%u alpha=%#llx user_ctl=%#x vco~%llu kHz\n", tag, pll,
++		    sweet_gpucc_read(base), l, (unsigned long long)frac, sweet_gpucc_read(base + 0x10), (unsigned long long)khz);
++	}
++	const uint32_t cmd = sweet_gpucc_read(0x101c), cfg = sweet_gpucc_read(0x1020);
++	printf("SWEET ADRENO: %s gfx3d RCG cmd=%#x cfg=%#x src_sel=%u src_div=%u crc_fsm=%#x crc_mnd=%#x\n", tag, cmd, cfg,
++	    (cfg >> 8) & 7, cfg & 0x1f, sweet_gpucc_read(0x1024), sweet_gpucc_read(0x1028));
++}
++
+ static void
+ sweet_gpu_raise_clock(vm_offset_t core, vm_offset_t gmu)
+ {
++	sweet_gpu_clock_regs("before DCVS");
+ 	const uint32_t before = sweet_gpu_measure_khz(core);
+ 	printf("SWEET ADRENO: GX clock measured=%u kHz at perf index 1 (configured %u kHz)\n",
+ 	    before, a618_gpu_level_count ? a618_gpu_levels[0].khz : 267000u);
+@@ -326,6 +351,7 @@ sweet_gpu_raise_clock(vm_offset_t core, vm_offset_t gmu)
+ 	const uint32_t after = sweet_gpu_measure_khz(core);
+ 	printf("SWEET ADRENO: DCVS perf index %u (%u kHz, gfx vlvl %u, mx vlvl %u) errno=%d; GX clock measured=%u kHz\n",
+ 	    top + 1, a618_gpu_levels[top].khz, gfx_vlvl, mx_vlvl, error, after);
++	sweet_gpu_clock_regs("after DCVS");
+ 	if (error && error != ETIMEDOUT) {
+ 		/* Firmware refused: request the proven bring-up index again. */
+ 		int back = a618_gmu_dcvs(&gmu_io, 1);

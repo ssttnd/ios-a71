@@ -1,0 +1,47 @@
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoSubmit.cpp b/iokit/Kernel/arm/unixnu/NativeAdrenoSubmit.cpp
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoSubmit.cpp
+@@ -97,9 +97,13 @@
+        (resource_count && !resources) || (resources && !resource_count))return kIOReturnBadArgument;
+     for(size_t i=0;i<resource_count;++i) {
+         uint64_t va=0;size_t bytes=0;unsigned permissions=0;
+-        if(!resources[i].access || (resources[i].access&~3u) ||
+-           vm_->describe(resources[i].handle,&va,&bytes,&permissions) ||
+-           (resources[i].access&permissions)!=resources[i].access)return kIOReturnBadArgument;
++        const IOReturn described=vm_->describe(resources[i].handle,&va,&bytes,&permissions);
++        if(!resources[i].access || (resources[i].access&~3u) || described ||
++           (resources[i].access&permissions)!=resources[i].access) {
++            IOLog("SWEET RENDER: reject residency index=%lu handle=%llu access=%u permissions=%u describe=%#x\n",
++                (unsigned long)i,resources[i].handle,resources[i].access,permissions,described);
++            return kIOReturnBadArgument;
++        }
+         for(size_t j=0;j<i;++j)if(resources[j].handle==resources[i].handle)return kIOReturnBadArgument;
+     }
+     for(size_t i=0;resource_count && i<count;++i) {
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.cpp b/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.cpp
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.cpp
+@@ -292,7 +292,22 @@
+         if(!entry || !entry->mapped_state || entry->unreleasable || wire.reserved || !wire.access || (wire.access&~3u)) {
+             status=kIOReturnBadArgument;break;
+         }
+-        resources[i]={entry->mapped,wire.access};
++        /* Gallium's FD_RELOC_FLAGS_INIT is READ|WRITE even for sampled,
++         * immutable IOSurfaces. This list is conservative residency/cache
++         * ownership, not permission to upgrade an owner's read-only pages.
++         * Keep the SMMU mapping read-only and hand the submit core its actual
++         * permitted access. A GPU store still faults instead of writing it. */
++        uint32_t access=wire.access;
++        if(entry->memory.readOnly()) {
++            if(!(access&1)) {status=kIOReturnBadArgument;break;}
++            access=1;
++            if(wire.access&2) {
++                static unsigned reports=0;
++                if(reports++<8)IOLog("SWEET RENDER: immutable residency handle=%llu requested=%u effective=1 SMMU read-only\n",
++                    wire.handle,wire.access);
++            }
++        }
++        resources[i]={entry->mapped,access};
+     }
+     NativeAdrenoSubmitBuffer buffers[NativeAdrenoAbiMaxBuffers];
+     for(uint32_t i=0;!status && i<commands.buffer_count;++i) {

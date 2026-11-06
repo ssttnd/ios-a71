@@ -1,0 +1,18 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6877,7 +6877,13 @@
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	/*
++	 * ptoa() widens to vm_address_t before shifting.  The direct form
++	 * (pp << PAGE_SHIFT) is evaluated in 32 bits and truncates physical
++	 * pages above 4 GB, which exist when the kernel runs from the high
++	 * DRAM bank.
++	 */
++	flush_dcache((vm_offset_t)ptoa(pp), PAGE_SIZE, TRUE);
+ }
+ 
+ #if CONFIG_COREDUMP

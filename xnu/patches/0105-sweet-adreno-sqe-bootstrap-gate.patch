@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/sweet_adreno_cp.h b/bsd/dev/sweet_adreno_cp.h
+--- a/bsd/dev/sweet_adreno_cp.h
++++ b/bsd/dev/sweet_adreno_cp.h
+@@ -22,6 +22,8 @@
+  unsigned phase, submitted, completed;
+  uint32_t rptr, wptr, status, interrupt, hw_fault, fence, value;
+  uint32_t cp_interrupt;
++ uint32_t irq_after_power, irq_before_auth, irq_after_auth;
++ unsigned bootstrap_wait_us;
+  unsigned sqe_started, secure_prepare_attempted;
+  int secure_prepare_error;
+  uint64_t initial_tsb_base;
+diff --git a/bsd/dev/sweet_adreno_cp.c b/bsd/dev/sweet_adreno_cp.c
+--- a/bsd/dev/sweet_adreno_cp.c
++++ b/bsd/dev/sweet_adreno_cp.c
+@@ -207,6 +207,7 @@
+  if (us == 10000) { result->poisoned = 1; return ETIMEDOUT; }
+  gmu->write(gmu->cookie, GMU_HOST_CLEAR, 1u << 24);
+  result->phase = 2;
++ result->irq_after_power = gpu->read(gpu->cookie, CP_INTERRUPT_STATUS);
+  /* Fresh engine only. Never overwrite an already running command processor. */
+  if (gpu->read(gpu->cookie, CP_RB_RPTR) || gpu->read(gpu->cookie, CP_RB_WPTR))
+   goto failed;
+@@ -304,14 +305,29 @@
+   * The adapter callback is synchronous and cannot submit PM4. It runs only
+   * after GPU_SET, DCVS and base programming. Authorization failure retains
+   * resources and leaves SQE halted. */
++ result->irq_before_auth = gpu->read(gpu->cookie, CP_INTERRUPT_STATUS);
+  result->secure_prepare_attempted = 1;
+  result->secure_prepare_error = secure_prepare(secure_cookie);
+  if (result->secure_prepare_error) {
+   result->poisoned = 1;
+   return result->secure_prepare_error;
+  }
++ result->irq_after_auth = gpu->read(gpu->cookie, CP_INTERRUPT_STATUS);
++ /* Attribute a pre-existing error to setup/authentication, rather than
++  * describing it as an SQE execution failure. Never clear unknown faults. */
++ if (cp_fault(gpu, gmu, result)) goto failed;
+  gpu->write(gpu->cookie, CP_SQE_CNTL, 1);
+  result->sqe_started = 1;
++ /* SQE bootstrap signals CP_CP2GMU_STATUS bit2 before entering waitin.
++  * Require that firmware handshake before publishing any ring commands;
++  * a timeout/fault here is distinct from a ME_INIT execution failure. */
++ for (unsigned waited = 0; waited < 10000; waited += 10) {
++  result->bootstrap_wait_us = waited;
++  if (cp_fault(gpu, gmu, result)) goto failed;
++  if (gpu->read(gpu->cookie, 0x2048) & 4u) break;
++  gpu->delay_us(gpu->cookie, 10);
++  if (waited == 9990) { result->poisoned = 1; return ETIMEDOUT; }
++ }
+  uint32_t init[] = {packet7(0x48, 8), 0x2f, 3, 0x20000000, 0, 0, 0, 0, 0};
+  int error = publish(gpu, gmu, memory, init, 9, barrier, cookie, result);
+  if (error) return error;
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -297,6 +297,9 @@
+  printf("SWEET ADRENO: SQE ME_INIT errno=%d phase=%u submitted=%u completed=%u RPTR=%#x WPTR=%#x status=%#x IRQ=%#x fault=%#x\n",
+      error, cp.phase, cp.submitted, cp.completed, cp.rptr, cp.wptr, cp.status,
+      cp.interrupt, cp.hw_fault);
++ printf("SWEET ADRENO: CP startup IRQ power=%#x before_auth=%#x after_auth=%#x bootstrap_us=%u CP2GMU=%#x ACTLR=%#x\n",
++     cp.irq_after_power, cp.irq_before_auth, cp.irq_after_auth, cp.bootstrap_wait_us,
++     sweet_adreno_read((void *)core, 0x2048), sweet_adreno_read((void *)smmu, 0x8004));
+  printf("SWEET ADRENO: CP execution status local_irq=%#x sqe_started=%u\n", cp.cp_interrupt, cp.sqe_started);
+  printf("SWEET ADRENO: CP MMU CB0FSR=%#x CB1FSR=%#x\n",
+      sweet_adreno_read((void *)smmu, 0x8058), sweet_adreno_read((void *)smmu, 0x9058));

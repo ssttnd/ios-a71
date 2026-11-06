@@ -1,0 +1,125 @@
+diff --git a/bsd/dev/sweet_adreno_cp.h b/bsd/dev/sweet_adreno_cp.h
+--- a/bsd/dev/sweet_adreno_cp.h
++++ b/bsd/dev/sweet_adreno_cp.h
+@@ -22,7 +22,8 @@
+  unsigned phase, submitted, completed;
+  uint32_t rptr, wptr, status, interrupt, hw_fault, fence, value;
+  uint32_t cp_interrupt;
+- unsigned sqe_started;
++ unsigned sqe_started, secure_prepare_attempted;
++ int secure_prepare_error;
+  uint64_t initial_tsb_base;
+  uint32_t initial_tsb_size, initial_tsb_control;
+  unsigned aperture_phase;
+@@ -38,7 +39,7 @@
+  unsigned, void (*)(void *), void *);
+ int a618_cp_start(const struct a618_io *, const struct a618_io *,
+  const struct a618_dma_region *, const unsigned char *, unsigned,
+- void (*)(void *), void *, struct a618_cp_result *);
++ void (*)(void *), void *, int (*)(void *), void *, struct a618_cp_result *);
+ struct a618_pas_result { unsigned phase; int64_t status; uint64_t response; };
+ /* Optional SCM MP/CP aperture setup, fixed to the driver-owned CB0. */
+ int a618_cp_configure_aperture(struct a618_pas_result *);
+diff --git a/bsd/dev/sweet_adreno_cp.c b/bsd/dev/sweet_adreno_cp.c
+--- a/bsd/dev/sweet_adreno_cp.c
++++ b/bsd/dev/sweet_adreno_cp.c
+@@ -155,11 +155,11 @@
+ a618_cp_start(const struct a618_io *gpu, const struct a618_io *gmu,
+  const struct a618_dma_region *memory, const unsigned char *firmware,
+  unsigned bytes, void (*barrier)(void *), void *cookie,
+- struct a618_cp_result *result)
++ int (*secure_prepare)(void *), void *secure_cookie, struct a618_cp_result *result)
+ {
+  if (!valid_io(gpu) || !valid_io(gmu) || !memory || !memory->cpu ||
+      memory->bytes != A618_CP_DMA_BYTES || !memory->uncached || !firmware ||
+-     bytes != 32136 || !barrier || !result) return EINVAL;
++     bytes != 32136 || !barrier || !secure_prepare || !result) return EINVAL;
+  *result = (struct a618_cp_result){0};
+  /* Firmware version excludes the container DWORD. Require patched A630 SQE
+   * at least as new as the pinned Linux driver requires for WHERE_AM_I. */
+@@ -300,6 +300,16 @@
+  if (gpu->read(gpu->cookie, CP_RB_RPTR_ADDR) != A618_CP_SHADOW_IOVA ||
+      gpu->read(gpu->cookie, CP_RB_RPTR_ADDR + 4)) goto failed;
+  gpu->write(gpu->cookie, CP_RB_CNTL, (1u << 27) | (2u << 8) | 12u);
++ /* Device vendor startup authenticates its signed ZAP before SQE release.
++  * The adapter callback is synchronous and cannot submit PM4. It runs only
++  * after GPU_SET, DCVS and base programming. Authorization failure retains
++  * resources and leaves SQE halted. */
++ result->secure_prepare_attempted = 1;
++ result->secure_prepare_error = secure_prepare(secure_cookie);
++ if (result->secure_prepare_error) {
++  result->poisoned = 1;
++  return result->secure_prepare_error;
++ }
+  gpu->write(gpu->cookie, CP_SQE_CNTL, 1);
+  result->sqe_started = 1;
+  uint32_t init[] = {packet7(0x48, 8), 0x2f, 3, 0x20000000, 0, 0, 0, 0, 0};
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -195,6 +195,23 @@
+      SecureDTGetProperty(node, crc_name, (const void **)&crc, &size) != kSuccess ||
+      size != 4 || *length > 0x8000 || !*length) return ENOENT;
+  return sweet_gpu_crc(*bytes, *length) == *crc ? 0 : EIO;
++}
++struct sweet_gpu_zap_request {
++ volatile uint32_t *reserved;
++ uint64_t physical;
++ const struct a618_dma_region *metadata;
++ const unsigned char *mdt, *code;
++ unsigned mdt_bytes, code_bytes;
++ struct a618_pas_result result;
++};
++static int
++sweet_gpu_zap_prepare(void *cookie)
++{
++ struct sweet_gpu_zap_request *request = cookie;
++ if (!request) return EINVAL;
++ return a618_zap_authenticate(request->reserved, request->physical,
++     request->metadata, request->mdt, request->mdt_bytes, request->code,
++     request->code_bytes, &request->result);
+ }
+ static int
+ sweet_gpu_cp_start(vm_offset_t gmu, vm_offset_t smmu)
+@@ -257,10 +274,22 @@
+      sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay};
+  const struct a618_io gmu_io = {(void *)gmu,
+      sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay};
++ error = sweet_adreno_pas_allocate(&metadata);
++ if (error) return error;
++ vm_offset_t zap = ml_io_map(*reserved_base, *reserved_size);
++ if (!zap) return ENOMEM;
++ struct sweet_gpu_zap_request request = {
++  .reserved = (volatile uint32_t *)zap, .physical = *reserved_base,
++  .metadata = &metadata, .mdt = mdt, .code = code,
++  .mdt_bytes = mdt_size, .code_bytes = code_size,
++ };
+  struct a618_cp_result cp;
+  bzero(&cp, sizeof(cp));
+  error = a618_cp_start(&gpu_io, &gmu_io, &memory, sqe, sqe_size,
+-     sweet_adreno_barrier, NULL, &cp);
++     sweet_adreno_barrier, NULL, sweet_gpu_zap_prepare, &request, &cp);
++ printf("SWEET ADRENO: pre-SQE ZAP attempted=%u errno=%d phase=%u status=%lld response=%#llx\n",
++     cp.secure_prepare_attempted, cp.secure_prepare_error, request.result.phase,
++     request.result.status, request.result.response);
+  printf("SWEET ADRENO: CP initial TSB control=%#x base=%#llx size=%#x\n",
+      cp.initial_tsb_control, cp.initial_tsb_base, cp.initial_tsb_size);
+  printf("SWEET ADRENO: CP aperture errno=%d phase=%u status=%lld response=%#llx\n",
+@@ -315,17 +344,6 @@
+         cache[i + 4], cache[i + 5], cache[i + 6], cache[i + 7]);
+   }
+  }
+- if (error) return error;
+- error = sweet_adreno_pas_allocate(&metadata);
+- if (error) return error;
+- vm_offset_t zap = ml_io_map(*reserved_base, *reserved_size);
+- if (!zap) return ENOMEM;
+- struct a618_pas_result pas;
+- bzero(&pas, sizeof(pas));
+- error = a618_zap_authenticate((volatile uint32_t *)zap, *reserved_base,
+-     &metadata, mdt, mdt_size, code, code_size, &pas);
+- printf("SWEET ADRENO: ZAP PAS errno=%d phase=%u status=%lld response=%#llx\n",
+-     error, pas.phase, pas.status, pas.response);
+  if (error) return error;
+  error = a618_cp_leave_secure(&gpu_io, &gmu_io, &memory,
+      sweet_adreno_barrier, NULL, &cp);

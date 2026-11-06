@@ -1,0 +1,464 @@
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -3,6 +3,7 @@
+  * one resource gate, synchronous quiescence before VM edits/cache publication.
+  */
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
+ #include <pexpert/pexpert.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOPlatformExpert.h>
+@@ -124,9 +125,28 @@
+ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodArguments *args,
+     IOExternalMethodDispatch *,OSObject *,void *)
+ {
+- if(!args || args->scalarInputCount || args->scalarOutputCount || args->structureInputDescriptor ||
+-    args->structureOutputDescriptor)return kIOReturnBadArgument;
++ if(!args || args->scalarInputCount || args->scalarOutputCount || args->structureOutputDescriptor)return kIOReturnBadArgument;
++ // Large residency lists arrive via IOKit's out-of-line descriptor. Snapshot
++ // once before validation; never dispatch directly from mutable task memory.
++ struct InputCopy {
++  void *data=nullptr;size_t bytes=0;
++  ~InputCopy(){if(data)IOFree(data,bytes);}
++ } copy;
+  IOExternalMethodArguments forwarded=*args;
++ if(args->structureInputDescriptor) {
++  if(selector!=NativeAdrenoMethodSubmitResources ||
++     args->structureInputDescriptor->getLength()!=sizeof(NativeAdrenoAbiSubmitResources))return kIOReturnBadArgument;
++  copy.bytes=sizeof(NativeAdrenoAbiSubmitResources);copy.data=IOMalloc(copy.bytes);
++  if(!copy.data)return kIOReturnNoMemory;
++  IOReturn prepare=args->structureInputDescriptor->prepare(kIODirectionOut);
++  if(prepare)return prepare;
++  const bool copied=args->structureInputDescriptor->readBytes(0,copy.data,copy.bytes)==copy.bytes;
++  IOReturn completed=args->structureInputDescriptor->complete(kIODirectionOut);
++  if(!copied)return kIOReturnVMError;
++  if(completed)return completed;
++  forwarded.structureInput=copy.data;forwarded.structureInputSize=copy.bytes;
++  forwarded.structureInputDescriptor=nullptr;args=&forwarded;
++ }
+  if(args->structureInput && args->structureInputSize>=8) {
+   uint32_t tunnel[2];memcpy(tunnel,args->structureInput,sizeof tunnel);
+   if(tunnel[0]==0x4e544e4c) {
+@@ -141,16 +161,17 @@
+    forwarded.structureInputSize-=8;args=&forwarded;
+   }
+  }
+- if(selector<1 || selector>NativeAdrenoMethodBoImport)return kIOReturnUnsupported;
++ if(selector<1 || selector>NativeAdrenoMethodSubmitResources)return kIOReturnUnsupported;
+  const size_t input=NativeAdrenoUserClient::inputSize(selector),output=NativeAdrenoUserClient::outputSize(selector);
+  if(args->structureInputSize!=input || args->structureOutputSize!=output ||
+     (input && !args->structureInput) || (output && !args->structureOutput))return kIOReturnBadArgument;
+  IOLockLock(backend.lock);
+  if(!mounted_ || closed_ || !healthy()) {IOLockUnlock(backend.lock);return kIOReturnNotReady;}
++ const uint64_t began=backend.clock.now_us(backend.clock.cookie);
+  IOReturn result=kIOReturnSuccess;
+  // The single shared context must be idle through EVERY table edit and cache
+  // publication; completion is the actual CP fence, not a job-count estimate.
+- if(selector==NativeAdrenoMethodBoMap || selector==NativeAdrenoMethodBoFree || selector==NativeAdrenoMethodSubmit)
++ if(selector==NativeAdrenoMethodBoMap || selector==NativeAdrenoMethodBoFree || selector==NativeAdrenoMethodSubmit || selector==NativeAdrenoMethodSubmitResources)
+   result=quiesce();
+  if(!result && selector==NativeAdrenoMethodBoImport) {
+   NativeAdrenoAbiBoImport request{};NativeAdrenoAbiBoAllocReply reply{};
+@@ -159,7 +180,22 @@
+   if(!result)memcpy(args->structureOutput,&reply,sizeof reply);
+  } else if(!result)result=core_->dispatch(selector,args->structureInput,input,args->structureOutput,output,&backend.clock);
+  if(!result)args->structureOutputSize=output;
+- if(trace_calls_++<64 || (result && trace_errors_++<16))
++ if(selector==NativeAdrenoMethodSubmitResources) {
++  static unsigned submissions=0;
++  if(++submissions<=8 || submissions%120==0) {
++   const auto *request=static_cast<const NativeAdrenoAbiSubmitResources *>(args->structureInput);
++   IOLog("SWEET RENDER: scoped submit %u IBs=%u BOs=%u total_us=%llu result=%#x\n",submissions,
++     request->commands.buffer_count,request->resource_count,
++     backend.clock.now_us(backend.clock.cookie)-began,result);
++  }
++ }
++
++ bool pending_poll=false;
++ if(selector==NativeAdrenoMethodWaitFence && result==kIOReturnTimeout) {
++  NativeAdrenoAbiWaitFence request{};memcpy(&request,args->structureInput,sizeof request);
++  pending_poll=request.timeout_ns==0;
++ }
++ if(!pending_poll && (trace_calls_++<64 || (result && trace_errors_++<16)))
+   IOLog("SWEET RENDER: method=%u result=%#x\n",selector,result);
+  IOLockUnlock(backend.lock);return result;
+ }
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -282,8 +282,9 @@
+ {
+     if (!asked) return sweet_row_bytes(width,ew,bpe);
+     char name[32]={0};proc_selfname(name,sizeof(name));
++    const uint64_t align=bpe>4 && bpe<=8 ? 128 : 64;
+     return !client && !strcmp(name,"backboardd") ?
+-        (uint32_t)(((uint64_t)asked+63)&~63ull) : asked;
++        (uint32_t)(((uint64_t)asked+align-1)&~(align-1)) : asked;
+ }
+ 
+ /* Geometry from the creation properties (IOSurface.h keys). */
+@@ -346,6 +347,15 @@
+ 		s->planeCount = planes->getCount();
+ 	}
+ 
++    // A6xx linear GMEM stores touch complete 16x4 pixel blocks. Preserve
++    // logical height but back the last partial block with actual storage.
++    // Caller-owned IOSurfaceAddress memory cannot be extended here.
++    if(!props->getObject("IOSurfaceAddress") && s->planeCount==0 &&
++       s->elementWidth==1 && s->elementHeight==1 && s->bytesPerElement &&
++       s->bytesPerElement<=8 && !(s->bytesPerElement&(s->bytesPerElement-1))) {
++        uint64_t padded=(uint64_t)s->offset+(uint64_t)s->bytesPerRow*((s->height+3u)&~3u);
++        if(padded>end)end=padded;
++    }
+ 	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
+ 	if (alloc < end) {
+ 		alloc = end;
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoABI.h
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoABI.h
+@@ -30,6 +30,8 @@
+     NativeAdrenoMethodBoCpuUnmap = 14,
+     NativeAdrenoMethodGetDeviceInfo = 15,
+     NativeAdrenoMethodBoImport = 16,
++    NativeAdrenoMethodSubmitResources = 17,
++    NativeAdrenoAbiMaxResources = 1024,
+     NativeAdrenoAbiMetadataBytes = 64,
+     NativeAdrenoAbiMaxQueues = 8
+ };
+@@ -41,6 +43,7 @@
+     uint64_t max_bo_bytes;
+ };
+ enum {
++    NativeAdrenoParamsSubmitResources = 2, /* complete per-submit BO read/write set */
+     NativeAdrenoParamsHostImport = 1  /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
+ };
+ struct NativeAdrenoAbiBoAlloc {
+@@ -84,6 +87,20 @@
+     uint64_t wait_fence;          /* zero or an earlier fence of this client */
+     uint64_t wait_timeout_ns;     /* used only when wait_fence is nonzero */
+     NativeAdrenoAbiSubmitBuffer buffers[NativeAdrenoAbiMaxBuffers];
++};
++/* A complete residency/access set, including nested IBs and all GPU data.
++ * Extension of ABI1: clients must check NativeAdrenoParamsSubmitResources.
++ * Fixed size; IOKit transports this larger-than-inline request out of line. */
++struct NativeAdrenoAbiResource {
++    uint64_t handle;
++    uint32_t access;             /* bit0 GPU read, bit1 GPU write; nonzero */
++    uint32_t reserved;
++};
++struct NativeAdrenoAbiSubmitResources {
++    NativeAdrenoAbiSubmit commands;
++    uint32_t resource_count;
++    uint32_t reserved;
++    NativeAdrenoAbiResource resources[NativeAdrenoAbiMaxResources];
+ };
+ struct NativeAdrenoAbiMetadata {
+     uint64_t handle;              /* object identity */
+@@ -145,6 +162,7 @@
+     uint32_t reserved;            /* zero */
+ };
+ #if defined(__cplusplus)
++static_assert(sizeof(NativeAdrenoAbiSubmitResources) == 16808, "ABI scoped submit layout");
+ static_assert(sizeof(NativeAdrenoAbiDeviceInfo) == 64, "ABI device info layout");
+ static_assert(sizeof(NativeAdrenoAbiParams) == 24, "ABI params layout");
+ static_assert(sizeof(NativeAdrenoAbiBoAlloc) == 16, "ABI alloc layout");
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoSubmit.cpp
+@@ -45,12 +45,23 @@
+ IOReturn NativeAdrenoSubmit::release(Job &job)
+ {
+     IOReturn status=kIOReturnSuccess;
+-    for(size_t i=0;i<job.count;++i) {
+-        IOReturn retired=vm_->retireJobAfterCompletion(job.handles[i]);
+-        if(retired)status=retired;else ++stats_.references_retired;
+-    }
+-    if(status)return poison();
+-    if(vm_->acquireImported())return poison();
++    if(job.resources) {
++        // Invalidate after completion BEFORE dropping any device references.
++        for(size_t i=0;i<job.count;++i)
++            if((job.resources[i].access&2) && vm_->acquireHandle(job.resources[i].handle))return poison();
++        for(size_t i=0;i<job.count;++i) {
++            if(vm_->retireJobAfterCompletion(job.resources[i].handle))return poison();
++            ++stats_.references_retired;
++        }
++        IODelete(job.resources,NativeAdrenoSubmitResource,job.count);
++    } else {
++        for(size_t i=0;i<job.count;++i) {
++            IOReturn retired=vm_->retireJobAfterCompletion(job.handles[i]);
++            if(retired)status=retired;else ++stats_.references_retired;
++        }
++        if(status)return poison();
++        if(vm_->acquireImported())return poison();
++    }
+     job={};return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoSubmit::detach()
+@@ -75,9 +86,28 @@
+ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size_t count,
+     uint32_t queue,uint32_t *fence)
+ {
++    return submitResources(buffers,count,queue,nullptr,0,fence);
++}
++IOReturn NativeAdrenoSubmit::submitResources(const NativeAdrenoSubmitBuffer *buffers,size_t count,
++    uint32_t queue,const NativeAdrenoSubmitResource *resources,size_t resource_count,uint32_t *fence)
++{
+     if(!fence)return kIOReturnBadArgument;*fence=0;
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+-    if(!buffers || !count || count>SubmitMaxBuffers)return kIOReturnBadArgument;
++    if(!buffers || !count || count>SubmitMaxBuffers || resource_count>NativeAdrenoVmMaxObjects ||
++       (resource_count && !resources) || (resources && !resource_count))return kIOReturnBadArgument;
++    for(size_t i=0;i<resource_count;++i) {
++        uint64_t va=0;size_t bytes=0;unsigned permissions=0;
++        if(!resources[i].access || (resources[i].access&~3u) ||
++           vm_->describe(resources[i].handle,&va,&bytes,&permissions) ||
++           (resources[i].access&permissions)!=resources[i].access)return kIOReturnBadArgument;
++        for(size_t j=0;j<i;++j)if(resources[j].handle==resources[i].handle)return kIOReturnBadArgument;
++    }
++    for(size_t i=0;resource_count && i<count;++i) {
++        bool found=false;
++        for(size_t j=0;j<resource_count;++j)
++            if(resources[j].handle==buffers[i].handle && (resources[j].access&1)) {found=true;break;}
++        if(!found)return kIOReturnBadArgument;
++    }
+     /* Every buffer is validated against the live VM before any reference. */
+     uint64_t handles[SubmitMaxBuffers];size_t handle_count=0;
+     uint32_t words[SubmitMaxBuffers*(1+SubmitIbWords)];size_t word_count=0;
+@@ -105,14 +135,24 @@
+     if(swept)return swept;
+     Job *job=free();
+     if(!job)return kIOReturnBusy;
+-    for(size_t i=0;i<handle_count;++i) {
+-        IOReturn status=vm_->holdJob(handles[i]);
++    const size_t held_count=resources?resource_count:handle_count;
++    NativeAdrenoSubmitResource *held=resources?IONew(NativeAdrenoSubmitResource,resource_count):nullptr;
++    if(resources && !held)return kIOReturnNoMemory;
++    for(size_t i=0;i<held_count;++i) {
++        const uint64_t handle=resources?resources[i].handle:handles[i];
++        IOReturn status=vm_->holdJob(handle);
+         if(status) {
+-            while(i) {vm_->retireJobAfterCompletion(handles[--i]);++stats_.references_retired;}
++            while(i) {--i;vm_->retireJobAfterCompletion(resources?resources[i].handle:handles[i]);++stats_.references_retired;}
++            if(held)IODelete(held,NativeAdrenoSubmitResource,resource_count);
+             return status;
+         }
++        if(held)held[i]=resources[i];
+         ++stats_.references_held;
+     }
++    auto rollback=[&]() {
++        for(size_t i=0;i<held_count;++i) {vm_->retireJobAfterCompletion(resources?resources[i].handle:handles[i]);++stats_.references_retired;}
++        if(held)IODelete(held,NativeAdrenoSubmitResource,resource_count);
++    };
+     uint32_t value=0;
+     /* int-070: the first IB word as the kernel's cacheable alias and DRAM see it before any maintenance, then DRAM after the CPU
+      * caches over every mapped BO are cleaned and invalidated. The board shows the last submission's record on a stall. */
+@@ -152,7 +192,11 @@
+         }
+     }
+     (void)vm_->sampleWord(buffers[0].iova,&cached,&before);
+-    IOReturn status=vm_->publishMapped();
++    IOReturn status=kIOReturnSuccess;
++    if(resources) {
++        for(size_t i=0;i<resource_count && !status;++i)
++            status=vm_->publishHandle(resources[i].handle,(resources[i].access&2)!=0);
++    } else status=vm_->publishMapped();
+     if(!status) {
+         (void)vm_->sampleWord(buffers[0].iova,&ignored,&after);
+         native_adreno_coherence[0]=native_adreno_coherence[0]+1;
+@@ -166,7 +210,7 @@
+         status=vm_->invalidateTlb();
+     }
+     if(status) {
+-        for(size_t i=0;i<handle_count;++i) {vm_->retireJobAfterCompletion(handles[i]);++stats_.references_retired;}
++        rollback();
+         return status;
+     }
+     {
+@@ -183,15 +227,17 @@
+          * referenced buffers cannot be retired here. */
+         if(ring_->poisoned()) {
+             *job=Job{};++stats_.poisoned_jobs;
+-            for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
+-            job->count=handle_count;job->queue=queue;job->active=true;
++            if(held)job->resources=held;
++            else for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
++            job->count=held_count;job->queue=queue;job->active=true;
+             return poison();
+         }
+-        while(handle_count) {vm_->retireJobAfterCompletion(handles[--handle_count]);++stats_.references_retired;}
++        rollback();
+         return status;
+     }
+-    for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
+-    job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;
++    if(held)job->resources=held;
++    else for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
++    job->count=held_count;job->fence=value;job->queue=queue;job->active=true;
+     ++stats_.submissions;
+     if(outstanding()>stats_.peak_jobs)stats_.peak_jobs=outstanding();
+     *fence=value;
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoSubmit.h
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoSubmit.h
+@@ -8,6 +8,10 @@
+     uint64_t handle;
+     uint64_t iova;
+     size_t bytes;      /* Complete indirect-buffer range in bytes. */
++};
++struct NativeAdrenoSubmitResource {
++    uint64_t handle;
++    uint32_t access;
+ };
+ /* Coherence samples (int-070): [0] submissions sampled; [1..3] the last one's first IB word through the kernel's cacheable alias,
+  * through DRAM before and through DRAM after the CPU cache maintenance of every mapped BO (~0 when unreadable); [4] samples whose
+@@ -34,6 +38,7 @@
+         uint32_t fence=0;
+         size_t count=0;
+         uint64_t handles[16]{};
++        NativeAdrenoSubmitResource *resources=nullptr;
+         uint32_t queue=0;
+         bool active=false;
+     } jobs_[8];
+@@ -59,6 +64,10 @@
+      * submissions and is validated by the caller's open queue set. */
+     IOReturn submit(const NativeAdrenoSubmitBuffer *,size_t,uint32_t queue,
+         uint32_t *fence);
++    /* Holds every residency object until the real fence, cleans just this set,
++     * and acquires only GPU-written objects. Legacy submit keeps full-VM sync. */
++    IOReturn submitResources(const NativeAdrenoSubmitBuffer *,size_t,uint32_t,
++        const NativeAdrenoSubmitResource *,size_t,uint32_t *);
+     bool queueOutstanding(uint32_t queue) const;
+     /* Queues [first, first+count): whether any of their jobs is outstanding, and a wait for every one of them (oldest first) that
+      * leaves other queues' jobs alone. Each client of the shared ring owns one such range. */
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.cpp
+@@ -119,7 +119,7 @@
+     if(!open_)return kIOReturnNotReady;
+     params->abi_version=NativeAdrenoAbiVersion;
+     params->input_bits=input_bits_;params->output_bits=output_bits_;
+-    params->flags=NativeAdrenoParamsHostImport;params->max_bo_bytes=UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;
++    params->flags=NativeAdrenoParamsHostImport|NativeAdrenoParamsSubmitResources;params->max_bo_bytes=UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;
+     return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoUserClient::allocBo(const NativeAdrenoAbiBoAlloc *request,
+@@ -272,6 +272,44 @@
+     reply->fence=fence;
+     return kIOReturnSuccess;
+ }
++IOReturn NativeAdrenoUserClient::submitResources(const NativeAdrenoAbiSubmitResources *request,
++    NativeAdrenoAbiSubmitReply *reply)
++{
++    if(!request || !reply)return kIOReturnBadArgument;
++    reply->fence=0;
++    if(!open_)return kIOReturnNotReady;
++    const auto &commands=request->commands;
++    if(request->reserved || !request->resource_count || request->resource_count>NativeAdrenoAbiMaxResources ||
++       !commands.buffer_count || commands.buffer_count>NativeAdrenoAbiMaxBuffers || commands.reserved ||
++       commands.wait_fence || commands.wait_timeout_ns || commands.queue>=NativeAdrenoAbiMaxQueues ||
++       !queues_[commands.queue].active)return kIOReturnBadArgument;
++    auto resources=IONew(NativeAdrenoSubmitResource,request->resource_count);
++    if(!resources)return kIOReturnNoMemory;
++    IOReturn status=kIOReturnSuccess;
++    for(uint32_t i=0;i<request->resource_count;++i) {
++        const auto &wire=request->resources[i];
++        Entry *entry=find(wire.handle);
++        if(!entry || !entry->mapped_state || entry->unreleasable || wire.reserved || !wire.access || (wire.access&~3u)) {
++            status=kIOReturnBadArgument;break;
++        }
++        resources[i]={entry->mapped,wire.access};
++    }
++    NativeAdrenoSubmitBuffer buffers[NativeAdrenoAbiMaxBuffers];
++    for(uint32_t i=0;!status && i<commands.buffer_count;++i) {
++        const auto &wire=commands.buffers[i];
++        Entry *entry=find(wire.handle);
++        if(!entry || !entry->mapped_state || entry->unreleasable || !wire.bytes || wire.bytes>SIZE_MAX || (wire.bytes&3)) {
++            status=kIOReturnBadArgument;break;
++        }
++        buffers[i]={entry->mapped,wire.iova,(size_t)wire.bytes};
++    }
++    uint32_t fence=0;
++    if(!status)status=submit_->submitResources(buffers,commands.buffer_count,
++        queue_base_+static_cast<uint32_t>(commands.queue),resources,request->resource_count,&fence);
++    IODelete(resources,NativeAdrenoSubmitResource,request->resource_count);
++    if(!status)reply->fence=fence;
++    return status;
++}
+ IOReturn NativeAdrenoUserClient::attachTimer(const NativeAdrenoTimer *timer)
+ {
+     if(!open_)return kIOReturnNotReady;
+@@ -330,6 +368,7 @@
+     case NativeAdrenoMethodBoImport:return sizeof(NativeAdrenoAbiBoImport);
+     case NativeAdrenoMethodBoFree:return sizeof(NativeAdrenoAbiBoFree);
+     case NativeAdrenoMethodSubmit:return sizeof(NativeAdrenoAbiSubmit);
++    case NativeAdrenoMethodSubmitResources:return sizeof(NativeAdrenoAbiSubmitResources);
+     case NativeAdrenoMethodSetMetadata:
+     case NativeAdrenoMethodGetMetadata:return sizeof(NativeAdrenoAbiMetadata);
+     case NativeAdrenoMethodCreateQueue:
+@@ -347,7 +386,8 @@
+     case NativeAdrenoMethodBoAlloc:return sizeof(NativeAdrenoAbiBoAllocReply);
+     case NativeAdrenoMethodBoMap:return sizeof(NativeAdrenoAbiBoMapReply);
+     case NativeAdrenoMethodBoFree:return 0;
+-    case NativeAdrenoMethodSubmit:return sizeof(NativeAdrenoAbiSubmitReply);
++    case NativeAdrenoMethodSubmit:
++    case NativeAdrenoMethodSubmitResources:return sizeof(NativeAdrenoAbiSubmitReply);
+     case NativeAdrenoMethodWaitFence:return 0;
+     case NativeAdrenoMethodGetTimestamp:return sizeof(NativeAdrenoAbiTimestamp);
+     case NativeAdrenoMethodGetStatus:return sizeof(NativeAdrenoAbiStatus);
+@@ -436,6 +476,13 @@
+         if(!status)memcpy(output,&reply,sizeof(reply));
+         break;
+     }
++    case NativeAdrenoMethodSubmitResources: {
++        NativeAdrenoAbiSubmitReply reply{};
++        // The IOKit wrapper already copied this fixed-size record to kernel memory.
++        status=submitResources(static_cast<const NativeAdrenoAbiSubmitResources *>(input),&reply);
++        if(!status)memcpy(output,&reply,sizeof(reply));
++        break;
++    }
+     case NativeAdrenoMethodWaitFence: {
+         NativeAdrenoAbiWaitFence request{};
+         memcpy(&request,input,sizeof(request));
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.h
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.h
+@@ -70,6 +70,7 @@
+     IOReturn releaseAll(const NativeAdrenoRingClock *,uint32_t timeout_us);
+     /* Backing object of a token returned by cpuMap while its lease is held (clientMemoryForType); null otherwise. */
+     NativeAdrenoMemory *memoryForToken(uint32_t token);
++    IOReturn submitResources(const NativeAdrenoAbiSubmitResources *,NativeAdrenoAbiSubmitReply *);
+     IOReturn query(NativeAdrenoAbiParams *);
+     IOReturn allocBo(const NativeAdrenoAbiBoAlloc *,NativeAdrenoAbiBoAllocReply *);
+     IOReturn mapBo(const NativeAdrenoAbiBoMap *,NativeAdrenoAbiBoMapReply *);
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoVm.cpp
+@@ -324,6 +324,22 @@
+         ArmSmmu4KInvalidateAllOwnedContext(&io_,streams_->bank,context_,budget_,&r);
+     return status?fail(status):kIOReturnSuccess;
+ }
++IOReturn NativeAdrenoVm::publishHandle(uint64_t handle,bool writes)
++{
++    if(!attached_ || poisoned_)return kIOReturnNotReady;
++    Mapping *m=find(handle);
++    if(!m || !m->memory || m->mapped_spans!=m->spans)return kIOReturnBadArgument;
++    if(coherentMapping(m->writeback))return kIOReturnSuccess;
++    return m->memory->publishForDevice(0,m->memory->bytes(),writes,distrust_write_combined_);
++}
++IOReturn NativeAdrenoVm::acquireHandle(uint64_t handle)
++{
++    if(!attached_ || poisoned_)return kIOReturnNotReady;
++    Mapping *m=find(handle);
++    if(!m || !m->memory || m->mapped_spans!=m->spans)return kIOReturnBadArgument;
++    if(coherentMapping(m->writeback))return kIOReturnSuccess;
++    return m->memory->acquireDeviceWrites(0,m->memory->bytes());
++}
+ IOReturn NativeAdrenoVm::publishMapped()
+ {
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoVm.h
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoVm.h
+@@ -89,6 +89,9 @@
+     /* Cleans and invalidates the CPU caches over every mapped BO (whole objects; imported ones through their physical pages), so
+      * no CPU cache line can hold data the GPU should see or hide what it wrote. Lines are physically tagged, so this also reaches
+      * lines a user mapping of the same pages left behind. int-070 runs it before every submission. */
++    /* Cache ownership transfers restricted to a validated residency set. */
++    IOReturn publishHandle(uint64_t handle,bool writes);
++    IOReturn acquireHandle(uint64_t handle);
+     IOReturn publishMapped();
+     /* The submit path saw a CPU-cached word that DRAM did not hold yet in a client's BO: from now on write-combined BOs are maintained
+      * like any other (sticky; the safe behaviour of int-070..097). */

@@ -1,0 +1,151 @@
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+index 789a5f6..88557d9 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -23,6 +23,7 @@ extern "C" uint64_t native_adreno_publish_stats[3];
+ extern "C" volatile uint32_t native_adreno_import_sync;
+ extern "C" volatile uint64_t native_adreno_import_sync_below;
+ extern "C" void sweet_native_adreno_fault_report(const char *why);
++extern "C" volatile uint32_t native_adreno_pool_stats[8];
+ namespace {
+ struct Backend {
+  NativeAdrenoVm *vm=nullptr;
+@@ -184,9 +185,10 @@ static void method_window(void)
+  if(at>=sizeof line)at=sizeof line-1;
+  line[at]=0;
+  const unsigned sampled=busy_samples+idle_samples;
+- IOLog("SWEET RENDER: window_ms=%llu gpu_busy_pct=%u samples=%u locked=%u lock_avg_us=%llu lock_max_us=%llu wait_polls=%llu calls/avg_us:%s\n",
++ IOLog("SWEET RENDER: window_ms=%llu gpu_busy_pct=%u samples=%u locked=%u lock_avg_us=%llu lock_max_us=%llu wait_polls=%llu pool_mib=%u/%u peak pooled=%u fallback=%u calls/avg_us:%s\n",
+    (now-window_began_us)/1000,sampled?busy_samples*100/sampled:0,sampled,locked_samples,
+-   lock_takes?lock_wait_us/lock_takes:0,lock_wait_max_us,wait_polls,line);
++   lock_takes?lock_wait_us/lock_takes:0,lock_wait_max_us,wait_polls,native_adreno_pool_stats[3],native_adreno_pool_stats[4],
++   native_adreno_pool_stats[1],native_adreno_pool_stats[2],line);
+  memset(method_stats,0,sizeof method_stats);
+  lock_wait_us=lock_wait_max_us=lock_takes=wait_polls=0;busy_samples=idle_samples=locked_samples=0;
+  window_began_us=now;
+@@ -288,7 +290,7 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
+  *memory=nullptr;
+  IOLockLock(backend.lock);
+  NativeAdrenoMemory *buffer=mounted_ && !closed_?core_->memoryForToken(type):nullptr;
+- auto descriptor=buffer?buffer->descriptor():nullptr;
++ auto descriptor=buffer?buffer->userDescriptor():nullptr;
+  if(!descriptor || buffer->quarantined()) {IOLockUnlock(backend.lock);return kIOReturnBadArgument;}
+  /* Return this same original descriptor on every map/unmap query. Its maps
+   * retain the BO allocation until the last user mapping really disappears. */
+@@ -493,6 +495,21 @@ extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit
+  int wc=1;PE_parse_boot_argn("sweetwc",&wc,sizeof(wc));
+  native_adreno_wc_enabled=wc!=0;
+  IOLog("SWEET RENDER: owned BOs %s (sweetwc=%d)\n",wc?"write-combined, IB audit armed":"cacheable with full maintenance",wc);
++ /* 0135 hardware: BoAlloc averaged 22ms (a failing 2MiB contiguous scan of
++  * 255k pages, then one cache-attribute change per page) under the GPU lock.
++  * The UniXNU pool (one contiguous block, write-combined once) was never
++  * reserved here. Owned BOs come from it first; larger or overflow ones keep
++  * the old path. sweetbopool=MiB (0 = off). */
++ uint32_t pool_mib=192;PE_parse_boot_argn("sweetbopool",&pool_mib,sizeof(pool_mib));
++ if(pool_mib) {
++  const uint64_t began=clock->now_us(clock->cookie);
++  IOReturn reserved=kIOReturnNoMemory;uint32_t got=0;
++  for(uint32_t mib=pool_mib>1024?1024:pool_mib;mib>=16 && reserved;mib/=2)
++   if(!(reserved=NativeAdrenoMemory::reservePool(36,(size_t)mib<<20)))got=mib;
++  const IOReturn combined=!reserved && wc?NativeAdrenoMemory::writeCombinePool():kIOReturnSuccess;
++  IOLog("SWEET RENDER: owned BO pool %u MiB reserve=%#x write-combine=%#x in %llu us\n",got,reserved,combined,
++    clock->now_us(clock->cookie)-began);
++ }
+  auto provider=new AGXAccelerator;
+  if(!provider || !provider->init() || !provider->attach(IOService::getPlatform())) {
+   if(provider)provider->release();return 1;
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.cpp b/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.cpp
+index d0f4a18..18b92dd 100644
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.cpp
+@@ -3,6 +3,7 @@
+ /* Where a call that never returns is stuck: the free/unmap/release path stores a stage number here, the board page shows it. */
+ extern "C" {volatile uint32_t native_adreno_trace_stage;}
+ #include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOSubMemoryDescriptor.h>
+ #include <IOKit/IOLib.h>
+ #include <kern/task.h>
+ #include <mach/vm_param.h>
+@@ -69,6 +70,8 @@ void poolGive(size_t offset,size_t bytes) {
+ }
+ }
+ size_t NativeAdrenoMemory::poolBytes() {return pool.bytes;}
++IOMemoryDescriptor *NativeAdrenoMemory::userDescriptor() const
++{return descriptor_?static_cast<IOMemoryDescriptor *>(descriptor_):pool_view_;}
+ /* int-152: a user BO's pages changed attribute one pmap_set_cache_attributes call at a time (each walks the page's mappings, flushes the
+  * TLB and cleans the page), on allocation and again on release, under the connection lock: 3 ms a BO on average and 90-130 ms for a
+  * surface-sized one, while every other GPU call of every client waited. The pool is the BOs' own block and nothing else maps it, so
+@@ -133,6 +136,9 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
+                 owned_capacity_=owned_count_=1;owned_spans_[0]={0,physical,capacity};
+                 span_capacity_=1;span_count_=1;spans_[0]={0,physical,bytes};
+                 mapping_=pool.virt+offset;bytes_=bytes;allocated_bytes_=capacity;pooled_=true;pool_offset_=offset;prepared_=true;write_combined_=pool.write_combined;
++                /* Turnip CPU-maps every BO through clientMemoryForType; a pooled one has no descriptor of its own. */
++                pool_view_=IOSubMemoryDescriptor::withSubRange(pool.descriptor,offset,capacity,kIODirectionInOut);
++                if(!pool_view_) {(void)release();return kIOReturnNoMemory;}
+                 zeroOwned(mapping_,capacity,pool.write_combined);
+                 /* Through a write-combined pool's own mapping the zeros go to DRAM; the barrier completes them. */
+                 if(pool.write_combined)__asm__ volatile("dsb sy":::"memory");
+@@ -273,6 +279,11 @@ IOReturn NativeAdrenoMemory::release()
+ {
+     native_adreno_trace_stage=30;
+     if(device_references_ || quarantined_)return kIOReturnBusy;
++    if(pool_view_) {
++        /* A live user mapping retains the view: its range must not go back to the pool for reuse. */
++        if(pool_view_->getRetainCount()>1) {quarantined_=true;return kIOReturnBusy;}
++        pool_view_->release();pool_view_=nullptr;
++    }
+     if(write_combined_ && pooled_ && pool.write_combined)write_combined_=false;   /* the pool's pages keep the attribute */
+     if(write_combined_) {
+         /* The pages go back to the VM cacheable, as they came. */
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.h b/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.h
+index 474ecbc..7e9675a 100644
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.h
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoMemory.h
+@@ -45,6 +45,7 @@ class NativeAdrenoMemory final {
+     uint32_t device_references_=0;
+     bool prepared_=false,quarantined_=false,write_combined_=false,pooled_=false,borrowed_nc_=false;
+     size_t pool_offset_=0;
++    IOMemoryDescriptor *pool_view_=nullptr;   /* a pooled BO's own range of the pool, for user mappings */
+     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
+ public:
+     NativeAdrenoMemory()=default;
+@@ -113,5 +114,7 @@ public:
+     /* Borrowed descriptor, never release independently or expose table pools
+      * through clientMemoryForType. Sharing requires a separate owner/task ABI. */
+     IOBufferMemoryDescriptor *descriptor() const {return descriptor_;}
++    /* What clientMemoryForType hands out: the BO's own descriptor, or its view of the pool. */
++    IOMemoryDescriptor *userDescriptor() const;
+ };
+ #endif
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.cpp b/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.cpp
+index 3a24072..6bad787 100644
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.cpp
+@@ -20,6 +20,7 @@ static void noteImport(IOReturn status,uint32_t stage,uint64_t bytes,uint64_t ad
+     }
+ }
+ #include <IOKit/IOLib.h>
++#include <kern/clock.h>
+ #include <string.h>
+ NativeAdrenoUserClient::Entry *NativeAdrenoUserClient::find(uint64_t handle)
+ {
+@@ -137,10 +138,18 @@ IOReturn NativeAdrenoUserClient::allocBo(const NativeAdrenoAbiBoAlloc *request,
+      * whole span table), so larger objects try one contiguous run first and fall back to scattered pages unless the
+      * caller demanded contiguity. */
+     IOReturn status=kIOReturnUnsupported;
+-    const bool prefer_contiguous=request->contiguous==0 && request->bytes>=NativeAdrenoClientContiguousFirstBytes;
++    /* 0146: a failed contiguous try scans the whole free list (0135: ~20 ms of a 22 ms BoAlloc). After one fails, objects at least
++     * that large go straight to scattered pages for a second; the pool still serves first inside allocate(). */
++    static uint64_t contiguous_failed_bytes=UINT64_MAX,contiguous_failed_at=0;
++    uint64_t now=mach_absolute_time(),since_ns=0;
++    absolutetime_to_nanoseconds(now-contiguous_failed_at,&since_ns);
++    if(since_ns>=NSEC_PER_SEC)contiguous_failed_bytes=UINT64_MAX;
++    const bool prefer_contiguous=request->contiguous==0 && request->bytes>=NativeAdrenoClientContiguousFirstBytes &&
++        request->bytes<contiguous_failed_bytes;
+     if(prefer_contiguous) {
+         status=entry->memory.allocate((size_t)request->bytes,output_bits_,true,(size_t(1)<<NativeAdrenoAbiMaxBoBytesShift),true);
+         if(status && !entry->memory.quarantined() && entry->memory.release()==kIOReturnSuccess)status=kIOReturnUnsupported;
++        if(status) {contiguous_failed_bytes=request->bytes;contiguous_failed_at=now;}
+     }
+     if(status)
+         status=entry->memory.allocate((size_t)request->bytes,output_bits_,request->contiguous!=0,(size_t(1)<<NativeAdrenoAbiMaxBoBytesShift),true);

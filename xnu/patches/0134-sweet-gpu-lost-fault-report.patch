@@ -1,0 +1,68 @@
+diff --git a/iokit/Kernel/arm/SweetNativeAdreno.cpp b/iokit/Kernel/arm/SweetNativeAdreno.cpp
+index 0639786..c229b89 100644
+--- a/iokit/Kernel/arm/SweetNativeAdreno.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdreno.cpp
+@@ -34,6 +34,19 @@ static bool faulted()
+  return global==UINT32_MAX || (global&errors) || irq==UINT32_MAX || (irq&0xf7u) || hw || fsr==UINT32_MAX ||
+      (fsr&0xc00001feu) || gmu==UINT32_MAX || (gmu&(1u<<23));
+ }
++/* One-time evidence for the first lost GPU: every term faulted() tests, plus
++ * the SMMU fault address/syndrome and the CP read pointer. Read-only. */
++extern "C" void sweet_native_adreno_fault_report(const char *why)
++{
++ if(!board.core || !board.smmu || !board.gmu)return;
++ const uint32_t irq=reg_read(board.core,0x208c), hw=reg_read(board.core,0x2084);
++ const uint32_t fsr=reg_read(board.smmu,0x8058), gmu=reg_read(board.gmu,0x14648);
++ const uint32_t global=reg_read(board.core,0x804);
++ const uint64_t far=(uint64_t)reg_read(board.smmu,0x8060)|((uint64_t)reg_read(board.smmu,0x8064)<<32);
++ IOLog("SWEET RENDER: GPU LOST (%s): RBBM_INT=%#x CP_INT=%#x CP_HW_FAULT=%#x CB0_FSR=%#x FAR=%#llx FSYNR0=%#x FSYNR1=%#x CB1_FSR=%#x GMU_HOST_INFO=%#x CP_RPTR=%#x CP_STATUS1=%#x\n",
++   why,global,irq,hw,fsr,far,reg_read(board.smmu,0x8068),reg_read(board.smmu,0x806c),
++   reg_read(board.smmu,0x9058),gmu,reg_read(board.core,0x2018),reg_read(board.core,0x2094));
++}
+ static int io_read(void *,uint32_t index,uint32_t *value)
+ {
+  if(!value || index>=0x10000 || faulted())return 1;
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+index c978fcc..a40c87f 100644
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -19,6 +19,7 @@ extern "C" void proc_selfname(char *,int);
+ extern "C" volatile uint32_t native_adreno_wc_enabled;
+ extern "C" uint64_t native_adreno_publish_stats[3];
+ extern "C" volatile uint32_t native_adreno_import_sync;
++extern "C" void sweet_native_adreno_fault_report(const char *why);
+ namespace {
+ struct Backend {
+  NativeAdrenoVm *vm=nullptr;
+@@ -52,12 +53,19 @@ bool extra_client(const char *name)
+ }
+ // Release/acquire publishes the completed backend to the framebuffer workloop.
+ static bool presentation_ready=false;
++char last_submitter[32];   // process of the newest successful submit (diagnostics)
+ bool healthy()
+ {
+  if(backend.lost)return false;
+- if(!backend.health || backend.health(nullptr) || backend.vm->poisoned() ||
+-    backend.submit->poisoned() || backend.ring->poisoned()) {
+-  backend.lost=true;backend.status.noteFault();return false;
++ const bool fault=!backend.health || backend.health(nullptr);
++ if(fault || backend.vm->poisoned() || backend.submit->poisoned() || backend.ring->poisoned()) {
++  backend.lost=true;backend.status.noteFault();
++  char why[96];
++  snprintf(why,sizeof why,"%s%s%s%s last_submit=%s fence=%u/%u",fault?"hw-fault ":"",
++    backend.vm->poisoned()?"vm ":"",backend.submit->poisoned()?"submit ":"",
++    backend.ring->poisoned()?"ring ":"",last_submitter,backend.ring->completedFence(),backend.ring->lastSubmitted());
++  sweet_native_adreno_fault_report(why);
++  return false;
+  }
+  return true;
+ }
+@@ -290,6 +298,8 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
+     (unsigned long)backend.vm->objectCount(),(unsigned long)backend.vm->spanCount(),
+     (unsigned long)backend.vm->spanCapacity(),backend.clock.now_us(backend.clock.cookie)-began,result);
+  }
++ if((selector==NativeAdrenoMethodSubmit || selector==NativeAdrenoMethodSubmitResources) && !result)
++  proc_selfname(last_submitter,sizeof last_submitter);
+  if(selector==NativeAdrenoMethodSubmit) {
+   // Window of 120 legacy submits: kernel time per call and jobs still in
+   // flight after it, i.e. whether the CPU actually ran ahead of the GPU.

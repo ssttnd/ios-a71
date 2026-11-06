@@ -1,0 +1,25 @@
+diff --git a/bsd/dev/sweet_adreno_clock.c b/bsd/dev/sweet_adreno_clock.c
+--- a/bsd/dev/sweet_adreno_clock.c
++++ b/bsd/dev/sweet_adreno_clock.c
+@@ -146,16 +146,15 @@
+ 		if (error)
+ 			return error;
+ 	}
+-	/* The SM7150 GMU DT requests CXO, not CXO_AON. The extra AON
+-	 * branch reads zero and rejects enable on sweet; it is not a GMU
+-	 * dependency. Keep the real CXO status check and do not claim AON
+-	 * enabled. No GX clock or PLL0/PLL1 register is touched.
++	/* SM7150 GMU requests CXO; its SMMU requests GPUCC AHB and GCC
++	 * GPU_SNOC_DVM_GFX. Neither requests GPUCC CXO_AON or CX_SNOC_DVM.
++	 * Those extra gates reject enable on sweet. Use the DT dependencies
++	 * and retain status checks on each required branch. No GX clock or
++	 * GPUCC PLL0/PLL1 register is touched.
+ 	 */
+ 	error = branch(gpucc, 0, 0x109c, result);
+ 	if (!error)
+ 		error = branch(gpucc, 0, 0x1078, result);
+-	if (!error)
+-		error = branch(gpucc, 0, 0x108c, result);
+ 	if (error)
+ 		return error;
+ 	/* RCG2 force-enable while selecting/dividing the existing GCC parent. */

@@ -1,0 +1,245 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1ea8873..9f8ac4e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -57,6 +57,22 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" int sweet_native_adreno_cpu_present_begin(uint32_t swap_fence);
+ extern "C" uint32_t sweet_native_adreno_last_fence(void);
+ extern "C" void sweet_native_adreno_cpu_present_end(int state);
++extern "C" void sweet_native_adreno_sample_busy(void);
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++/* MDP INTF timing engines (sweet DT qcom,sde-intf-off 0x6b000.. from
++ * mdp_phys 0xae00000; types dp,dsi,dsi,dp). Register layout as Linux
++ * dpu_hw_intf.c. Only read, except FRAME_LINE_COUNT_EN which the downstream
++ * driver itself sets to 3 when it programs a timing engine. */
++#define SWEET_INTF_PA           0x0ae6b000ULL
++#define INTF_TIMING_ENGINE_EN   0x000
++#define INTF_HSYNC_CTL          0x008
++#define INTF_VSYNC_PERIOD_F0    0x00c
++#define INTF_DISPLAY_V_START_F0 0x01c
++#define INTF_DISPLAY_V_END_F0   0x024
++#define INTF_FRAME_LINE_COUNT_EN 0x0a8
++#define INTF_FRAME_COUNT        0x0ac
++#define INTF_LINE_COUNT         0x0b0
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -167,6 +183,16 @@ public:
+ 	 * cheap; split them so the remaining cap is measured. */
+ 	uint64_t      fStatsGateUs, fStatsAcquireUs, fStatsCopyUs, fStatsSwaps;
+ 	uint32_t      fPendingFence, fPresentFence;   /* newest GPU fence when SwapEnd recorded the frame */
++	/* Beam-raced copy (0144): the DSC video-mode panel scans this single
++	 * buffer continuously, so a copy that starts behind the scan line tears
++	 * where it overtakes it. Start only where the copy cannot catch up. */
++	volatile uint32_t *fIntf;       /* the active INTF timing engine */
++	bool          fBeam, fBeamProbed;
++	uint32_t      fBeamTotal, fBeamFirst, fBeamLast;   /* lines: total, active first/last */
++	uint64_t      fBeamLineNs, fCopyRowNs;
++	uint64_t      fStatsBeamUs, fStatsBeamSkips;
++	void beamProbe(void);
++	void beamWait(uint32_t rows);
+ 	void rearmVsync(void);
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -582,10 +608,13 @@ AppleCLCD::rearmVsync(void)
+ 		const uint64_t acquire_us = __atomic_exchange_n(&fStatsAcquireUs, 0, __ATOMIC_RELAXED);
+ 		const uint64_t copy_us = __atomic_exchange_n(&fStatsCopyUs, 0, __ATOMIC_RELAXED);
+ 		const uint64_t swaps = __atomic_exchange_n(&fStatsSwaps, 0, __ATOMIC_RELAXED);
+-		IOLog("SWEET FB: timing window_ms=%llu callbacks=%llu present_calls=%llu missed_deadlines=%llu target=%u Hz present_avg_us=%llu present_max_us=%llu coalesced=%llu swaps=%llu gate_avg_us=%llu acquire_avg_us=%llu copy_avg_us=%llu\n",
++		const uint64_t beam_us = __atomic_exchange_n(&fStatsBeamUs, 0, __ATOMIC_RELAXED);
++		const uint64_t beam_skips = __atomic_exchange_n(&fStatsBeamSkips, 0, __ATOMIC_RELAXED);
++		IOLog("SWEET FB: timing window_ms=%llu callbacks=%llu present_calls=%llu missed_deadlines=%llu target=%u Hz present_avg_us=%llu present_max_us=%llu coalesced=%llu swaps=%llu gate_avg_us=%llu acquire_avg_us=%llu copy_avg_us=%llu beam_avg_us=%llu beam_skips=%llu\n",
+ 		    elapsed / NSEC_PER_MSEC, fStatsCallbacks, presents,
+ 		    fStatsMissed, fPresentHz, presents ? present_us / presents : 0, present_max, coalesced, swaps,
+-		    presents ? gate_us / presents : 0, presents ? acquire_us / presents : 0, presents ? copy_us / presents : 0);
++		    presents ? gate_us / presents : 0, presents ? acquire_us / presents : 0, presents ? copy_us / presents : 0,
++		    presents ? beam_us / presents : 0, beam_skips);
+ 		fStatsStart = now;
+ 		fStatsCallbacks = fStatsMissed = 0;
+ 	}
+@@ -599,6 +628,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	sweet_native_adreno_sample_busy();
+ 	++fb->fStatsCallbacks;
+ 	/* Fractional pacing also handles requested rates that do not divide 60. */
+ 	fb->fPresentPhase += fb->fPresentHz;
+@@ -788,6 +818,154 @@ static IOReturn sweet_fb_acquire(SweetSurface *s,uint64_t first,uint64_t last)
+  return kIOReturnSuccess;
+ }
+ 
++/* Find the running DSI timing engine (INTF_1/INTF_2) and measure its line
++ * period from the hardware frame counter. Any inconsistency leaves the copy
++ * unsynchronised, as before 0144. Runs once, on the present thread. */
++void
++AppleCLCD::beamProbe(void)
++{
++	fBeamProbed = true;
++	int beam = 1;
++	PE_parse_boot_argn("sweetfbbeam", &beam, sizeof(beam));
++	if (!beam) {
++		IOLog("SWEET FB: beam-raced copy off (sweetfbbeam=0)\n");
++		return;
++	}
++	volatile uint32_t *intf = (volatile uint32_t *)ml_io_map(SWEET_INTF_PA, 0x2000);
++	if (intf == NULL) {
++		IOLog("SWEET FB: beam: INTF map failed\n");
++		return;
++	}
++	for (unsigned i = 1; i <= 2; i++) {
++		volatile uint32_t *r = intf + i * 0x800 / 4;
++		const uint32_t en = r[INTF_TIMING_ENGINE_EN / 4], hctl = r[INTF_HSYNC_CTL / 4];
++		const uint32_t period = r[INTF_VSYNC_PERIOD_F0 / 4], vstart = r[INTF_DISPLAY_V_START_F0 / 4];
++		const uint32_t vend = r[INTF_DISPLAY_V_END_F0 / 4], lce = r[INTF_FRAME_LINE_COUNT_EN / 4];
++		IOLog("SWEET FB: beam: INTF_%u en=%#x hsync_ctl=%#x vsync_period=%#x v_start=%#x v_end=%#x count_en=%#x frame=%u line=%u\n",
++		    i, en, hctl, period, vstart, vend, lce, r[INTF_FRAME_COUNT / 4], r[INTF_LINE_COUNT / 4]);
++		const uint32_t hp = hctl >> 16;
++		if (!(en & 1) || hp == 0 || fIntf != NULL) {
++			continue;
++		}
++		const uint32_t total = period / hp, first = vstart / hp, last = (vend + 1) / hp;
++		if (last <= first || last > total || last - first != fHeight) {
++			IOLog("SWEET FB: beam: INTF_%u lines total=%u active=%u-%u do not match %u rows\n",
++			    i, total, first, last, fHeight);
++			continue;
++		}
++		fIntf = r;
++		fBeamTotal = total;
++		fBeamFirst = first;
++		fBeamLast = last;
++	}
++	if (fIntf == NULL) {
++		IOLog("SWEET FB: beam: no usable DSI timing engine; copy unsynchronised\n");
++		return;
++	}
++	if ((fIntf[INTF_FRAME_LINE_COUNT_EN / 4] & 3) != 3) {
++		fIntf[INTF_FRAME_LINE_COUNT_EN / 4] = 3;
++		IODelay(50);
++	}
++	/* Frame period between two counter edges ~200 ms apart. */
++	uint32_t f0 = fIntf[INTF_FRAME_COUNT / 4];
++	uint64_t t0 = 0, t1 = 0;
++	for (unsigned spins = 0; spins < 400; spins++) {
++		const uint32_t f = fIntf[INTF_FRAME_COUNT / 4];
++		if (f != f0) {
++			f0 = f;
++			t0 = mach_absolute_time();
++			break;
++		}
++		IODelay(50);
++	}
++	IOSleep(190);
++	uint32_t f1 = fIntf[INTF_FRAME_COUNT / 4];
++	const uint32_t target = f1 + 1;
++	for (unsigned spins = 0; t0 && spins < 400; spins++) {
++		f1 = fIntf[INTF_FRAME_COUNT / 4];
++		if (f1 == target) {
++			t1 = mach_absolute_time();
++			break;
++		}
++		IODelay(50);
++	}
++	uint64_t ns = 0;
++	if (t0 && t1) {
++		absolutetime_to_nanoseconds(t1 - t0, &ns);
++	}
++	const uint32_t frames = f1 - f0;
++	if (!t1 || frames == 0 || frames > 1000) {
++		IOLog("SWEET FB: beam: frame counter not advancing (frames=%u); copy unsynchronised\n", frames);
++		return;
++	}
++	fBeamLineNs = ns / frames / fBeamTotal;
++	uint32_t lines[4];
++	for (unsigned i = 0; i < 4; i++) {
++		lines[i] = fIntf[INTF_LINE_COUNT / 4];
++		IODelay(1000);
++	}
++	fBeam = fBeamLineNs != 0;
++	IOLog("SWEET FB: beam-raced copy %s: %u lines (active %u-%u), frame %llu us over %u frames, line %llu ns, samples %u %u %u %u\n",
++	    fBeam ? "on" : "off", fBeamTotal, fBeamFirst, fBeamLast, ns / frames / 1000, frames, fBeamLineNs,
++	    lines[0], lines[1], lines[2], lines[3]);
++}
++
++/* The copy writes rows top to bottom faster than the panel scans them. Begun
++ * while the scan is at active row b, it overtakes the scan at row
++ * b/(1 - copy/scan) - after the last copied row when b >= rows*(1 - copy/scan).
++ * So start in that late window (with a 1.5x copy-time margin), never in the
++ * last lines before the wrap, where fetch-ahead may already read the next frame. */
++void
++AppleCLCD::beamWait(uint32_t rows)
++{
++	if (!fBeamProbed) {
++		beamProbe();
++	}
++	if (!fBeam || rows == 0 || rows > fBeamLast - fBeamFirst) {
++		return;
++	}
++	const uint64_t copy = (fCopyRowNs ? fCopyRowNs : 1100) * 3 / 2, scan = fBeamLineNs;
++	if (copy >= scan) {
++		__atomic_add_fetch(&fStatsBeamSkips, 1, __ATOMIC_RELAXED);
++		return;
++	}
++	const uint32_t from = fBeamFirst + rows - (uint32_t)((uint64_t)rows * copy / scan);
++	const uint32_t to = fBeamLast - 16;
++	if (from >= to) {
++		__atomic_add_fetch(&fStatsBeamSkips, 1, __ATOMIC_RELAXED);
++		return;
++	}
++	const uint64_t began = mach_absolute_time();
++	uint32_t line = 0, before = fIntf[INTF_LINE_COUNT / 4];
++	bool ok = false;
++	for (unsigned tries = 0; tries < 6; tries++) {
++		line = fIntf[INTF_LINE_COUNT / 4];
++		if (line >= fBeamTotal) {
++			break;
++		}
++		if (line >= from && line < to) {
++			ok = true;
++			break;
++		}
++		const uint32_t ahead = line < from ? from - line : fBeamTotal - line + from;
++		IODelay((unsigned)((uint64_t)ahead * scan / NSEC_PER_USEC) + 1);
++	}
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++	__atomic_add_fetch(&fStatsBeamUs, ns / NSEC_PER_USEC, __ATOMIC_RELAXED);
++	if (!ok) {
++		__atomic_add_fetch(&fStatsBeamSkips, 1, __ATOMIC_RELAXED);
++	}
++	static unsigned logged;
++	if (logged < 8 || !ok) {
++		if (logged < 24) {
++			logged++;
++			IOLog("SWEET FB: beam wait rows=%u window=%u-%u line %u -> %u in %llu us copy_row_ns=%llu %s\n",
++			    rows, from, to, before, line, ns / NSEC_PER_USEC, fCopyRowNs, ok ? "ok" : "gave up");
++		}
++	}
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -901,6 +1079,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 			}
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			if (gate.state > 0 && dy == 0) {
++				beamWait((uint32_t)h);
++			}
+ 			const uint64_t copy_began = mach_absolute_time();
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+@@ -910,6 +1091,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 			uint64_t copy_ns = 0;
+ 			absolutetime_to_nanoseconds(mach_absolute_time() - copy_began, &copy_ns);
+ 			__atomic_add_fetch(&fStatsCopyUs, copy_ns / NSEC_PER_USEC, __ATOMIC_RELAXED);
++			if (h >= 256 && w >= (int32_t)fWidth / 2) {
++				/* Running estimate of the time per copied panel row. */
++				const uint64_t row = copy_ns / (uint64_t)h;
++				fCopyRowNs = fCopyRowNs ? (fCopyRowNs * 3 + row) / 4 : row;
++			}
+ 		}
+ 		s->release();
+ 	}

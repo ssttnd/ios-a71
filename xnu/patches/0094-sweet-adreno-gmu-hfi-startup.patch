@@ -1,0 +1,476 @@
+diff --git a/bsd/dev/sweet_adreno_dma.h b/bsd/dev/sweet_adreno_dma.h
+--- a/bsd/dev/sweet_adreno_dma.h
++++ b/bsd/dev/sweet_adreno_dma.h
+@@ -44,11 +44,36 @@
+  volatile uint32_t *table;
+  void (*barrier)(void *);
+  void *cookie;
++ unsigned sequence, poisoned;
+ };
+ int a618_hfi_init(struct a618_hfi *, const struct a618_dma_region *,
+  void (*)(void *), void *);
+ int a618_hfi_write(struct a618_hfi *, const uint32_t *, unsigned);
+ int a618_hfi_read(struct a618_hfi *, unsigned, uint32_t *, unsigned, unsigned *);
++/* Single caller, polled legacy v1 RPC. A timeout/fault poisons the session:
++ * never reuse it or release DMA memory while firmware ownership is uncertain.
++ * payload_words is a required response length, not an unchecked copy size.
++ */
++int a618_hfi_call(struct a618_hfi *, const struct a618_io *, unsigned,
++ const uint32_t *, unsigned, uint32_t *, unsigned);
++int a618_hfi_bootstrap(struct a618_hfi *, const struct a618_io *,
++ uint32_t gpu_vote, uint32_t gmu_vote, uint32_t *firmware_version);
++struct a618_gmu_boot_result {
++ unsigned phase;
++ uint32_t offset, value, firmware_version;
++};
++/* SM7150/A618 cold boot only. Firmware must be staged, the shared SMMU
++ * mappings verified and all clocks/parent rails held before calling.
++ * PDC/PDC-sequence apertures are the SM7150 DT regions. No warm resume,
++ * CP/SQE init, GPU stream mapping, graphics service or rendering here.
++ */
++int a618_gmu_boot_legacy(const struct a618_io *, const struct a618_io *,
++ const struct a618_io *, struct a618_hfi *, uint32_t, uint32_t,
++ struct a618_gmu_boot_result *);
++/* Read command DB only; constructs raw ARC votes for the documented MIN_SVS
++ * 180 MHz GPU / 200 MHz GMU operating points. No ACTIVE rail write.
++ */
++int sweet_rpmh_adreno_votes(uint32_t *, uint32_t *);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/bsd/dev/sweet_adreno_gmu.c b/bsd/dev/sweet_adreno_gmu.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_adreno_gmu.c
+@@ -0,0 +1,186 @@
++/* SPDX-License-Identifier: MIT
++ * A618 cold-start implementation using the pinned SM7150 Linux register and
++ * firmware protocols. See docs/adreno-port.md for scope and source hashes.
++ * Single caller. No dynamic clock scaling, warm boot, IRQs or CP submission.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(KERNEL)
++#include <sys/errno.h>
++#else
++#include <errno.h>
++#endif
++#include "sweet_adreno_dma.h"
++#define GMU_CM3_DTCM_START 0x7000u
++#define GMU_GENERAL_7 0x14730u
++#define GMU_CM3_BOOT_CONFIG 0x14004u
++#define GMU_HFI_QTBL_ADDR 0x14614u
++#define GMU_HFI_QTBL_INFO 0x14610u
++#define GMU_AHB_FENCE_RANGE_0 0x24c44u
++#define GMU_CM3_CFG 0x140b4u
++#define GMU_HFI_SFR_ADDR 0x14608u
++#define GPU_GMU_CX_GMU_PWR_COL_CP_MSG 0x14400u
++#define GPU_GMU_CX_GMU_PWR_COL_CP_RESP 0x14404u
++#define GMU_SYS_BUS_CONFIG 0x1303cu
++#define GMU_ICACHE_CONFIG 0x13000u
++#define GMU_DCACHE_CONFIG 0x13004u
++#define GMU_PWR_COL_INTER_FRAME_CTRL 0x14300u
++#define GMU_RPMH_CTRL 0x143a0u
++#define GMU_BOOT_SLUMBER_OPTION 0x8fe0u
++#define GMU_GX_VOTE_IDX 0x8fe4u
++#define GMU_MX_VOTE_IDX 0x8fe8u
++#define GMU_HOST2GMU_INTR_SET 0x14650u
++#define GMU_GMU2HOST_INTR_INFO 0x14648u
++#define GMU_GMU2HOST_INTR_CLR 0x14644u
++#define GMU_GMU2HOST_INTR_MASK 0x1464cu
++#define GMU_AO_HOST_INTERRUPT_MASK 0x24c18u
++#define GMU_GX_SPTPRAC_POWER_CONTROL 0x204u
++#define GMU_SPTPRAC_PWR_CLK_STATUS 0x14340u
++#define GMU_HFI_CTRL_INIT 0x14618u
++#define GMU_HFI_CTRL_STATUS 0x14600u
++
++static int
++valid_io(const struct a618_io *io)
++{
++ return io && io->read && io->write && io->delay_us;
++}
++static int
++poll(const struct a618_io *io, uint32_t offset, uint32_t mask,
++ uint32_t expected, unsigned timeout, struct a618_gmu_boot_result *result)
++{
++ result->offset = offset;
++ for (unsigned us = 0; us <= timeout; us += 10) {
++  result->value = io->read(io->cookie, offset);
++  if (result->value == 0xffffffffu) return EIO;
++  uint32_t faults = io->read(io->cookie, 0x24c14); /* AO status */
++  uint32_t interrupts = io->read(io->cookie, GMU_GMU2HOST_INTR_INFO);
++  if (faults == 0xffffffffu || interrupts == 0xffffffffu ||
++      (faults & 0x29) || (interrupts & (1u << 23))) return EIO;
++  if ((result->value & mask) == expected) return 0;
++  if (us != timeout) io->delay_us(io->cookie, 10);
++ }
++ return ETIMEDOUT;
++}
++static void
++rscc_write(const struct a618_io *gmu, unsigned reg, uint32_t value)
++{
++ gmu->write(gmu->cookie, 0x23000 + reg * 4, value);
++}
++static void
++pdc_program(const struct a618_io *gmu, const struct a618_io *pdc,
++ const struct a618_io *seq)
++{
++ /* SM7150 A618 constants, not the newer A650/A7xx sequence. */
++ static const uint32_t rsc[] = {
++  0xa7a506a0, 0xa1e6a6e7, 0xa2e081e1, 0xe9a982e2, 0x0020e8a8 };
++ static const uint32_t program[] = {
++  0xfebea1e1, 0xa5a4a3a2, 0x8382a6e0, 0xbce3e284, 0x002081fc };
++ rscc_write(gmu, 4, 1u << 24);
++ rscc_write(gmu, 0xb, 1);
++ for (unsigned i = 0; i < 3; ++i) {
++  rscc_write(gmu, 0xe + i * 2, i == 2 ? 0x80000000 : 0);
++  rscc_write(gmu, 0xd + i * 2, 0);
++ }
++ rscc_write(gmu, 0x100, 0);
++ rscc_write(gmu, 8, 0x4520);
++ rscc_write(gmu, 9, 0x4510);
++ rscc_write(gmu, 0xa, 0x4514);
++ for (unsigned i = 0; i < 5; ++i) {
++  rscc_write(gmu, 0x180 + i, rsc[i]);
++  seq->write(seq->cookie, i * 4, program[i]);
++ }
++ /* Third address is the target-specific A618 PDC resource from Linux.
++  * Do not label it xo.lvl without command-DB identity evidence. */
++ static const uint32_t address[] = {0x30010, 0x30000, 0x30090};
++ static const uint32_t sleep[] = {1, 0, 0}, wake[] = {2, 2, 3};
++ for (unsigned bank = 0; bank < 2; ++bank) {
++  unsigned base = bank ? 0x15d6 : 0x1572; /* TCS3 / TCS1 DWORD offsets */
++  pdc->write(pdc->cookie, (base + 1) * 4, 7);
++  pdc->write(pdc->cookie, (base + 2) * 4, 0);
++  pdc->write(pdc->cookie, base * 4, 0);
++  for (unsigned i = 0; i < 3; ++i) {
++   unsigned command = base + 3 + 4 * i;
++   pdc->write(pdc->cookie, command * 4, 0x10108);
++   pdc->write(pdc->cookie, (command + 1) * 4, address[i]);
++   pdc->write(pdc->cookie, (command + 2) * 4, bank ? wake[i] : sleep[i]);
++  }
++ }
++ pdc->write(pdc->cookie, 0x1148 * 4, 0);
++ pdc->write(pdc->cookie, 0x1140 * 4, 0x80000001);
++}
++int
++a618_gmu_boot_legacy(const struct a618_io *gmu, const struct a618_io *pdc,
++ const struct a618_io *seq, struct a618_hfi *hfi, uint32_t gpu_vote,
++ uint32_t gmu_vote, struct a618_gmu_boot_result *result)
++{
++ if (!valid_io(gmu) || !valid_io(pdc) || !valid_io(seq) || !hfi ||
++     !hfi->table || !hfi->barrier || hfi->poisoned || !result ||
++     !(gpu_vote >> 16) || !(gmu_vote >> 16)) return EINVAL;
++ result->phase = result->offset = result->value = result->firmware_version = 0;
++ /* Never reload a running M3 or pretend a warm boot is cold. The caller
++  * has already validated every SMMU page and the unmapped guard. */
++ if (gmu->read(gmu->cookie, A618_GMU_SYSRESET) != 1) return EBUSY;
++ uint32_t version = gmu->read(gmu->cookie, GMU_CM3_DTCM_START + 0xff8 * 4);
++ if (version == 0xffffffffu) return EIO;
++ /* Polled faults only; no unhandled GMU interrupts reach the host GIC. */
++ gmu->write(gmu->cookie, GMU_GMU2HOST_INTR_MASK, 0xffffffffu);
++ gmu->write(gmu->cookie, GMU_AO_HOST_INTERRUPT_MASK, 0xffffffffu);
++ gmu->write(gmu->cookie, GMU_GMU2HOST_INTR_CLR, 0xffffffffu);
++ gmu->write(gmu->cookie, 0x24c10, 0xffffffffu); /* AO status W1C */
++ /* A reset M3 does not prove the independent RSC sequencer is idle. */
++ if (gmu->read(gmu->cookie, 0x23000 + 0x101 * 4) != 0) return EBUSY;
++ pdc_program(gmu, pdc, seq);
++ gmu->write(gmu->cookie, GMU_GENERAL_7, 1);
++ gmu->write(gmu->cookie, A618_GMU_FW_INIT_RESULT, 0);
++ gmu->write(gmu->cookie, GMU_CM3_BOOT_CONFIG, 2);
++ gmu->write(gmu->cookie, GMU_HFI_QTBL_ADDR, A618_HFI_IOVA);
++ gmu->write(gmu->cookie, GMU_HFI_QTBL_INFO, 1);
++ gmu->write(gmu->cookie, GMU_AHB_FENCE_RANGE_0, (1u << 31) | (0xau << 18) | 0xa0);
++ gmu->write(gmu->cookie, GMU_CM3_CFG, 0x4052);
++ /* 0x06010800 chipid in the GMU's packed minor/patch layout. */
++ gmu->write(gmu->cookie, GMU_HFI_SFR_ADDR, 0x06018000);
++ gmu->write(gmu->cookie, GPU_GMU_CX_GMU_PWR_COL_CP_MSG, A618_LOG_IOVA | 3);
++ gmu->write(gmu->cookie, GMU_SYS_BUS_CONFIG, 1);
++ gmu->write(gmu->cookie, GMU_ICACHE_CONFIG, 1);
++ gmu->write(gmu->cookie, GMU_DCACHE_CONFIG, 1);
++ /* ACTIVE idle policy: no automatic GX collapse until recovery exists. */
++ gmu->write(gmu->cookie, GMU_PWR_COL_INTER_FRAME_CTRL, 0x09c40400);
++ uint32_t rpmh = gmu->read(gmu->cookie, GMU_RPMH_CTRL);
++ if (rpmh == 0xffffffffu) return EIO;
++ gmu->write(gmu->cookie, GMU_RPMH_CTRL, rpmh | 0xf11);
++ gmu->write(gmu->cookie, GPU_GMU_CX_GMU_PWR_COL_CP_RESP, 0);
++ hfi->barrier(hfi->cookie);
++ result->phase = 1;
++ gmu->write(gmu->cookie, A618_GMU_SYSRESET, 0);
++ int error = poll(gmu, A618_GMU_FW_INIT_RESULT,
++     version <= 0x20010004 ? 0xffffffffu : 0x1ff,
++     version <= 0x20010004 ? 0xbabeface : 0x100, 10000, result);
++ if (error) goto failed;
++ result->phase = 2;
++ gmu->write(gmu->cookie, GMU_BOOT_SLUMBER_OPTION, 0);
++ gmu->write(gmu->cookie, GMU_GX_VOTE_IDX, gpu_vote & 255);
++ gmu->write(gmu->cookie, GMU_MX_VOTE_IDX, (gpu_vote >> 8) & 255);
++ gmu->write(gmu->cookie, GMU_HOST2GMU_INTR_SET, 1u << 22);
++ error = poll(gmu, GMU_GMU2HOST_INTR_INFO, 1u << 30, 1u << 30, 10000, result);
++ gmu->write(gmu->cookie, GMU_GMU2HOST_INTR_CLR, 1u << 30);
++ if (error) goto failed;
++ result->phase = 3;
++ gmu->write(gmu->cookie, GMU_GX_SPTPRAC_POWER_CONTROL, 0x778000);
++ error = poll(gmu, GMU_SPTPRAC_PWR_CLK_STATUS, 0x38, 0x28, 100, result);
++ if (error) goto failed;
++ result->phase = 4;
++ gmu->write(gmu->cookie, GMU_HFI_CTRL_INIT, 1);
++ error = poll(gmu, GMU_HFI_CTRL_STATUS, 1, 1, 10000, result);
++ if (error) goto failed;
++ result->phase = 5;
++ error = a618_hfi_bootstrap(hfi, gmu, gpu_vote, gmu_vote, &result->firmware_version);
++ if (error) goto failed;
++ result->phase = 6; /* GMU/HFI ready; this does not imply a working GPU CP. */
++ return 0;
++failed:
++ /* Do not reset/power down behind an in-flight RPMh transaction or free
++  * its DMA storage. Preserve the failure registers and poison the session.
++  * Controlled shutdown/recovery is still required before any retry. */
++ hfi->poisoned = 1;
++ return error;
++}
++#endif
+diff --git a/bsd/dev/sweet_adreno_hfi.c b/bsd/dev/sweet_adreno_hfi.c
+--- a/bsd/dev/sweet_adreno_hfi.c
++++ b/bsd/dev/sweet_adreno_hfi.c
+@@ -36,6 +36,7 @@
+  hfi->table = (volatile uint32_t *)(memory->cpu + A618_TABLE_BYTES +
+      (A618_HFI_IOVA - A618_SHARED_IOVA));
+  hfi->barrier = barrier; hfi->cookie = cookie;
++ hfi->sequence = hfi->poisoned = 0;
+  for (unsigned i = 0; i < 4096; ++i) hfi->table[i] = 0;
+  hfi->table[0] = 0;
+  hfi->table[1] = 24 + 3 * 48; /* size in bytes; offsets below in DWORDs */
+@@ -82,7 +83,11 @@
+  int error = indices(hfi, queue, &read, &write);
+  if (error) return error;
+  unsigned available = (write + QUEUE_WORDS - read) % QUEUE_WORDS;
+- if (!available) return EAGAIN;
++ if (!available) {
++  queue_header(hfi, queue)[8] = 1;
++  hfi->barrier(hfi->cookie);
++  return EAGAIN;
++ }
+  volatile uint32_t *data = hfi->table + (queue + 1) * QUEUE_WORDS;
+  unsigned size = (data[read] >> 8) & 255;
+  if (!size) return EIO;
+@@ -95,4 +100,103 @@
+  *count = size;
+  return 0;
+ }
++
++/* GMU-relative byte offsets from the A6xx register XML. Keep host IRQs
++ * masked: this backend polls, and no XNU interrupt handler is installed. */
++#define HFI_INTR_INFO 0x14648u
++#define HFI_INTR_CLEAR 0x14644u
++#define HFI_DOORBELL 0x14650u
++#define HFI_CM3_FAULT (1u << 23)
++int
++a618_hfi_call(struct a618_hfi *hfi, const struct a618_io *io, unsigned id,
++ const uint32_t *body, unsigned body_words, uint32_t *payload,
++ unsigned payload_words)
++{
++ if (!hfi || !hfi->table || !hfi->barrier || !io || !io->read ||
++     !io->write || !io->delay_us || id > 255 || body_words > 254 ||
++     (body_words && !body) || payload_words > 252 ||
++     (payload_words && !payload)) return EINVAL;
++ if (hfi->poisoned) return EIO;
++ uint32_t message[255];
++ hfi->sequence = (hfi->sequence + 1) % 0xfffu;
++ uint32_t sent = (hfi->sequence << 20) | ((body_words + 1) << 8) | id;
++ message[0] = sent;
++ for (unsigned i = 0; i < body_words; ++i) message[i + 1] = body[i];
++ int error = a618_hfi_write(hfi, message, body_words + 1);
++ if (error) return error; /* Nothing published on a rejected append. */
++ io->write(io->cookie, HFI_DOORBELL, 1);
++ for (unsigned elapsed = 0; elapsed < 10000; elapsed += 10) {
++  uint32_t interrupt = io->read(io->cookie, HFI_INTR_INFO);
++  if (interrupt == 0xffffffffu || (interrupt & HFI_CM3_FAULT)) {
++   error = EIO; goto failed;
++  }
++  /* W1C before reading: a concurrent firmware append remains visible via
++   * the queue indices, including when no fresh interrupt edge is seen. */
++  if (interrupt & 1) io->write(io->cookie, HFI_INTR_CLEAR, 1);
++  unsigned words = 0;
++  error = a618_hfi_read(hfi, 1, message, 255, &words);
++  if (error != EAGAIN && error) goto failed;
++  if (!error) {
++   unsigned received_id = message[0] & 255;
++   unsigned type = (message[0] >> 16) & 15;
++   if (received_id == 100) { error = EIO; goto failed; }
++   if (received_id != 126 || type != 2 || words < 3) {
++    error = EPROTO; goto failed;
++   }
++   /* Full echoed header matches id, length, type and sequence. Stale ACKs
++    * are consumed within this same bounded deadline, never accepted. */
++   if (message[1] == sent) {
++    if (message[2]) { error = EIO; goto failed; }
++    if (words < 3 + payload_words) { error = EPROTO; goto failed; }
++    for (unsigned i = 0; i < payload_words; ++i) payload[i] = message[3 + i];
++    return 0;
++   }
++  }
++  /* Drain a single debug packet per iteration so logs cannot deadlock FW.
++   * All queue indices and packet sizes pass the same validation. */
++  error = a618_hfi_read(hfi, 2, message, 255, &words);
++  if (error != EAGAIN && error) goto failed;
++  if (!error && (message[0] & 255) == 100) { error = EIO; goto failed; }
++  io->delay_us(io->cookie, 10);
++ }
++ error = ETIMEDOUT;
++failed:
++ hfi->poisoned = 1;
++ return error;
++}
++
++int
++a618_hfi_bootstrap(struct a618_hfi *hfi, const struct a618_io *io,
++ uint32_t gpu_vote, uint32_t gmu_vote, uint32_t *firmware_version)
++{
++ if (!firmware_version || !(gpu_vote >> 16) || !(gmu_vote >> 16)) return EINVAL;
++ *firmware_version = 0;
++ uint32_t init[] = {0, A618_DEBUG_IOVA, 0x4000, 1}; /* cold boot = 1 */
++ int error = a618_hfi_call(hfi, io, 0, init, 4, 0, 0);
++ if (error) return error;
++ uint32_t supported = (1u << 28) | (1u << 19) | (1u << 17); /* HFI 1.10 */
++ error = a618_hfi_call(hfi, io, 1, &supported, 1, firmware_version, 1);
++ if (error) return error;
++ /* Two levels include the mandatory off entry; units are kHz. Upper
++  * corners stay absent until power, thermal control and recovery exist. */
++ uint32_t perf[42] = {0}; /* body of the fixed 43-DWORD v1 message */
++ perf[0] = perf[1] = 2;
++ perf[4] = gpu_vote; perf[5] = 180000;
++ perf[36] = gmu_vote; perf[37] = 200000;
++ error = a618_hfi_call(hfi, io, 4, perf, 42, 0, 0);
++ if (error) return error;
++ /* A618 uses a single DDR off entry: GMU does not scale its bus. Exact
++  * target-specific wire constants from Linux a618_build_bw_table().
++  * Host interconnect bandwidth remains a separate prerequisite. */
++ uint32_t bw[159] = {0}; /* body of the fixed 160-DWORD message */
++ bw[0] = 1; bw[1] = 1; bw[2] = 3; bw[3] = bw[4] = 1;
++ bw[5] = 0x5007c;
++ bw[11] = 0x40000000; bw[17] = 0x60000001;
++ bw[23] = 0x50000; bw[24] = 0x5003c; bw[25] = 0x5000c;
++ bw[31] = bw[32] = bw[33] = 0x40000000;
++ error = a618_hfi_call(hfi, io, 3, bw, 159, 0, 0);
++ if (error) return error;
++ /* Wire message 5 ends legacy initialization (named TEST in Linux). */
++ return a618_hfi_call(hfi, io, 5, 0, 0, 0, 0);
++}
+ #endif
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -6,7 +6,8 @@
+  * sweetgpu=5 enables GMU/bus clocks and reads CX-side GMU/SMMU status.
+  * sweetgpu=6 additionally stages firmware while the M3 remains in reset.
+  * sweetgpu=7 additionally validates SMMU mappings and prepares HFI RAM.
+- * GX is firmware controlled. No GPU core access or command submission.
++ * sweetgpu=8 cold-starts legacy GMU and exchanges real HFI messages.
++ * GX is firmware controlled. No CP/SQE or graphics submission yet.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -263,6 +264,28 @@
+   printf("SWEET ADRENO: SMMU mapping check complete; SYSRESET=%#x; no firmware execution\n",
+       sweet_adreno_read((void *)gmu, A618_GMU_SYSRESET));
+   if (error) return error;
++  if (stage >= 8) {
++   uint32_t gpu_vote = 0, gmu_vote = 0;
++   error = sweet_rpmh_adreno_votes(&gpu_vote, &gmu_vote);
++   printf("SWEET ADRENO: MIN_SVS votes errno=%d GPU=%#x GMU=%#x\n",
++       error, gpu_vote, gmu_vote);
++   if (error) return error;
++   /* PDC apertures from the pinned SM7150 DT, shared by the live A618. */
++   vm_offset_t pdc = ml_io_map(0x0b290000, 0x10000);
++   vm_offset_t seq = ml_io_map(0x0b490000, 0x10000);
++   if (!pdc || !seq) return ENOMEM;
++   const struct a618_io pdc_io = {(void *)pdc,
++       sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay};
++   const struct a618_io seq_io = {(void *)seq,
++       sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay};
++   struct a618_gmu_boot_result boot;
++   bzero(&boot, sizeof(boot));
++   error = a618_gmu_boot_legacy(&gmu_io, &pdc_io, &seq_io, &hfi,
++       gpu_vote, gmu_vote, &boot);
++   printf("SWEET ADRENO: legacy GMU boot errno=%d phase=%u offset=%#x value=%#x FW=%#x; CP unavailable\n",
++       error, boot.phase, boot.offset, boot.value, boot.firmware_version);
++   return error;
++  }
+  }
+ 	printf("SWEET ADRENO: GMU preparation complete; GX remains firmware controlled, no submission\n");
+ 	return 0;
+@@ -340,8 +363,8 @@
+ 	}
+ 	sweet_gpu_probe_attempted = 1;
+ 	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
+-	if (enabled < 1 || enabled > 7) {
+-		printf("SWEET GPU: audit disabled; sweetgpu=1 read-only, 2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 GMU clocks/status, 6 firmware staging, 7 DMA/SMMU/HFI mappings\n");
++	if (enabled < 1 || enabled > 8) {
++		printf("SWEET GPU: audit disabled; sweetgpu=1 read-only, 2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 GMU clocks/status, 6 firmware staging, 7 DMA/SMMU/HFI mappings, 8 legacy GMU/HFI startup\n");
+ 		return;
+ 	}
+ 
+@@ -384,7 +407,7 @@
+ 		return;
+ 	}
+ 	if (enabled == 1) {
+-		printf("SWEET GPU: read-only audit complete; sweetgpu=2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 GMU clocks/status, 6 firmware staging, 7 DMA/SMMU/HFI mappings\n");
++		printf("SWEET GPU: read-only audit complete; sweetgpu=2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 GMU clocks/status, 6 firmware staging, 7 DMA/SMMU/HFI mappings, 8 legacy GMU/HFI startup\n");
+ 		return;
+ 	}
+ 	sweet_gpu_stage = enabled;
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -502,6 +502,43 @@
+ 	return error;
+ }
+ 
++/* Build wire votes from raw command-DB levels, not regulator levels (+1).
++ * Uses only command-DB RAM: no new ACTIVE TCS write authority. */
++int sweet_rpmh_adreno_votes(uint32_t *gpu, uint32_t *gmu);
++int
++sweet_rpmh_adreno_votes(uint32_t *gpu, uint32_t *gmu)
++{
++ if (!gpu || !gmu) return EINVAL;
++ *gpu = *gmu = 0;
++ if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
++ const char *names[] = {"gfx.lvl", "cx.lvl", "mx.lvl"};
++ const uint32_t address[] = {0x30050, 0x30000, 0x30010};
++ uint32_t levels[3][RH_ARC_MAX_LEVELS] = {{0}};
++ unsigned counts[3] = {0}, selected[3] = {0};
++ int error = rh_map();
++ for (unsigned r = 0; !error && r < 3; ++r) {
++  struct rh_res resource = {0};
++  error = rh_lookup(names[r], RH_ARC, &resource);
++  if (!error && resource.addr != address[r]) error = ENODEV;
++  if (!error) error = rh_arc_levels(&resource, levels[r], &counts[r]);
++  if (error) break;
++  /* MIN_SVS is raw 48 in the pinned RPMh bindings. The measured
++  * GFX/CX tables round this up to 64; MX rounds up to 192. */
++  unsigned i;
++  for (i = 0; i < counts[r]; ++i) {
++   --levels[r][i];
++   if (!selected[r] && levels[r][i] >= 48) selected[r] = i;
++  }
++  if (!selected[r] || levels[r][0] != 0) error = ERANGE;
++ }
++ if (!error) {
++  *gpu = (levels[0][selected[0]] << 16) | (selected[2] << 8) | selected[0];
++  *gmu = (levels[1][selected[1]] << 16) | (selected[2] << 8) | selected[1];
++ }
++ __atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++ return error;
++}
++
+ /*
+  * Read one ARC resource while the caller holds rh_lock. The same serialized
+  * ACTIVE TCS engine is used for reads and for the raise-only write below.
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,3 +117,4 @@
+ bsd/dev/sweet_adreno_smmu.c		standard
+ bsd/dev/sweet_adreno_hfi.c			standard
++bsd/dev/sweet_adreno_gmu.c			standard
+ bsd/dev/mem.c				standard

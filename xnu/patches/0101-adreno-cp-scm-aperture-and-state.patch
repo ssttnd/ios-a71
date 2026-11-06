@@ -1,0 +1,155 @@
+diff --git a/bsd/dev/sweet_adreno_cp.h b/bsd/dev/sweet_adreno_cp.h
+--- a/bsd/dev/sweet_adreno_cp.h
++++ b/bsd/dev/sweet_adreno_cp.h
+@@ -21,6 +21,10 @@
+ struct a618_cp_result {
+  unsigned phase, submitted, completed;
+  uint32_t rptr, wptr, status, interrupt, hw_fault, fence, value;
++ unsigned aperture_phase;
++ int aperture_error;
++ int64_t aperture_status;
++ uint64_t aperture_response;
+  int poisoned;
+ };
+ /* Trusted kernel commands only. The caller verified SQE blob CRC, GPU stream
+@@ -30,6 +34,8 @@
+  const struct a618_dma_region *, const unsigned char *, unsigned,
+  void (*)(void *), void *, struct a618_cp_result *);
+ struct a618_pas_result { unsigned phase; int64_t status; uint64_t response; };
++/* Optional SCM MP/CP aperture setup, fixed to the driver-owned CB0. */
++int a618_cp_configure_aperture(struct a618_pas_result *);
+ /* Signed device ZAP only, live reserved range must match the device DT.
+  * Metadata lives in its own permanently retained, cache-inhibited host page.
+  * No security-register fallback if firmware authorization fails. */
+diff --git a/bsd/dev/sweet_adreno_pas.c b/bsd/dev/sweet_adreno_pas.c
+--- a/bsd/dev/sweet_adreno_pas.c
++++ b/bsd/dev/sweet_adreno_pas.c
+@@ -14,7 +14,8 @@
+ }
+ static int
+ scm(unsigned service, unsigned command, uint64_t arguments,
+- uint64_t arg0, uint64_t arg1, uint64_t arg2, struct a618_pas_result *result)
++ uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3,
++ struct a618_pas_result *result)
+ {
+  uint64_t function = 0x42000000u | (service << 8) | command;
+  for (unsigned busy = 0; busy < 5; ++busy) {
+@@ -25,7 +26,7 @@
+    register uint64_t x2 __asm__("x2") = arg0;
+    register uint64_t x3 __asm__("x3") = arg1;
+    register uint64_t x4 __asm__("x4") = arg2;
+-   register uint64_t x5 __asm__("x5") = 0;
++   register uint64_t x5 __asm__("x5") = arg3;
+    register uint64_t x6 __asm__("x6") = quirk_a6;
+    register uint64_t x7 __asm__("x7") = 0;
+    __asm__ volatile("dsb sy\n\tsmc #0\n\tdsb sy" :
+@@ -44,6 +45,26 @@
+   if (busy != 4) delay(30000);
+  }
+  return EBUSY;
++}
++/* Public SCM aperture protocol used by the pinned Linux Adreno driver.
++ * Availability is optional; an advertised call that fails is fatal. The four
++ * arguments fit x2..x5 directly, so no shared extended-argument buffer exists.
++ * This entry cannot select another context or issue arbitrary SCM commands. */
++int
++a618_cp_configure_aperture(struct a618_pas_result *result)
++{
++ if (!result) return EINVAL;
++ *result = (struct a618_pas_result){ .phase = 1 };
++ int error = scm(6, 1, 1, 0x02000c1b, 0, 0, 0, result);
++ if (error == ENOTSUP) return 0; /* firmware lacks the optional query */
++ if (error) return error;
++ if (!result->response) return 0; /* optional MP command unavailable */
++ result->phase = 2;
++ error = scm(0x0c, 0x1b, 4, 0xffff0000, 0xffffffffu,
++     0xffffffffu, 0xffffffffu, result);
++ if (error) return error;
++ result->phase = 3;
++ return 0;
+ }
+ int
+ a618_zap_authenticate(volatile uint32_t *reserved, uint64_t physical,
+@@ -68,7 +89,7 @@
+  result->phase = 1;
+  const unsigned commands[] = {1, 2, 5};
+  for (unsigned i = 0; i < 3; ++i) {
+-  int error = scm(6, 1, 1, 0x02000200u | commands[i], 0, 0, result);
++  int error = scm(6, 1, 1, 0x02000200u | commands[i], 0, 0, 0, result);
+   if (error) return error;
+   if (!result->response) return ENOTSUP;
+  }
+@@ -76,18 +97,18 @@
+  for (unsigned i = 0; i < mdt_bytes / 4; ++i) words[i] = le32(mdt + i * 4);
+  __asm__ volatile("dsb sy" ::: "memory");
+  result->phase = 2;
+- int error = scm(2, 1, 0x82, 13, metadata->physical, 0, result);
++ int error = scm(2, 1, 0x82, 13, metadata->physical, 0, 0, result);
+  if (error || result->response) return error ? error : EACCES;
+  /* TZ may now protect metadata. Retain its separate page and do not read,
+   * modify, free or reuse it, including on errors below. */
+  result->phase = 3;
+- error = scm(2, 2, 3, 13, physical, 0x1000, result);
++ error = scm(2, 2, 3, 13, physical, 0x1000, 0, result);
+  if (error || result->response) return error ? error : EACCES;
+  for (unsigned i = 0; i < 0x1000 / 4; ++i) reserved[i] = 0;
+  for (unsigned i = 0; i < code_bytes / 4; ++i) reserved[i] = le32(code + i * 4);
+  __asm__ volatile("dsb sy" ::: "memory");
+  result->phase = 4;
+- error = scm(2, 5, 1, 13, 0, 0, result);
++ error = scm(2, 5, 1, 13, 0, 0, 0, result);
+  if (error || result->response) return error ? error : EACCES;
+  result->phase = 5;
+  return 0;
+diff --git a/bsd/dev/sweet_adreno_cp.c b/bsd/dev/sweet_adreno_cp.c
+--- a/bsd/dev/sweet_adreno_cp.c
++++ b/bsd/dev/sweet_adreno_cp.c
+@@ -243,6 +243,15 @@
+  if (gpu->read(gpu->cookie, CP_RB_RPTR_ADDR) != A618_CP_SHADOW_IOVA ||
+      gpu->read(gpu->cookie, CP_RB_RPTR_ADDR + 4)) goto failed;
+  gpu->write(gpu->cookie, CP_RB_CNTL, (1u << 27) | (2u << 8) | 12u);
++ /* Match the optional firmware-owned CP SMMU aperture setup before SQE
++  * can access context-bank state. GX is held by GPU_SET at this point. */
++ struct a618_pas_result aperture;
++ int aperture_error = a618_cp_configure_aperture(&aperture);
++ result->aperture_phase = aperture.phase;
++ result->aperture_error = aperture_error;
++ result->aperture_status = aperture.status;
++ result->aperture_response = aperture.response;
++ if (aperture_error) { result->poisoned = 1; return aperture_error; }
+  gpu->write(gpu->cookie, CP_SQE_CNTL, 1);
+  uint32_t init[] = {packet7(0x48, 8), 0x2f, 3, 0x20000000, 0, 0, 0, 0, 0};
+  int error = publish(gpu, gmu, memory, init, 9, barrier, cookie, result);
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -240,6 +240,8 @@
+  bzero(&cp, sizeof(cp));
+  error = a618_cp_start(&gpu_io, &gmu_io, &memory, sqe, sqe_size,
+      sweet_adreno_barrier, NULL, &cp);
++ printf("SWEET ADRENO: CP aperture errno=%d phase=%u status=%lld response=%#llx\n",
++     cp.aperture_error, cp.aperture_phase, cp.aperture_status, cp.aperture_response);
+  printf("SWEET ADRENO: SQE ME_INIT errno=%d phase=%u submitted=%u completed=%u RPTR=%#x WPTR=%#x status=%#x IRQ=%#x fault=%#x\n",
+      error, cp.phase, cp.submitted, cp.completed, cp.rptr, cp.wptr, cp.status,
+      cp.interrupt, cp.hw_fault);
+@@ -258,6 +260,20 @@
+      ((uint64_t)sweet_adreno_read((void *)core, 0x2004) << 32) | sweet_adreno_read((void *)core, 0x2000),
+      ((uint64_t)sweet_adreno_read((void *)core, 0x2014) << 32) | sweet_adreno_read((void *)core, 0x2010),
+      sweet_adreno_read((void *)core, 0x2008), sweet_adreno_read((void *)core, 0x2020));
++ if (error && cp.submitted) {
++  /* Bounded failure-only indexed SQE state, same 0x33-word bank as A6xx
++   * Linux devcoredump. Each DATA read auto-increments the index. No resume
++   * follows a poisoned CP, so changing this diagnostic selector is harmless. */
++  uint32_t state[51];
++  sweet_adreno_write((void *)core, 0x2420, 0);
++  for (unsigned i = 0; i < 51; ++i)
++   state[i] = sweet_adreno_read((void *)core, 0x2424);
++  for (unsigned i = 0; i < 51; i += 3)
++   printf("SWEET ADRENO: SQE_STAT[%u]=%#x,%#x,%#x\n", i, state[i], state[i + 1], state[i + 2]);
++  printf("SWEET ADRENO: CP hardware RPTR=%#x STATUS1=%#x INTERRUPT=%#x\n",
++      sweet_adreno_read((void *)core, 0x2018), sweet_adreno_read((void *)core, 0x2094),
++      sweet_adreno_read((void *)core, 0x208c));
++ }
+  if (error) return error;
+  error = sweet_adreno_pas_allocate(&metadata);
+  if (error) return error;

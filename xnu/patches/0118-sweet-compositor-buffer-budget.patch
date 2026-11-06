@@ -1,0 +1,97 @@
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -168,11 +168,15 @@
+  IOLockLock(backend.lock);
+  if(!mounted_ || closed_ || !healthy()) {IOLockUnlock(backend.lock);return kIOReturnNotReady;}
+  const uint64_t began=backend.clock.now_us(backend.clock.cookie);
++ uint64_t quiesce_us=0;
+  IOReturn result=kIOReturnSuccess;
+  // The single shared context must be idle through EVERY table edit and cache
+  // publication; completion is the actual CP fence, not a job-count estimate.
+  if(selector==NativeAdrenoMethodBoMap || selector==NativeAdrenoMethodBoFree || selector==NativeAdrenoMethodSubmit || selector==NativeAdrenoMethodSubmitResources)
++ {
+   result=quiesce();
++  quiesce_us=backend.clock.now_us(backend.clock.cookie)-began;
++ }
+  if(!result && selector==NativeAdrenoMethodBoImport) {
+   NativeAdrenoAbiBoImport request{};NativeAdrenoAbiBoAllocReply reply{};
+   memcpy(&request,args->structureInput,sizeof request);
+@@ -180,13 +184,20 @@
+   if(!result)memcpy(args->structureOutput,&reply,sizeof reply);
+  } else if(!result)result=core_->dispatch(selector,args->structureInput,input,args->structureOutput,output,&backend.clock);
+  if(!result)args->structureOutputSize=output;
++ if(selector==NativeAdrenoMethodBoMap) {
++  static unsigned maps=0;
++  if(++maps<=4 || maps%256==0 || result)
++   IOLog("SWEET RENDER: map %u objects=%lu/4128 spans=%lu/%lu total_us=%llu result=%#x\n",maps,
++    (unsigned long)backend.vm->objectCount(),(unsigned long)backend.vm->spanCount(),
++    (unsigned long)backend.vm->spanCapacity(),backend.clock.now_us(backend.clock.cookie)-began,result);
++ }
+  if(selector==NativeAdrenoMethodSubmitResources) {
+   static unsigned submissions=0;
+   if(++submissions<=8 || submissions%120==0) {
+    const auto *request=static_cast<const NativeAdrenoAbiSubmitResources *>(args->structureInput);
+-   IOLog("SWEET RENDER: scoped submit %u IBs=%u BOs=%u total_us=%llu result=%#x\n",submissions,
++   IOLog("SWEET RENDER: scoped submit %u IBs=%u BOs=%u total_us=%llu quiesce_us=%llu result=%#x\n",submissions,
+      request->commands.buffer_count,request->resource_count,
+-     backend.clock.now_us(backend.clock.cookie)-began,result);
++     backend.clock.now_us(backend.clock.cookie)-began,quiesce_us,result);
+   }
+  }
+ 
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoABI.h b/iokit/Kernel/arm/unixnu/NativeAdrenoABI.h
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoABI.h
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoABI.h
+@@ -43,6 +43,7 @@
+     uint64_t max_bo_bytes;
+ };
+ enum {
++    NativeAdrenoParamsCompositor4096 = 4, /* 4096 client BOs; residency set stays 1024 */
+     NativeAdrenoParamsSubmitResources = 2, /* complete per-submit BO read/write set */
+     NativeAdrenoParamsHostImport = 1  /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
+ };
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.cpp b/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.cpp
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.cpp
+@@ -119,7 +119,7 @@
+     if(!open_)return kIOReturnNotReady;
+     params->abi_version=NativeAdrenoAbiVersion;
+     params->input_bits=input_bits_;params->output_bits=output_bits_;
+-    params->flags=NativeAdrenoParamsHostImport|NativeAdrenoParamsSubmitResources;params->max_bo_bytes=UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;
++    params->flags=NativeAdrenoParamsHostImport|NativeAdrenoParamsSubmitResources|NativeAdrenoParamsCompositor4096;params->max_bo_bytes=UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;
+     return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoUserClient::allocBo(const NativeAdrenoAbiBoAlloc *request,
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.h b/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.h
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.h
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.h
+@@ -13,7 +13,7 @@
+  * pointer values. A mapping is retirable only through freeBo, which unmaps
+  * first and then releases the backing object; both steps must succeed.
+  * Up to NativeAdrenoClientMaxObjects live objects and the execbuf's own eight-job limit apply. */
+-enum : size_t {NativeAdrenoClientMaxObjects=1024,NativeAdrenoClientContiguousFirstBytes=65536};
++enum : size_t {NativeAdrenoClientMaxObjects=4096,NativeAdrenoClientContiguousFirstBytes=65536};
+ class NativeAdrenoUserClient final {
+     struct Queue {uint32_t id=0;bool active=false;};
+     struct Entry {
+diff --git a/iokit/Kernel/arm/unixnu/NativeAdrenoVm.h b/iokit/Kernel/arm/unixnu/NativeAdrenoVm.h
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoVm.h
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoVm.h
+@@ -26,7 +26,7 @@
+  * only the owned streams. Uncertain resources require independent real reset.
+  * No VM may be advertised to apps until per-client isolation, submission
+  * validation/protection, genuine IRQ fences and reset are implemented. */
+-enum : size_t {NativeAdrenoVmMaxObjects=1024};
++enum : size_t {NativeAdrenoVmMaxObjects=4128};
+ /* Board hook for sampleWord(): reads one aligned word of physical memory through a fresh uncached mapping; 0 on success. */
+ extern "C" int (*native_adreno_dram_read32)(uint64_t physical,uint32_t *value);
+ /* The board's reader through the kernel's cacheable physical aperture (null on the host: the BO's own mapping is read). */
+@@ -121,6 +121,7 @@
+     IOReturn retireJobAfterCompletion(uint64_t handle);
+     bool poisoned() const {return poisoned_;}
+     size_t objectCount() const {return objects_;}
++    size_t spanCapacity() const {return capacity_;}
+     size_t spanCount() const {return lower_count_+upper_count_;}
+     NativeAdrenoVmResult lastResult() const {return result_;}
+ };
