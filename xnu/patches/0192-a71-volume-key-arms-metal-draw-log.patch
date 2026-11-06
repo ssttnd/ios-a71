@@ -1,0 +1,61 @@
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -116,6 +116,10 @@
+ 				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
+ 				    k, state[k], pon, gpio);
+ 				sweet_hid_key(k, state[k]);
++				if (k != 0 && state[k]) {
++					extern void sweet_drawlog_arm(void);
++					sweet_drawlog_arm();    /* sweetdrawlogkey=1: bsd/dev/sweet_files.c */
++				}
+ 			}
+ 		}
+ 		keys_wait();
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -47,6 +47,7 @@
+ extern int sync(proc_t p, struct sync_args *uap, int32_t *retval);
+ void sweet_files_start(void);
+ void sweet_payload_start(void);
++void sweet_drawlog_arm(void);
+ extern int sweet_ufs_payload_read(uint32_t blk, uint32_t count, void *out);
+ extern int sweet_ufs_payload_clear(void);
+ extern struct vnode *rootvnode;
+@@ -488,6 +489,37 @@
+ 	printf("SWEET PAYLOAD: finished %u/%u errno=%d sync=%d clear=%d\n", done, h.entries, err, serr, cerr);
+ }
+ 
++/*
++ * 0192: the Metal bundle arms its draw log when /var/local/sweet-native-drawlog
++ * changes while it runs (SweetNativeDrawLog.inc). Without a network nothing can
++ * touch that file, so with sweetdrawlogkey=1 a volume key press does it: 4000
++ * draws, with vertices and constants for the 565x1220 blur target.
++ */
++void
++sweet_drawlog_arm(void)
++{
++	static int on = -1;
++	if (on < 0) {
++		int v = 0;
++		PE_parse_boot_argn("sweetdrawlogkey", &v, sizeof(v));
++		on = v;
++	}
++	if (!on) {
++		return;
++	}
++	char text[] = "4000 565x1220\n";
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int resid = 0;
++	int err = vnode_open("/private/var/local/sweet-native-drawlog", O_CREAT | O_TRUNC | FWRITE, 0644, 0, &vp, ctx);
++	if (!err) {
++		err = vn_rdwr(UIO_WRITE, vp, text, (int)strlen(text), 0, UIO_SYSSPACE, IO_UNIT,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		vnode_close(vp, FWRITE, ctx);
++	}
++	printf("SWEET DRAWLOG: armed by key, errno=%d resid=%d\n", err, resid);
++}
++
+ void
+ sweet_payload_start(void)
+ {
