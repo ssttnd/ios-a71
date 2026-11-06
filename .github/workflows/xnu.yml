@@ -34,9 +34,10 @@ env:
 
 jobs:
   build:
-    # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
-    # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-14
+    # macos-14 shipped Xcode 15.x (iig matching the xnu-8796 IORPC ABI) but its images
+    # were retired in November 2026. DC28088/ios-sweet built and booted a kernel from
+    # macos-15 with its oldest Xcode, picked below.
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -51,6 +52,21 @@ jobs:
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # The upstream builder skips rejected patches. Our patches must apply.
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          builder = Path("dxb/build.sh")
+          source = builder.read_text()
+          needle = '                warning "Skipping patch ${PATCH}'
+          assert source.count(needle) == 1, "builder patch loop changed"
+          names = "|".join(p.name for p in sorted(Path("xnu/patches").glob("*.patch")))
+          guard = ('                case "${PATCH##*/}" in\n'
+                   f'                    {names})\n'
+                   '                        printf "Required project patch rejected: %s\\n%s\\n" "$PATCH" "$APPLY_CHECK" >&2\n'
+                   '                        exit 1 ;;\n'
+                   '                esac\n')
+          builder.write_text(source.replace(needle, guard + needle))
+          PYCODE
           ls dxb/patches
 
       - name: Deps
@@ -121,6 +137,10 @@ jobs:
         run: |
           strings out/kernel.development.sweet | grep "Samsung S6SY771"
           strings out/kernel.development.sweet | grep "Qualcomm Adreno 618"
+          strings out/kernel.development.sweet | grep "SWEET CPUFREQ: domain %u selected lut"
+          strings out/kernel.development.sweet | grep "sweetbigcores"
+          strings out/kernel.development.sweet | grep "SWEET DDR: memory bandwidth vote"
+          strings out/kernel.development.sweet | grep "SWEET USB: bring-up: PHY rails"
 
       - uses: actions/upload-artifact@v4
         if: always()
