@@ -45,7 +45,8 @@ if os.environ.get('SWEETRTCOFFSET'):
     cmdline += f" sweetrtcoffset={int(os.environ['SWEETRTCOFFSET'])}"
 # Start the calendar at packaging time, not 1969; extra test arguments from SWEETARGS.
 import time
-cmdline += f" sweetbuildtime={int(time.time())}"
+if not os.environ.get('SWEETNOTIME'):
+    cmdline += f" sweetbuildtime={int(time.time())}"
 if os.environ.get('SWEETARGS'):
     cmdline += " " + os.environ['SWEETARGS']
 
