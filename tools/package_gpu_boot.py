@@ -43,6 +43,11 @@ cmdline = f"debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogres
 # The A71 RTC does not hold the real date. a71-flash-boot computes PC time minus RTC.
 if os.environ.get('SWEETRTCOFFSET'):
     cmdline += f" sweetrtcoffset={int(os.environ['SWEETRTCOFFSET'])}"
+# Start the calendar at packaging time, not 1969; extra test arguments from SWEETARGS.
+import time
+cmdline += f" sweetbuildtime={int(time.time())}"
+if os.environ.get('SWEETARGS'):
+    cmdline += " " + os.environ['SWEETARGS']
 
 print("\n1. Generating ADT...")
 subprocess.run(['python', 'tools/mkadt.py', 'build/a71_highmem.adt', '--highmem'], check=True)
