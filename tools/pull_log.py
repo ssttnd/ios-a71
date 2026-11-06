@@ -9,6 +9,7 @@ if not adb or not os.path.isfile(adb):
     candidates = [
         os.path.abspath("adb.exe"),
         os.path.abspath("adb"),
+        os.path.expandvars(r"%USERPROFILE%\Desktop\misc\misc\71stuff\Minimal ADB and Fastboot\adb.exe"),
         os.path.expandvars(r"%USERPROFILE%\Downloads\platform-tools-latest-windows\platform-tools\adb.exe"),
         r"C:\Users\Szymon\Downloads\platform-tools-latest-windows\platform-tools\adb.exe",
         r"C:\Users\dawid\Downloads\platform-tools-latest-windows\platform-tools\adb.exe",

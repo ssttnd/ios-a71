@@ -36,7 +36,10 @@ assert b'Samsung S6SY771' in kdata, "Touch driver signature missing!"
 assert b'Qualcomm Adreno 618' in kdata, "GPU driver signature missing!"
 print("Verified Touch (Samsung S6SY771) and GPU (Qualcomm Adreno 618) signatures in kernel!")
 
-cmdline = "debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 sweettouchdelay=3 sweettouchbitbang=1"
+# Same arguments as the A71 boot image known to reach the lock screen, except
+# sweetusb: 3 powers the controller up and offers the console as a serial port.
+sweetusb = os.environ.get('SWEETUSB', '3')
+cmdline = f"debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=60 sweettouchdelay=3 sweettouchbitbang=1 sweetusb={sweetusb} sweetfb_noconsole=1"
 
 print("\n1. Generating ADT...")
 subprocess.run(['python', 'tools/mkadt.py', 'build/a71_highmem.adt', '--highmem'], check=True)
@@ -44,8 +47,8 @@ subprocess.run(['python', 'tools/mkadt.py', 'build/a71_highmem.adt', '--highmem'
 print("\n2. Packaging SWEETXNU payload...")
 subprocess.run(['python', 'tools/mkpayload.py', kernel_path, 'build/a71_highmem.adt', 'build/a71_payload.bin', '--cmdline', cmdline], check=True)
 
-out_img = os.path.join(downloads, 'shim-boot.img')
-out_tar = os.path.join(downloads, 'shim-boot.tar')
+out_img = os.path.join('shim', 'out', 'shim-boot.img')
+out_tar = os.path.join('shim', 'out', 'shim-boot.tar')
 
 print(f"\n3. Building boot.img: {out_img}...")
 subprocess.run(['python', 'tools/mkbootv2.py', '--kernel', 'shim/out/Image', '--ramdisk', 'build/a71_payload.bin', '--dtb', 'dtb/boot_unpacked/dtb', '-o', out_img], check=True)

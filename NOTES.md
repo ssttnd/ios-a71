@@ -49,9 +49,37 @@ Claims are that author's, on Redmi. A71 needs: own signed `a615_zap`, OPP table 
 Wi-Fi/BT rails, MSA/MPSS addresses and BDF from A71 DT, panel and battery and haptic work.
 Patch numbers collide with ours from 0081. Main unknown: Samsung TrustZone behaviour.
 
-**Next (proposed to owner, no decision recorded yet):** owner tests the lock screen; pull log via
-TWRP; add USB log; then base on that branch with A71 patches on top, bring-up in order
-power -> GMU -> SQE/zap -> Metal, then Wi-Fi, BT. Pushing to the fork requires asking first.
+**Owner's test of v13 (same day):** home screen, Settings and touch work. Very laggy, black
+wallpaper, many apps not working, occasional strong artifacts. Log (147 flushes): Preferences,
+MobileSlideShow, MobileSMS, MobileSafari, AppStore, MobilePhone, Camera were launched and none has
+a CRASH line; only assetsd (26), mediaserverd (1), driverkitd (1) crash. So the app failures look
+like hangs (not confirmed). Artifact cause not confirmed; tearing suspected. Wallpaper: the fork
+needed provider registration and HEIC to PNG, and its auto-registration once blocked boot: deferred.
+
+**Patches 0086-0089 written, NOT yet built or booted (owner approved doing all four):**
+- 0086 cpufreq-hw (fork 0126): the fork measured 300 MHz on Redmi's A76s; not measured on A71 yet.
+  The log lines `SWEET CPUFREQ` will show it. Domain addresses checked against the A71 live DT.
+- 0087 UI threads to A76 (fork 0167), changed to exclude kernel threads, which the fork fixed later.
+- 0088 DDR bandwidth vote (fork 0169) plus a BCM vote helper. Off with `sweetddr=0`.
+- 0089 `sweetusb=3`: late thread powers up rails (L4A/L11A/L17A), SN15/CN0 votes, TBU2 and USB
+  GDSCs, RCGs, clocks, SMMU stream 0x540, wrapper, QUSB2 from the DT sequence, core reset, then the
+  gadget as CDC-ACM (1209:0002) streaming the console. Every step logs first, so the last log line
+  shows a stall. `sweetusbsmmu=0` skips the SMMU step. Unknowns: Samsung MUIC/CCIC D+/D- routing,
+  bus votes for DMA. First-try enumeration is not expected to be certain.
+- Host: `tools/a71-usblog.py` (no packages; finds the port by USB ID; written, untested on hardware).
+
+**Local patch workflow (Windows):** `research/buildtree.tgz` is the CI tree of 9b05f9c;
+`research/xnu-tree` holds extracted files patched through 0085 (no compiler here: compile errors
+show only in CI). Patches were checked with GNU patch `--fuzz=0` against a copy of that tree.
+
+**Packaging check:** `tools/package_gpu_boot.py` with the old kernel and `SWEETUSB=2` reproduces the
+phone's boot image byte for byte over its 17223680 bytes, except the 64-byte ADT `random-seed`.
+Output is now `shim/out/shim-boot.img`. Kernel zip: newest `Downloads\xnu-kernel*.zip`.
+
+**Next:** owner pushes main (Windows git has no stored login); CI builds; owner downloads the
+xnu-kernel artifact; package; confirm with owner, then write boot from TWRP (restore image:
+`backup/2026-11-06/boot.img`); test; read `SWEET CPUFREQ`, `SWEET DDR`, `SWEET USB` lines. After
+that, GPU per the lead above: bring-up order power -> GMU -> SQE/zap -> Metal, then Wi-Fi, BT.
 
 ## A71 touch status (2026-10-23) - CONFIRMED WORKING!
 - Touchscreen input on Samsung Galaxy A71 4G (SM-A715F) running Apple iOS 16.7.16 is CONFIRMED FULLY WORKING by the device owner!
