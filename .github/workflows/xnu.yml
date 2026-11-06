@@ -175,7 +175,7 @@ jobs:
         run: |
           python3 tools/mkadt.py /tmp/qemu.adt --qemu
           python3 tools/mkpayload.py out/kernel.development.sweet /tmp/qemu.adt /tmp/payload.bin \
-            --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0'
+            --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 sweetbattery=0 sweetbacklight=0 sweetfbdpudump=0 sweetfbflip=0 sweetfbbeam=0 sweetgpu=0 sweetusb=0 sweetkeys=0 sweettouch=0 sweetcpufreq=0 sweetddr=0'
           python3 tools/qemu-sweet.py /tmp/payload.bin qemu-out --secs 60 --kernel out/kernel.development.sweet --fail-on-panic
       - name: Show the result
         if: always()
