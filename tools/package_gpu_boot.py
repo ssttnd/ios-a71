@@ -59,18 +59,19 @@ adt_path = 'build/a71_highmem.adt'
 fw = 'research/a71-firmware'
 if os.path.exists(os.path.join(fw, 'a615_zap.mdt')):
     import hashlib
-    def fw_args(option, name):
+    def fw_args(option, sha_option, name):
         path = os.path.join(fw, name)
         digest = hashlib.sha256(open(path, 'rb').read()).hexdigest()
-        return [option, path, option + '-sha256', digest]
+        return [option, path, sha_option, digest]
     gmu = os.path.join(fw, 'a618_gmu.bin')
     adt_path = 'build/a71_highmem_fw.adt'
     if os.path.exists(adt_path):
         os.remove(adt_path)
     subprocess.run(['python', 'tools/a71-adreno-firmware.py', 'build/a71_highmem.adt', gmu, adt_path,
                     '--sha256', hashlib.sha256(open(gmu, 'rb').read()).hexdigest()]
-                   + fw_args('--sqe-firmware', 'a630_sqe.fw') + fw_args('--zap-metadata', 'a615_zap.mdt')
-                   + fw_args('--zap-code', 'a615_zap.b02'), check=True)
+                   + fw_args('--sqe-firmware', '--sqe-sha256', 'a630_sqe.fw')
+                   + fw_args('--zap-metadata', '--zap-metadata-sha256', 'a615_zap.mdt')
+                   + fw_args('--zap-code', '--zap-code-sha256', 'a615_zap.b02'), check=True)
 
 print("\n2. Packaging SWEETXNU payload...")
 subprocess.run(['python', 'tools/mkpayload.py', kernel_path, adt_path, 'build/a71_payload.bin', '--cmdline', cmdline], check=True)

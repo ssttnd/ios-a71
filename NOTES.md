@@ -106,6 +106,9 @@ not known. The fork's sandbox patches were therefore wrongly suspected: retest t
 **Do not run `tools/a71-usblog.py`/`a71-bootcheck.py` unattended before CREATE_NO_WINDOW (now fixed):**
 detached runs opened a console window every poll and annoyed the owner.
 
+**2026-11-07 GPU result, kernel 2a8b02c, sweetgpu=9 (log logs/usb-gpu9.txt, gitignored):** image with the phone's own firmware (research/a71-firmware, pulled from /vendor/firmware and apnhlos). Observed: signed zap accepted (phase 5, status 0), legacy GMU boot errno 0, HFI OK, SQE ME_INIT OK, CP fence value 0x618c0de completed, GX measured 267000 kHz at index 1. DCVS to index 6 (800 MHz, gfx vlvl 385, mx vlvl 385) then measured 0 kHz; `NativeAdreno A618 handoff errno=5; no userspace rendering`. iOS stays up. Next try: sweetgpukhz lower (boot arg, no rebuild). A71 DT lists 825/800/650/565/430/355/267/180 MHz. Metal also needs sweetnative=1 and the fork's userspace bundle on the root, which needs write access to the running root.
+On a71-gpu the home screen boots but looks as on main: white panels instead of blur.
+
 **Next:** owner reports speed and artifacts. Then USB networking that Windows drives without WSL
 (needed for SSH, the donors' install path), then base on the Pixel 4a port per
 `docs/a71-radio-port.md`. Restore image for boot: `backup/2026-11-06/boot.img`.
