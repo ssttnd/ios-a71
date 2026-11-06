@@ -76,7 +76,11 @@ show only in CI). Patches were checked with GNU patch `--fuzz=0` against a copy 
 phone's boot image byte for byte over its 17223680 bytes, except the 64-byte ADT `random-seed`.
 Output is now `shim/out/shim-boot.img`. Kernel zip: newest `Downloads\xnu-kernel*.zip`.
 
-**Next:** owner pushes main (Windows git has no stored login); CI builds; owner downloads the
+**Porting plan for GPU/Wi-Fi/BT/audio:** `docs/a71-radio-port.md`. Best donor found:
+Yofuness/ios-flame (Pixel 4a, same SD730G/A618). CI moved to macos-15 (85c1c27), since GitHub
+retired macos-14; run 42241740972 was queued when this was written. Pushing now works from Windows.
+
+**Next:** CI builds; owner downloads the
 xnu-kernel artifact; package; confirm with owner, then write boot from TWRP (restore image:
 `backup/2026-11-06/boot.img`); test; read `SWEET CPUFREQ`, `SWEET DDR`, `SWEET USB` lines. After
 that, GPU per the lead above: bring-up order power -> GMU -> SQE/zap -> Metal, then Wi-Fi, BT.
