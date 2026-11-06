@@ -1,0 +1,71 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -270,6 +270,7 @@
+ 	void rearmVsync(void);
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	uint32_t     *fFadeCopy;      /* 0194: the frame being faded, in cached memory */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -733,17 +734,35 @@
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fPowerOff) {
+-		/* Fade out: halve every channel each vsync, then black, then idle. */
++		/* Fade out, then black, then idle. 0194: the panel memory is uncached, so reading it
++		 * on every step took longer than a refresh and the fade showed as a few stages. It is
++		 * read once; every step writes a scaled copy of that frame. */
++		const uint32_t steps = 24;
+ 		uint32_t step = fb->fFadeStep;
+-		if (step <= 6) {
++		if (step <= steps) {
+ 			fb->fFadeStep = step + 1;
+ 		}
+ 		IOLockUnlock(fb->fLock);
+-		if (step <= 6) {
++		if (step <= steps) {
++			if (step == 0 && fb->fFadeCopy == NULL) {
++				fb->fFadeCopy = (uint32_t *)IOMalloc((size_t)fb->fWidth * fb->fHeight * 4);
++			}
++			uint32_t *copy = fb->fFadeCopy;
++			if (step == 0 && copy != NULL) {
++				for (uint32_t y = 0; y < fb->fHeight; y++) {
++					memcpy(copy + (uint64_t)y * fb->fWidth,
++					    (const void *)(fb->fPixels + (uint64_t)y * fb->fRowBytes), (size_t)fb->fWidth * 4);
++				}
++			}
++			/* Eased: brightness falls as the square of the time left. */
++			const uint32_t left = steps - step, scale = left * left * 256 / (steps * steps);
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++				uint32_t *row = (uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++				const uint32_t *from = copy != NULL ? copy + (uint64_t)y * fb->fWidth : NULL;
+ 				for (uint32_t x = 0; x < fb->fWidth; x++) {
+-					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
++					const uint32_t v = from != NULL ? from[x] : 0;
++					row[x] = (((v & 0x00ff00ff) * scale >> 8) & 0x00ff00ff) |
++					    (((v & 0x0000ff00) * scale >> 8) & 0x0000ff00) | (v & 0xff000000);
+ 				}
+ 			}
+ 		}
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -493,7 +493,7 @@
+  * 0192: the Metal bundle arms its draw log when /var/local/sweet-native-drawlog
+  * changes while it runs (SweetNativeDrawLog.inc). Without a network nothing can
+  * touch that file, so with sweetdrawlogkey=1 a volume key press does it: 4000
+- * draws, with vertices and constants for the 565x1220 blur target.
++ * draws, with vertices and constants for the 704x256 variable blur target.
+  */
+ void
+ sweet_drawlog_arm(void)
+@@ -507,7 +507,7 @@
+ 	if (!on) {
+ 		return;
+ 	}
+-	char text[] = "4000 565x1220\n";
++	char text[] = "4000 704x256\n";
+ 	vfs_context_t ctx = vfs_context_kernel();
+ 	vnode_t vp = NULLVP;
+ 	int resid = 0;

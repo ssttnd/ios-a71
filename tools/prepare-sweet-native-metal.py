@@ -1111,6 +1111,19 @@ static _Atomic unsigned long long native_wait_until_completed;
         .native_scissor={work->nativeScissor[0],work->nativeScissor[1],work->nativeScissor[2],work->nativeScissor[3]},
         .native_blend={work->nativeBlend[0],work->nativeBlend[1],work->nativeBlend[2],work->nativeBlend[3]},''')
     s=replace(s,'\t\t_color[i] = texture;\n','\t\t_color[i] = texture;\n\t\t/* CoreAnimation binds the target twice and sets the level on attachment 0 only. */\n\t\t_colorLevel[i] = i && texture == _color[0] ? _colorLevel[0] : (unsigned)[attachment level];\n')
+    # Which filters the blur passes get (pixelated variable blur).
+    s=replace(s,'''\tstruct rwa_sampler *sampler = mesa.sampler_create(_mesa, &state, why, sizeof(why));
+''','''\tstruct rwa_sampler *sampler = mesa.sampler_create(_mesa, &state, why, sizeof(why));
+\t{
+\t\tstatic unsigned said;
+\t\tif (said < 32) {
+\t\t\tsaid++;
+\t\t\trw_print("sampler min %u mag %u mip %u lod %g..%g normalized %u address %u,%u\\n", state.min_filter,
+\t\t\t         state.mag_filter, state.mip_filter, state.lod_min, state.lod_max,
+\t\t\t         state.normalized_coordinates, state.address[0], state.address[1]);
+\t\t}
+\t}
+''')
     # A clamp this driver ignores would sample the wrong level: say so once.
     s=replace(s,'''\t(void)lodMin; (void)lodMax;
 \t[self setFragmentSamplerState:sampler atIndex:index];''','''\tif (lodMin != 0.0f || lodMax < 1000.0f) {

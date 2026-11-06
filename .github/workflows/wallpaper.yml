@@ -1,0 +1,23 @@
+name: sweet-wallpaper
+on:
+  workflow_dispatch:
+  push:
+    branches: [a71-gpu]
+    paths: [userspace/wallpaper/**, .github/workflows/wallpaper.yml]
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build iOS16 wallpaper provider registration helper
+        run: |
+          mkdir -p userspace/out/sweet-wallpaper-ios16
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -fobjc-arc -Wall -Wextra -Werror -framework Foundation -framework IOKit userspace/wallpaper/register.m -o userspace/out/sweet-wallpaper-ios16/sweet-wallpaper-register
+          codesign --force --sign - --pagesize 4096 --entitlements userspace/wallpaper/entitlements.plist userspace/out/sweet-wallpaper-ios16/sweet-wallpaper-register
+          codesign --verify --strict userspace/out/sweet-wallpaper-ios16/sweet-wallpaper-register
+          shasum -a 256 userspace/out/sweet-wallpaper-ios16/sweet-wallpaper-register > userspace/out/sweet-wallpaper-ios16/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweet-wallpaper-ios16
+          path: userspace/out/sweet-wallpaper-ios16/

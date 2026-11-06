@@ -143,7 +143,11 @@ Draw log captured (research/drawlog.txt, gitignored, 16000 draws). Observed chai
 
 **Progressive blur FIXED, bundle 929ce9e (CI 42305677638), image 247df26a, log logs/usb-mip1.txt.** Observed: `rendering into mip level 1 of a 704x256 texture`, no lod clamp message. Owner: "все отлично там". New report: the App Library platter disappears; cause not known.
 
-**Next:** draw log of the App Library platter (volume key); test kernel d57ff4c with 0193 (CI 42304345031 passed including QEMU) for Photos, widgets and wallpaper; shorten the present lock for FPS. Move the GPU stage earlier so the restart is not seen. Later: widgets (retest sandbox patches), time, Wi-Fi per
+Regression in 929ce9e: App Library goes black with artifacts. Observed: `the draw failed: colour attachment 1 is 704x256 and attachment 0 is 352x128`; the capture jumps from draw 44 (`Tvrd`) to a new frame, so the command buffer was dropped. Commit a9b9f80 keeps attachment 1 on attachment 0's level when it is the same texture and only fails when an attachment is smaller. Same-texture binding is a guess from identical sizes in the log. Owner also reports earlier artifacts on swiping up on the widgets page, possibly the same drop.
+
+Image b9c4db8b (kernel d57ff4c with 0193, `sweetamfi=1 sweetdrawlogkey=1 sweetpayload=1`) plus bundle a9b9f80, log logs/usb-all1.txt: boots, no boot loop with 0193 on a71-gpu, package 9/9, no draw failure so far. Screen report pending.
+
+**Next:** owner's report on App Library, widgets, Photos, wallpaper; shorten the present lock for FPS. Move the GPU stage earlier so the restart is not seen. Later: widgets (retest sandbox patches), time, Wi-Fi per
 `docs/a71-radio-port.md`. Restore image for boot: `backup/2026-11-06/boot.img`.
 Kernel archive of this build: `research/xnu-kernel-130bb90.zip`.
 
