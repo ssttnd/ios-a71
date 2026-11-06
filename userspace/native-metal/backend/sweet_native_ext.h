@@ -35,7 +35,7 @@ int rwa_command_end(struct rwa_device *, char *, size_t);
 int rwa_command_submit(struct rwa_device *, uint64_t *, char *, size_t);
 int rwa_command_poll(struct rwa_device *, uint64_t, bool, char *, size_t);
 int rwa_clear(struct rwa_device *, struct rwa_texture *const *, unsigned, unsigned,
-              const float [8][4], struct rwa_texture *, const float *, const unsigned *, char *, size_t);
+              const unsigned *, const float [8][4], struct rwa_texture *, const float *, const unsigned *, char *, size_t);
 #ifdef __cplusplus
 }
 #endif

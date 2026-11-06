@@ -330,10 +330,11 @@ air2nir = executable(""")
     float native_blend[4];
     unsigned native_flags; /* bit0 viewport, bit1 scissor, bit2 blend */
     unsigned native_cull, native_winding, native_fill;
+    unsigned native_color_level[8]; /* colorAttachments[i].level */
 };''')
     p.write_text(s)
     p=air/'air_metal.c';s=p.read_text()
-    s=replace(s,'#include "air_metal.h"','#include "sweet_native_ext.h"\n#include "util/u_framebuffer.h"\n#include <math.h>\n#include <time.h>\n#include "util/u_upload_mgr.h"')
+    s=replace(s,'#include "air_metal.h"','#include "sweet_native_ext.h"\n#include "util/u_framebuffer.h"\n#include "util/u_math.h"\n#include <math.h>\n#include <time.h>\n#include "util/u_upload_mgr.h"')
     s=replace(s,'#include "nir_air.h"','#include "nir_air.h"\n#include "air_live_resources.inc"\n#include "air_stage_link.inc"\n#include "air_vertex_exports.inc"')
     # Metal ALWAYS enables primitive restart for indexed strip draws (0xFFFF /
     # 0xFFFFFFFF), the donor turned it off ("Metal has no restart index"). The
@@ -467,26 +468,47 @@ index_range(const uint8_t *indices, unsigned count, unsigned index_size, bool re
     # Texture storage/format is immutable here. Keep its level-zero surface
     # instead of allocating an identical Gallium view for every CA draw.
     s=replace(s,'   struct pipe_sampler_view *view;  /* made when a dispatch first samples it, then kept */',
-                '   struct pipe_sampler_view *view;  /* made when a dispatch first samples it, then kept */\n   struct pipe_surface *native_surface;')
+                '   struct pipe_sampler_view *view;  /* made when a dispatch first samples it, then kept */\n   struct pipe_surface *native_surface[16];')
     s=replace(s,'   pipe_resource_reference(&texture->res, NULL);\n   free(texture);',
-                '   pipe_surface_reference(&texture->native_surface, NULL);\n   pipe_resource_reference(&texture->res, NULL);\n   free(texture);')
+                '   for (unsigned l = 0; l < 16; l++) pipe_surface_reference(&texture->native_surface[l], NULL);\n   pipe_resource_reference(&texture->res, NULL);\n   free(texture);')
     s=replace(s,'rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,',
                 'native_render_draw(struct rwa_render *render, const struct rwa_draw *draw,')
     # Return one transient reference so existing draw cleanup stays balanced.
     s=replace(s,'surf[i] = pipe->create_surface(pipe, draw->color[i]->res,\n         &(struct pipe_surface){ .format = draw->color[i]->res->format });',
-                'surf[i] = native_render_surface(draw->color[i]);')
+                'surf[i] = native_render_surface(draw->color[i], draw->native_color_level[i]);')
+    # CoreAnimation's variable blur draws each downsample into the next mip level of one texture
+    # (colorAttachments[i].level). The pass is that level's size; level 0 alone left the other
+    # levels unwritten, and sampling them gave the black band over the top of the screen.
+    s=replace(s,'''      unsigned tw = t->shape.width;
+      unsigned th = t->shape.height ? t->shape.height : 1;
+      if (i == 0) {''','''      unsigned tw = u_minify(t->shape.width, draw->native_color_level[i]);
+      unsigned th = u_minify(t->shape.height ? t->shape.height : 1, draw->native_color_level[i]);
+      if (draw->native_color_level[i]) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "SweetNativeMetal: rendering into mip level %u of a %ux%u texture\\n",
+                    draw->native_color_level[i], t->shape.width, t->shape.height);
+         }
+      }
+      if (i == 0) {''')
     s=replace(s,'zsurf = pipe->create_surface(pipe, draw->depth->res,\n         &(struct pipe_surface){ .format = draw->depth->res->format });',
-                'zsurf = native_render_surface(draw->depth);')
+                'zsurf = native_render_surface(draw->depth, 0);')
     s=replace(s,'int\nnative_render_draw(', 'static int\nnative_render_draw(')
     at=s.index('static int\nnative_render_draw(')
     s=s[:at]+'''static struct pipe_surface *
-native_render_surface(struct rwa_texture *texture)
+native_render_surface(struct rwa_texture *texture, unsigned level)
 {
-   if (!texture->native_surface)
-      texture->native_surface = texture->device->pipe->create_surface(texture->device->pipe,
-         texture->res, &(struct pipe_surface){ .format = texture->res->format });
+   if (level >= 16 || level > texture->res->last_level)
+      return NULL;
+   if (!texture->native_surface[level]) {
+      struct pipe_surface tmpl = { .format = texture->res->format };
+      tmpl.u.tex.level = level;
+      texture->native_surface[level] = texture->device->pipe->create_surface(texture->device->pipe,
+         texture->res, &tmpl);
+   }
    struct pipe_surface *surface = NULL;
-   if (texture->native_surface) pipe_surface_reference(&surface, texture->native_surface);
+   if (texture->native_surface[level]) pipe_surface_reference(&surface, texture->native_surface[level]);
    return surface;
 }
 
@@ -672,7 +694,8 @@ bind_stage(''')
       device->batch_fb.nr_cbufs == fb.nr_cbufs;
    for (unsigned i=0; same && i<fb.nr_cbufs; i++)
       same = device->batch_fb.cbufs[i] &&
-             device->batch_fb.cbufs[i]->texture == fb.cbufs[i]->texture;
+             device->batch_fb.cbufs[i]->texture == fb.cbufs[i]->texture &&
+             device->batch_fb.cbufs[i]->u.tex.level == fb.cbufs[i]->u.tex.level;
    if (same) same = (!fb.zsbuf && !device->batch_fb.zsbuf) ||
       (fb.zsbuf && device->batch_fb.zsbuf && fb.zsbuf->texture == device->batch_fb.zsbuf->texture);
    if (!same) {
@@ -1038,11 +1061,13 @@ static _Atomic unsigned long long native_wait_until_completed;
     unsigned nativeScissor[4], nativeFlags;
     BOOL nativeClearOnly, nativeBarrier;
     unsigned nativeClearMask;
+    unsigned nativeColorLevel[8];
     float nativeClearColors[8][4];''')
     s=replace(s,'\tBOOL _hasDepthRange;','''\tBOOL _hasDepthRange;
     float _nativeViewport[4], _nativeBlend[4];
     unsigned _nativeScissor[4], _nativeFlags;
     unsigned _nativeClearMask;
+    unsigned _colorLevel[8];
     float _nativeClearColors[8][4];''')
     begin=s.index('- (void)setViewport:(MTLViewport)viewport\n{')
     end=s.index('/* The depth/stencil state,',begin)
@@ -1069,14 +1094,28 @@ static _Atomic unsigned long long native_wait_until_completed;
     memcpy(work->nativeScissor,_nativeScissor,sizeof _nativeScissor);
     memcpy(work->nativeBlend,_nativeBlend,sizeof _nativeBlend);
     work->nativeFlags=_nativeFlags;
+    memcpy(work->nativeColorLevel,_colorLevel,sizeof _colorLevel);
     work->nativeClearMask=_nativeClearMask;
     memcpy(work->nativeClearColors,_nativeClearColors,sizeof _nativeClearColors);
     _nativeClearMask=0;_clears=NO;_clearsDepth=NO;_clearsStencil=NO;''')
     s=replace(s,'\t\t.fragment_buffer_table_count = work->count,','''\t\t.fragment_buffer_table_count = work->count,
         .native_flags=work->nativeFlags,
+        .native_color_level={work->nativeColorLevel[0],work->nativeColorLevel[1],work->nativeColorLevel[2],work->nativeColorLevel[3],
+                             work->nativeColorLevel[4],work->nativeColorLevel[5],work->nativeColorLevel[6],work->nativeColorLevel[7]},
         .native_viewport={work->nativeViewport[0],work->nativeViewport[1],work->nativeViewport[2],work->nativeViewport[3]},
         .native_scissor={work->nativeScissor[0],work->nativeScissor[1],work->nativeScissor[2],work->nativeScissor[3]},
         .native_blend={work->nativeBlend[0],work->nativeBlend[1],work->nativeBlend[2],work->nativeBlend[3]},''')
+    s=replace(s,'\t\t_color[i] = texture;\n','\t\t_color[i] = texture;\n\t\t_colorLevel[i] = (unsigned)[attachment level];\n')
+    # A clamp this driver ignores would sample the wrong level: say so once.
+    s=replace(s,'''\t(void)lodMin; (void)lodMax;
+\t[self setFragmentSamplerState:sampler atIndex:index];''','''\tif (lodMin != 0.0f || lodMax < 1000.0f) {
+\t\tstatic BOOL said;
+\t\tif (!said) {
+\t\t\tsaid = YES;
+\t\t\trw_print("a fragment sampler lod clamp (%g..%g) is ignored\\n", lodMin, lodMax);
+\t\t}
+\t}
+\t[self setFragmentSamplerState:sampler atIndex:index];''')
     # Independent attachment clear values and exactly one clear per pass.
     s=replace(s,'\t\tif (i == 0 && [attachment loadAction] == MTLLoadActionClear) {',
                 '\t\tif ([attachment loadAction] == MTLLoadActionClear) {')
@@ -1092,7 +1131,7 @@ static _Atomic unsigned long long native_wait_until_completed;
         if(work->nativeClearMask || work->clearsDepth || work->clearsStencil) {
             struct rwa_texture *targets[8]={0};
             for(unsigned i=0;i<work->colorCount;i++)targets[i]=[work->color[i] mesaTexture];
-            if(rwa_clear([[_queue device] mesaDevice],targets,work->colorCount,work->nativeClearMask,
+            if(rwa_clear([[_queue device] mesaDevice],targets,work->colorCount,work->nativeClearMask,work->nativeColorLevel,
                          work->nativeClearColors,[work->depth mesaTexture],
                          work->clearsDepth?&work->clearDepth:NULL,work->clearsStencil?&work->clearStencil:NULL,
                          why,sizeof why)){[self failWith:why];goto done;}
@@ -1111,6 +1150,7 @@ static _Atomic unsigned long long native_wait_until_completed;
         RedwoodMetalWork *work=[RedwoodMetalWork new];work->nativeClearOnly=YES;
         work->colorCount=_colorCount;for(unsigned i=0;i<8;i++)work->color[i]=_color[i];
         work->nativeClearMask=_nativeClearMask;memcpy(work->nativeClearColors,_nativeClearColors,sizeof _nativeClearColors);
+        memcpy(work->nativeColorLevel,_colorLevel,sizeof _colorLevel);
         work->depth=_depth;work->clearDepth=_clearDepth;work->clearStencil=_clearStencil;
         work->clearsDepth=_clearsDepth;work->clearsStencil=_clearsStencil;
         [_commandBuffer recordWork:work];[work release];

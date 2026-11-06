@@ -222,7 +222,7 @@ int rwa_command_poll(struct rwa_device *d,uint64_t fence,bool give_up,char *why,
    return -1;
 }
 int rwa_clear(struct rwa_device *d,struct rwa_texture *const *color,unsigned count,unsigned mask,
-               const float values[8][4],struct rwa_texture *depth,const float *z,const unsigned *s,
+               const unsigned *levels,const float values[8][4],struct rwa_texture *depth,const float *z,const unsigned *s,
                char *why,size_t n)
 {
    if(!d || d->lost || count>8 || (mask>>count)){say(why,n,"invalid clear attachments");return -1;}
@@ -232,11 +232,12 @@ int rwa_clear(struct rwa_device *d,struct rwa_texture *const *color,unsigned cou
       if(!(res->bind&PIPE_BIND_RENDER_TARGET) || util_format_is_pure_integer(res->format)) {
          say(why,n,"interface: clear requires a floating-point or normalized render target");return -1;
       }
-      struct pipe_surface *surface=native_render_surface(color[i]);
+      const unsigned level=levels?levels[i]:0;
+      struct pipe_surface *surface=native_render_surface(color[i],level);
       if(!surface){say(why,n,"failed to create clear surface");return -1;}
       union pipe_color_union value;
       memcpy(value.f,values[i],sizeof(value.f));
-      d->pipe->clear_render_target(d->pipe,surface,&value,0,0,res->width0,res->height0,false);
+      d->pipe->clear_render_target(d->pipe,surface,&value,0,0,u_minify(res->width0,level),u_minify(res->height0,level),false);
       pipe_surface_reference(&surface,NULL);
    }
    if(z || s) {
@@ -246,7 +247,7 @@ int rwa_clear(struct rwa_device *d,struct rwa_texture *const *color,unsigned cou
       if((z&&!format_has_depth(res->format)) || (s&&!format_has_stencil(res->format))) {
          say(why,n,"depth/stencil clear aspect absent from format");return -1;
       }
-      struct pipe_surface *surface=native_render_surface(depth);
+      struct pipe_surface *surface=native_render_surface(depth,0);
       if(!surface){say(why,n,"failed to create depth clear surface");return -1;}
       d->pipe->clear_depth_stencil(d->pipe,surface,flags,z?*z:0,s?*s:0,0,0,res->width0,res->height0,false);
       pipe_surface_reference(&surface,NULL);

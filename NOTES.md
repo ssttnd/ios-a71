@@ -137,7 +137,9 @@ Wallpaper package prepared, NOT written: `build/wallpaper.payload` (sha256 90c18
 Checked for the band: donor's `setScissorRect` is a no-op, but tools/prepare-sweet-native-metal.py already implements scissor and viewport, so that is not the cause. No "not implemented" message in the logs.
 The owner approved writing the wallpaper package, then said stop and asked for the blur first. Package not written.
 
-**Next:** draw log capture of the band on the 0192 kernel; then wallpaper (ask whether the approval still stands); shorten the present lock for FPS. Move the GPU stage earlier so the restart is not seen. Later: widgets (retest sandbox patches), time, Wi-Fi per
+Wallpaper package written with owner's approval, image 247df26a (kernel 3b14aa8, `sweetpayload=1 sweetamfi=1 sweetdrawlogkey=1` plus the kept args), log logs/usb-wall1.txt: 47/47 entries errno 0, trust cache queries answered. Owner: wallpaper still black. Observed: only SpringBoard and backboardd create surfaces, no poster process does. Guess: providers die or are not registered. Commit d57ff4c adds 0193 (0219+0240 from 3075cab, sweetsbext=0 sweetsbcont=0 turn it off), CI pending; it needs its own boot test because main looped with these patches, and it is also the attempt to fix Photos and widgets. LaunchServices rebuild remains the last resort.
+
+**Next:** test 0193; draw log capture of the band (volume key); shorten the present lock for FPS. Move the GPU stage earlier so the restart is not seen. Later: widgets (retest sandbox patches), time, Wi-Fi per
 `docs/a71-radio-port.md`. Restore image for boot: `backup/2026-11-06/boot.img`.
 Kernel archive of this build: `research/xnu-kernel-130bb90.zip`.
 
