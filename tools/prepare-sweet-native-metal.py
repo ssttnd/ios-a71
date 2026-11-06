@@ -492,6 +492,11 @@ index_range(const uint8_t *indices, unsigned count, unsigned index_size, bool re
          }
       }
       if (i == 0) {''')
+    # A larger attachment beside attachment 0 is drawn over the pass's area: only attachment 0
+    # bounds the pass, and failing here would drop the whole command buffer.
+    s=replace(s,'''      } else if (tw != w || th != h) {
+         say(why, why_size, "colour attachment %u is %ux%u and attachment 0 is %ux%u", i,''','''      } else if (tw < w || th < h) {
+         say(why, why_size, "colour attachment %u is %ux%u and attachment 0 is %ux%u", i,''')
     s=replace(s,'zsurf = pipe->create_surface(pipe, draw->depth->res,\n         &(struct pipe_surface){ .format = draw->depth->res->format });',
                 'zsurf = native_render_surface(draw->depth, 0);')
     s=replace(s,'int\nnative_render_draw(', 'static int\nnative_render_draw(')
@@ -1105,7 +1110,7 @@ static _Atomic unsigned long long native_wait_until_completed;
         .native_viewport={work->nativeViewport[0],work->nativeViewport[1],work->nativeViewport[2],work->nativeViewport[3]},
         .native_scissor={work->nativeScissor[0],work->nativeScissor[1],work->nativeScissor[2],work->nativeScissor[3]},
         .native_blend={work->nativeBlend[0],work->nativeBlend[1],work->nativeBlend[2],work->nativeBlend[3]},''')
-    s=replace(s,'\t\t_color[i] = texture;\n','\t\t_color[i] = texture;\n\t\t_colorLevel[i] = (unsigned)[attachment level];\n')
+    s=replace(s,'\t\t_color[i] = texture;\n','\t\t_color[i] = texture;\n\t\t/* CoreAnimation binds the target twice and sets the level on attachment 0 only. */\n\t\t_colorLevel[i] = i && texture == _color[0] ? _colorLevel[0] : (unsigned)[attachment level];\n')
     # A clamp this driver ignores would sample the wrong level: say so once.
     s=replace(s,'''\t(void)lodMin; (void)lodMax;
 \t[self setFragmentSamplerState:sampler atIndex:index];''','''\tif (lodMin != 0.0f || lodMax < 1000.0f) {
