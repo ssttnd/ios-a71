@@ -139,7 +139,11 @@ The owner approved writing the wallpaper package, then said stop and asked for t
 
 Wallpaper package written with owner's approval, image 247df26a (kernel 3b14aa8, `sweetpayload=1 sweetamfi=1 sweetdrawlogkey=1` plus the kept args), log logs/usb-wall1.txt: 47/47 entries errno 0, trust cache queries answered. Owner: wallpaper still black. Observed: only SpringBoard and backboardd create surfaces, no poster process does. Guess: providers die or are not registered. Commit d57ff4c adds 0193 (0219+0240 from 3075cab, sweetsbext=0 sweetsbcont=0 turn it off), CI pending; it needs its own boot test because main looped with these patches, and it is also the attempt to fix Photos and widgets. LaunchServices rebuild remains the last resort.
 
-**Next:** test 0193; draw log capture of the band (volume key); shorten the present lock for FPS. Move the GPU stage earlier so the restart is not seen. Later: widgets (retest sandbox patches), time, Wi-Fi per
+Draw log captured (research/drawlog.txt, gitignored, 16000 draws). Observed chain: 83-84 capture into 676x238 then 704x256, 85-88 `variable_blur_downsample_frag_lph` with render target and source both 704x256, 89 `variable_blur_frag_lph` with textures 704x256 and a 1x366 mask, 90 composite. Observed in source: the driver builds render surfaces with level 0 and never read `[attachment level]`. Guess, strong but not seen working: CoreAnimation renders those four passes into mip levels 1-4, they stayed empty, and the blur sampled black. Commit 929ce9e passes the level to the surface, pass size and clear; CI pending. It also logs `rendering into mip level` once and `lod clamp ... is ignored` once. If that clamp line appears, per-binding clamps need implementing too: the donor ignores them.
+
+**Progressive blur FIXED, bundle 929ce9e (CI 42305677638), image 247df26a, log logs/usb-mip1.txt.** Observed: `rendering into mip level 1 of a 704x256 texture`, no lod clamp message. Owner: "все отлично там". New report: the App Library platter disappears; cause not known.
+
+**Next:** draw log of the App Library platter (volume key); test kernel d57ff4c with 0193 (CI 42304345031 passed including QEMU) for Photos, widgets and wallpaper; shorten the present lock for FPS. Move the GPU stage earlier so the restart is not seen. Later: widgets (retest sandbox patches), time, Wi-Fi per
 `docs/a71-radio-port.md`. Restore image for boot: `backup/2026-11-06/boot.img`.
 Kernel archive of this build: `research/xnu-kernel-130bb90.zip`.
 
