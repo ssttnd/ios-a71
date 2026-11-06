@@ -59,8 +59,8 @@ def main():
     if len(sys.argv) > 1:
         path = sys.argv[1]
     else:
-        os.makedirs("logs", exist_ok=True)
         path = os.path.join("logs", datetime.datetime.now().strftime("usb-%Y%m%d-%H%M%S.txt"))
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     print(f"[log: {os.path.abspath(path)}; waiting for USB VID 1209 PID 0002]", flush=True)
     with open(path, "ab") as log:
         while True:

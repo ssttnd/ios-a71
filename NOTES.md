@@ -56,7 +56,19 @@ a CRASH line; only assetsd (26), mediaserverd (1), driverkitd (1) crash. So the 
 like hangs (not confirmed). Artifact cause not confirmed; tearing suspected. Wallpaper: the fork
 needed provider registration and HEIC to PNG, and its auto-registration once blocked boot: deferred.
 
-**Patches 0086-0089 written, NOT yet built or booted (owner approved doing all four):**
+**Boot of 0086-0089 (CI 42250744002, 130bb90, Intel runner; boot image SHA-256 3b5825ad..., on the
+phone now). Measured on this A71 from the persistent log:**
+- A76 domain was at 300 MHz (perf_state 0, measured 299989 kHz); now 2208 MHz (measured 2207890).
+  A55 domain was 1497.6 MHz; now 1804.8 MHz (measured 1803347). Domains had dcvs=0.
+- DDR votes MC0/SH0/ACV all returned 0.
+- USB WORKS: first try. Windows enumerated CDC-ACM and `tools/a71-usblog.py` captured the console
+  live (337 KB in `logs/usb-first.txt`, matching the ring). DSTS speed 0 = high speed. The SMMU
+  already had SMR3 for stream 0x540, so no entry was added. PLL ready. No panic.
+- Owner's view of speed on this boot: not recorded yet. `ue0 rx/tx` lines in ACM mode are cosmetic.
+- CI: arm64 macos-15 had no capacity on 2026-11-06; macos-15-intel with Xcode 16.0 builds a kernel
+  that boots, so the old "Xcode 16 iig is incompatible" note no longer holds for this tree.
+
+**Patches 0086-0089 (owner approved doing all four):**
 - 0086 cpufreq-hw (fork 0126): the fork measured 300 MHz on Redmi's A76s; not measured on A71 yet.
   The log lines `SWEET CPUFREQ` will show it. Domain addresses checked against the A71 live DT.
 - 0087 UI threads to A76 (fork 0167), changed to exclude kernel threads, which the fork fixed later.
@@ -80,10 +92,10 @@ Output is now `shim/out/shim-boot.img`. Kernel zip: newest `Downloads\xnu-kernel
 Yofuness/ios-flame (Pixel 4a, same SD730G/A618). CI moved to macos-15 (85c1c27), since GitHub
 retired macos-14; run 42241740972 was queued when this was written. Pushing now works from Windows.
 
-**Next:** CI builds; owner downloads the
-xnu-kernel artifact; package; confirm with owner, then write boot from TWRP (restore image:
-`backup/2026-11-06/boot.img`); test; read `SWEET CPUFREQ`, `SWEET DDR`, `SWEET USB` lines. After
-that, GPU per the lead above: bring-up order power -> GMU -> SQE/zap -> Metal, then Wi-Fi, BT.
+**Next:** owner reports speed and artifacts. Then USB networking that Windows drives without WSL
+(needed for SSH, the donors' install path), then base on the Pixel 4a port per
+`docs/a71-radio-port.md`. Restore image for boot: `backup/2026-11-06/boot.img`.
+Kernel archive of this build: `research/xnu-kernel-130bb90.zip`.
 
 ## A71 touch status (2026-10-23) - CONFIRMED WORKING!
 - Touchscreen input on Samsung Galaxy A71 4G (SM-A715F) running Apple iOS 16.7.16 is CONFIRMED FULLY WORKING by the device owner!
