@@ -16,14 +16,13 @@ the next boot when the command line has sweetpayload=1, logs each entry as
 "SWEET PAYLOAD:", and clears the header. Writing needs the owner's confirmation:
 it is a write to userdata.
 """
-import hashlib, os, socket, struct, subprocess, sys, time
+import hashlib, os, struct, subprocess, sys
 
 BLOCK = 4096
 LOG_BLOCKS = 1025
 AREA_BLOCKS = 65536
 ROOT_BYTES = 16 << 30
 TGT = "/dev/block/by-name/userdata"
-PORT = 15556
 NW = 0x08000000 if os.name == "nt" else 0
 MKDIR, FILE, LINK, RM = 1, 2, 3, 4
 COUNT = [0]
@@ -116,22 +115,9 @@ def write(a, path):
     want = hashlib.sha256(data).hexdigest()
     start = area_start(a)
     count = len(data) // BLOCK
-    rx = f"#!/system/bin/sh\nexec dd of={TGT} bs={BLOCK} seek={start} conv=notrunc,fsync 2>/tmp/dd.log\n"
-    tmp = path + ".rx.sh"
-    with open(tmp, "w", newline="\n") as f:
-        f.write(rx)
-    adb(a, "push", tmp, "/tmp/rx.sh")
-    os.remove(tmp)
-    adb(a, "forward", f"tcp:{PORT}", f"tcp:{PORT}")
-    srv = subprocess.Popen([a, "shell", f"nc -l -p {PORT} sh /tmp/rx.sh"], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, creationflags=NW)
-    time.sleep(2)
-    with socket.create_connection(("127.0.0.1", PORT)) as s:
-        s.sendall(data)
-        s.shutdown(socket.SHUT_WR)
-        srv.wait(timeout=300)
-    adb(a, "forward", "--remove", f"tcp:{PORT}")
-    sh(a, "sync")
+    if adb(a, "push", path, "/tmp/payload.bin").returncode:
+        sys.exit("adb push failed")
+    print(sh(a, f"dd if=/tmp/payload.bin of={TGT} bs={BLOCK} seek={start} conv=notrunc,fsync 2>&1; rm -f /tmp/payload.bin; sync"))
     got = sh(a, f"dd if={TGT} bs={BLOCK} skip={start} count={count} 2>/dev/null | sha256sum").split()[0]
     print("VERIFY OK" if got == want else "VERIFY FAILED", got)
     sys.exit(0 if got == want else 1)

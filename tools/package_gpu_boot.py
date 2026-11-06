@@ -47,7 +47,7 @@ cmdline += " sweetbattery=0 sweetbacklight=0 sweetfbdpudump=0 sweetfbflip=0 swee
 cmdline += f" sweetgpu={int(os.environ.get('SWEETGPU', '1'))}"
 # Less console work: copies of /dev/null writes and the IOKit trace. Empty SWEETQUIET keeps them.
 if os.environ.get('SWEETQUIET', '1'):
-    cmdline += " sweetnull=none sweetiolog=none"
+    cmdline += f" sweetnull={os.environ.get('SWEETNULL', 'none')} sweetiolog=none"
 # Extra test arguments, such as sweetexeclog=1 or ufslogsecs=1.
 if os.environ.get('SWEETARGS'):
     cmdline += " " + os.environ['SWEETARGS']

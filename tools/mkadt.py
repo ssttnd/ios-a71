@@ -30,6 +30,12 @@ GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
 FB, FB_SIZE = 0x9c000000, 0x1700000
 SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
+# MobileGestalt identity placeholders. These do not publish a hardware radio.
+SWEET_MG_MACS = {
+    'mac-address-wifi0': bytes.fromhex('025357454554'),
+    'mac-address-bluetooth0': bytes.fromhex('025357454555'),
+    'mac-address-ethernet0': bytes.fromhex('02005e77ee02'),
+}
 FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
@@ -113,6 +119,10 @@ def build(seed=None, qemu=False, highmem=False):
         # of the A11 that the iPhone X userland expects.
         ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
         ('chip-id', u32(0x8015)),
+        # MobileGestalt's legacy device identity otherwise waits for a WLAN
+        # IOService for each bundle scanned by MobileInstallation. These are
+        # stable, locally administered placeholders, not factory radio MACs.
+        *list(SWEET_MG_MACS.items()),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
         # DeviceType then takes its native "Hactivation" branch (state
@@ -220,6 +230,11 @@ def build(seed=None, qemu=False, highmem=False):
     ])
 
     product_props = d22ap_product()
+    # Match the 8-bit BGRA framebuffer. P3 makes CoreAnimation request b3a8/w30r
+    # render targets, which the display and GPU paths do not support.
+    if product_props:
+        product_props = [(k, cstr('sRGB') if k in ('artwork-display-gamut', 'display-gamut') else v)
+                         for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the
