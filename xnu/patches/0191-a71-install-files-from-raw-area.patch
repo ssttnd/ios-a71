@@ -1,0 +1,224 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -663,6 +663,10 @@
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
++	{
++		extern void sweet_payload_start(void);
++		sweet_payload_start();   /* sweetpayload=1: bsd/dev/sweet_files.c */
++	}
+ 	sweet_sample_start();
+ 	(void)sweet_native_adreno_reserve_pool();   /* owned-BO pool while memory is unfragmented (0147) */
+ 	sweet_pmem_init();       /* /dev/pmem (sweetpmem=1): bsd/dev/sweet_pmem.c, from ios-flame 0094 */
+@@ -821,6 +825,47 @@
+ 	}
+ }
+ 
++/*
++ * 0191: raw area just below the persistent log, written from TWRP by
++ * tools/a71-payload.py and read by the installer in bsd/dev/sweet_files.c.
++ */
++#define SWEET_PAYLOAD_BLOCKS    65536u  /* 256 MiB */
++
++int sweet_ufs_payload_read(uint32_t blk, uint32_t count, void *out);
++int sweet_ufs_payload_clear(void);
++
++int
++sweet_ufs_payload_read(uint32_t blk, uint32_t count, void *out)
++{
++	if (!su.ready || su.nblocks < 2 * (uint64_t)(SWEET_LOG_BLOCKS + SWEET_PAYLOAD_BLOCKS) ||
++	    blk >= SWEET_PAYLOAD_BLOCKS || count == 0 || count > SWEET_PAYLOAD_BLOCKS - blk ||
++	    count > BOUNCE_SIZE / UFS_BLOCK) {
++		return EINVAL;
++	}
++	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS - SWEET_PAYLOAD_BLOCKS;
++	lck_mtx_lock(&sweet_ufs_lock);
++	int error = ufs_read_blocks(base + blk, count);
++	if (!error) {
++		memcpy(out, (const void *)(su.dma + DMA_BOUNCE), (size_t)count * UFS_BLOCK);
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
++int
++sweet_ufs_payload_clear(void)
++{
++	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS - SWEET_PAYLOAD_BLOCKS;
++	lck_mtx_lock(&sweet_ufs_lock);
++	bzero((void *)(su.dma + DMA_BOUNCE), UFS_BLOCK);
++	int error = ufs_write_blocks(base, 1);
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);
+ 
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -46,6 +46,10 @@
+ struct sync_args;
+ extern int sync(proc_t p, struct sync_args *uap, int32_t *retval);
+ void sweet_files_start(void);
++void sweet_payload_start(void);
++extern int sweet_ufs_payload_read(uint32_t blk, uint32_t count, void *out);
++extern int sweet_ufs_payload_clear(void);
++extern struct vnode *rootvnode;
+ 
+ #define SF_BUF  (64 * 1024)
+ 
+@@ -352,4 +356,149 @@
+ 		thread_deallocate(thread);
+ 	}
+ }
++/*
++ * 0191: install files into the root without a network. Windows has no driver
++ * for the USB network function, so tools/a71-payload.py writes a package to a
++ * raw area from TWRP and this thread applies it once at the next boot
++ * (sweetpayload=1), then clears the header. All entries occupy whole 4 KiB
++ * blocks: header, then for each entry its record and, for a file, its data.
++ * An existing file is unlinked first, so a mapped executable is never rewritten.
++ */
++#define SP_BLOCK        4096u
++#define SP_CHUNK        64u     /* blocks */
++#define SP_MKDIR        1u
++#define SP_FILE         2u
++#define SP_LINK         3u
++#define SP_RM           4u
++
++struct sp_header {
++	char magic[8];
++	uint32_t version, entries;
++};
++
++struct sp_entry {
++	uint32_t op, mode;
++	uint64_t size;
++	char path[1024], target[1024];
++};
++
++static int
++sp_file(const struct sp_entry *e, uint32_t *blk, void *buf)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	(void)sweet_vfs_unlink(e->path);
++	int err = vnode_open(e->path, O_CREAT | O_TRUNC | FWRITE, (int)(e->mode & 07777), 0, &vp, ctx);
++	uint64_t off = 0;
++	while (!err && off < e->size) {
++		uint64_t left = e->size - off;
++		uint32_t n = (uint32_t)MIN((left + SP_BLOCK - 1) / SP_BLOCK, (uint64_t)SP_CHUNK);
++		int bytes = (int)MIN(left, (uint64_t)n * SP_BLOCK), resid = 0;
++		err = sweet_ufs_payload_read(*blk, n, buf);
++		if (!err) {
++			err = vn_rdwr(UIO_WRITE, vp, buf, bytes, (off_t)off, UIO_SYSSPACE, IO_UNIT,
++			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		}
++		if (!err && resid) {
++			err = EIO;
++		}
++		*blk += n;
++		off += (uint64_t)bytes;
++	}
++	if (vp != NULLVP) {
++		vnode_close(vp, FWRITE, ctx);
++	}
++	if (!err) {
++		err = sf_setattr(e->path, (int)e->mode, true);
++	}
++	return err;
++}
++
++static void
++sp_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	void *buf = kalloc_data((size_t)SP_CHUNK * SP_BLOCK, Z_WAITOK);
++	struct sp_entry *e = kalloc_data(sizeof(*e) < SP_BLOCK ? SP_BLOCK : sizeof(*e), Z_WAITOK);
++	struct sp_header h;
++	uint32_t blk = 1, done = 0;
++	int err;
++
++	if (buf == NULL || e == NULL) {
++		printf("SWEET PAYLOAD: no memory\n");
++		return;
++	}
++	while (rootvnode == NULL) {
++		sf_sleep_ms(1000);
++	}
++	sf_sleep_ms(10000);
++	err = sweet_ufs_payload_read(0, 1, buf);
++	if (err) {
++		printf("SWEET PAYLOAD: header read errno=%d\n", err);
++		return;
++	}
++	memcpy(&h, buf, sizeof(h));
++	if (memcmp(h.magic, "SWEETPY1", 8) != 0 || h.version != 1) {
++		printf("SWEET PAYLOAD: nothing to install\n");
++		return;
++	}
++	printf("SWEET PAYLOAD: installing %u entries\n", h.entries);
++	for (; done < h.entries; done++) {
++		err = sweet_ufs_payload_read(blk++, 1, e);
++		if (err) {
++			break;
++		}
++		e->path[sizeof(e->path) - 1] = 0;
++		e->target[sizeof(e->target) - 1] = 0;
++		switch (e->op) {
++		case SP_MKDIR:
++			err = sweet_vfs_mkdir(e->path, (int)e->mode);
++			if (err == EEXIST) {
++				err = 0;
++			}
++			if (!err) {
++				err = sf_setattr(e->path, (int)e->mode, true);
++			}
++			break;
++		case SP_FILE:
++			err = sp_file(e, &blk, buf);
++			break;
++		case SP_LINK:
++			(void)sweet_vfs_unlink(e->path);
++			err = sweet_vfs_symlink(e->target, e->path);
++			break;
++		case SP_RM:
++			err = sweet_vfs_unlink(e->path);
++			if (err == ENOENT) {
++				err = 0;
++			}
++			break;
++		default:
++			err = EINVAL;
++			break;
++		}
++		printf("SWEET PAYLOAD: op %u %s size %llu -> %d\n", e->op, e->path, e->size, err);
++		if (err) {
++			break;
++		}
++	}
++	int32_t rv = 0;
++	int serr = sync(kernproc, NULL, &rv);
++	/* A failed package stays: the next boot repeats it and the log shows the same error. */
++	int cerr = err ? 0 : sweet_ufs_payload_clear();
++	printf("SWEET PAYLOAD: finished %u/%u errno=%d sync=%d clear=%d\n", done, h.entries, err, serr, cerr);
++}
++
++void
++sweet_payload_start(void)
++{
++	int on = 0;
++	PE_parse_boot_argn("sweetpayload", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	thread_t thread;
++	if (kernel_thread_start(sp_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

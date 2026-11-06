@@ -1,0 +1,42 @@
+name: sweet-native-metal
+on:
+  workflow_dispatch:
+  push:
+    branches: [a71-gpu]
+    paths:
+      - "userspace/native-metal/**"
+      - "tools/build-sweet-native-metal.py"
+      - "tools/prepare-sweet-native-metal.py"
+      - ".github/workflows/native-metal.yml"
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native compiler build tools
+        run: |
+          brew install bison flex ninja
+          echo "$(brew --prefix bison)/bin:$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+      - name: Build direct AIR and freedreno Metal bundle
+        run: python3 tools/build-sweet-native-metal.py
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: sweet-native-metal-ios16
+          path: |
+            userspace/out/native-legacy
+            userspace/out/SweetNativeMetal.bundle
+            userspace/out/native-metal-build.json
+            userspace/out/native-metal-dependencies.txt
+            userspace/out/native-metal-symbols
+      - name: Collect build logs
+        if: failure()
+        run: |
+          mkdir -p userspace/diagnostics/native-metal
+          find research/sweet-native-metal-build -name '*.log' -type f -exec cp {} userspace/diagnostics/native-metal/ \; || true
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: sweet-native-metal-diagnostics
+          path: userspace/diagnostics/native-metal/

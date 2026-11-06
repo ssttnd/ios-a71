@@ -1,0 +1,13 @@
+{
+  "donor_repository": "https://github.com/oosexgang/hackios-xnu-userland.git",
+  "donor_commit": "a79ff0772a3454fd1ef127e181e5b3bce6c9ce18",
+  "mesa_url": "https://archive.mesa3d.org/mesa-25.0.7.tar.xz",
+  "mesa_version": "25.0.7",
+  "mesa_sha256": "592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6",
+  "deployment_target": "16.0",
+  "bundle": "SweetNativeMetal",
+  "device_class": "SweetNativeMetalDevice",
+  "kernel_abi": "NativeAdreno ABI1 + HostImport + SubmitResources + Compositor4096",
+  "renderer": "Metal -> AIR/NIR -> Gallium freedreno/ir3 -> NativeAdreno/A618",
+  "hardware_qualified": false
+}
