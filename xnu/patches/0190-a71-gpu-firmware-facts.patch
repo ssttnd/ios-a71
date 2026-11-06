@@ -1,0 +1,48 @@
+--- a/bsd/dev/sweet_adreno_cp.c
++++ b/bsd/dev/sweet_adreno_cp.c
+@@ -155,7 +155,7 @@
+ {
+  if (!memory || !memory->cpu || !memory->uncached ||
+      memory->bytes != A618_CP_DMA_BYTES || ((uintptr_t)memory->cpu & 3) ||
+-     !firmware || bytes != 32136 || !barrier) return EINVAL;
++     !firmware || (bytes != 32136 && bytes != 32304) || !barrier) return EINVAL;
+  volatile uint32_t *sqe = (volatile uint32_t *)(memory->cpu + A618_CP_SQE_OFFSET);
+  for (unsigned i = 0; i < (bytes - 4) / 4; ++i) {
+   uint32_t word = 0;
+@@ -205,7 +205,7 @@
+ {
+  if (!valid_io(gpu) || !valid_io(gmu) || !memory || !memory->cpu ||
+      memory->bytes != A618_CP_DMA_BYTES || !memory->uncached || !firmware ||
+-     bytes != 32136 || !barrier || !secure_prepare || !result) return EINVAL;
++     (bytes != 32136 && bytes != 32304) || !barrier || !secure_prepare || !result) return EINVAL;
+  *result = (struct a618_cp_result){0};
+  /* Firmware version excludes the container DWORD. Require patched A630 SQE
+   * at least as new as the pinned Linux driver requires for WHERE_AM_I. */
+--- a/bsd/dev/sweet_adreno_pas.c
++++ b/bsd/dev/sweet_adreno_pas.c
+@@ -75,11 +75,12 @@
+ {
+  if (!result) return EINVAL;
+  *result = (struct a618_pas_result){0};
+- if (!reserved || physical != 0x97f15000ull || !metadata || !metadata->cpu ||
++ /* A71 live DT gpu_region: 0x9a915000 + 0x2000; its signed zap's code is 0x7b0 bytes. */
++ if (!reserved || physical != 0x9a915000ull || !metadata || !metadata->cpu ||
+      metadata->bytes != 0x4000 || !metadata->uncached ||
+      !metadata->physical || (metadata->physical & 0x3fff) ||
+      metadata->physical >= (1ull << 36) || !mdt || !code ||
+-     mdt_bytes != 0x1acc || code_bytes != 0x7c0 ||
++     mdt_bytes != 0x1acc || code_bytes != 0x7b0 ||
+      le32(mdt) != 0x464c457f || mdt[4] != 1 || mdt[5] != 1 ||
+      le32(mdt + 28) != 52 || (le32(mdt + 44) & 0xffff) != 3 || le32(mdt + 40) != 0x00200034 ||
+      le32(mdt + 52 + 2 * 32) != 1 ||
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -380,7 +380,7 @@
+  const uint32_t *reserved_size = NULL;
+  unsigned length = 0;
+  if (!error && (SecureDTGetProperty(node, "zap-reserved-base", (const void **)&reserved_base,
+-     &length) != kSuccess || length != 8 || *reserved_base != 0x97f15000ull)) error = EINVAL;
++     &length) != kSuccess || length != 8 || *reserved_base != 0x9a915000ull)) error = EINVAL;
+  if (!error && (SecureDTGetProperty(node, "zap-reserved-size", (const void **)&reserved_size,
+      &length) != kSuccess || length != 4 || *reserved_size != 0x2000)) error = EINVAL;
+  printf("SWEET ADRENO: CP firmware properties errno=%d SQE=%u MDT=%u ZAP=%u\n",
