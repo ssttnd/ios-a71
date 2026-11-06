@@ -12,6 +12,9 @@ on:
       machine_config:
         description: xnu MACHINE_CONFIG
         default: SWEET
+      runner:
+        description: GitHub runner label (macos-15-intel if arm64 runners have no capacity)
+        default: macos-15
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -37,7 +40,7 @@ jobs:
     # macos-14 shipped Xcode 15.x (iig matching the xnu-8796 IORPC ABI) but its images
     # were retired in November 2026. DC28088/ios-sweet built and booted a kernel from
     # macos-15 with its oldest Xcode, picked below.
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
