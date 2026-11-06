@@ -1,0 +1,32 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7440,7 +7440,18 @@
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/* SWEET runs every iOS binary this way: one short line per exec. */
++			{
++		/* One console line per exec is costly with daemons respawning; sweetexeclog=1 restores it. */
++		static int sweet_exec_log = -1;
++		if (sweet_exec_log < 0) {
++			int on = 0;
++			PE_parse_boot_argn("sweetexeclog", &on, sizeof(on));
++			sweet_exec_log = on != 0;
++		}
++		if (sweet_exec_log) {
+ 			printf("exec %s\n", p->p_name);
++		}
++	}
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -904,7 +904,7 @@
+ 		if ((++ticks % 30000) == 0) {
+ 			printf("SWEET USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
+ 		}
+-		ud_sleep_ms(1);
++		ud_sleep_ms(ud.acm ? 4 : 1);      /* the serial console needs no fast polling */
+ 	}
+ }
+ 

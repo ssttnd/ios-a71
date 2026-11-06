@@ -45,13 +45,10 @@ cmdline = f"debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogres
 # sweetgpu is the GPU bring-up stage: 1 read-only ... 9 commands. Override with SWEETGPU.
 cmdline += " sweetbattery=0 sweetbacklight=0 sweetfbdpudump=0 sweetfbflip=0 sweetfbbeam=0"
 cmdline += f" sweetgpu={int(os.environ.get('SWEETGPU', '1'))}"
-# The A71 RTC does not hold the real date. a71-flash-boot computes PC time minus RTC.
-if os.environ.get('SWEETRTCOFFSET'):
-    cmdline += f" sweetrtcoffset={int(os.environ['SWEETRTCOFFSET'])}"
-# Start the calendar at packaging time, not 1969; extra test arguments from SWEETARGS.
-import time
-if not os.environ.get('SWEETNOTIME'):
-    cmdline += f" sweetbuildtime={int(time.time())}"
+# Less console work: copies of /dev/null writes and the IOKit trace. Empty SWEETQUIET keeps them.
+if os.environ.get('SWEETQUIET', '1'):
+    cmdline += " sweetnull=none sweetiolog=none"
+# Extra test arguments, such as sweetexeclog=1 or ufslogsecs=1.
 if os.environ.get('SWEETARGS'):
     cmdline += " " + os.environ['SWEETARGS']
 

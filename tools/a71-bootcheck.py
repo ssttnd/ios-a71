@@ -13,7 +13,7 @@ LOG = sys.argv[1]
 LIMIT = int(sys.argv[2]) if len(sys.argv) > 2 else 300
 STEPS = [("kernel", "Darwin Kernel Version"), ("USB up", "SWEET USB: running"), ("root mounted", "hfs: mounted"),
          ("launchd", "exec launchd"), ("backboardd", "exec backboardd"), ("SpringBoard", "exec SpringBoard"),
-         ("first frames", "SWEET FB: 10 s: presents")]
+         ("first frames", "SWEET FB: timing window_ms")]
 t0 = time.time()
 start_size = os.path.getsize(LOG) if os.path.exists(LOG) else 0
 seen, port = set(), False
@@ -43,7 +43,7 @@ while time.time() - t0 < LIMIT:
     if panic:
         print("PANIC:", panic.group(0)[:300], flush=True)
         break
-    if "first frames" in seen and text.count("SWEET FB: 10 s: presents") >= 2:
+    if "first frames" in seen and text.count("SWEET FB: timing window_ms") >= 2:
         break
     time.sleep(5)
 crashes = re.findall(r"^CRASH (\S+?)\[\d+\] sig", text, re.M)

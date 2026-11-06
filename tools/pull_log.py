@@ -23,8 +23,6 @@ if not adb or not os.path.isfile(adb):
     sys.exit("Blad: Nie znaleziono adb.exe! Upewnij sie, ze adb jest w PATH lub w biezacym folderze.")
 
 print(f"Uzywam ADB: {adb}")
-tools_dir = os.path.dirname(__file__)
-sweet_log_py = os.path.join(tools_dir, "sweet-log.py")
 
 print("[1/3] Sprawdzanie partycji userdata...")
 dev = subprocess.check_output([adb, "shell", "readlink -f /dev/block/by-name/userdata"]).decode().strip()
