@@ -1,0 +1,541 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -23,10 +23,15 @@
+  * panic with a clear message instead of being NULL.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/clock.h>
+ #include <kern/debug.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
+ #include <kern/startup.h>
+ #include <libkern/amfi/amfi.h>
++#include <machine/atomic.h>
+ #include <mach/kern_return.h>
++#include <pexpert/pexpert.h>
+ #include <sys/codesign.h>
+ #include <sys/mount.h>
+ #include <sys/priv.h>
+@@ -280,13 +285,474 @@
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). SWEET runs without a sandbox: operations succeed
+  * (checks allow, profile init is accepted); the few that must return
+- * data (container paths, extension tokens) fail with ENOENT. The first
+- * use of each operation number is logged.
++ * data (container paths) fail with ENOENT. The first use of each
++ * operation number is logged.
++ *
++ * From Yofuness/ios-flame (Pixel 4a, same SoC), its patches 0219 and 0240.
++ * 0219: extension issue (op 5) writes a token string in the userland
++ * format and consume (op 6) returns a handle, so tccd's grants reach
++ * Music and assetsd. sweetsbext=0 makes both fail with ENOENT again.
+  */
+ static uint64_t sweet_sandbox_seen;
++static uint64_t sweet_sbext_count;     /* issue counter (token hex) */
++static int64_t sweet_sbext_handle;     /* consume handle counter */
++
++#define SWEET_SBEXT_TOKEN_MAX   0x800   /* userland buffer at out_token */
++#define SWEET_SBEXT_CLASS_MAX   256
++#define SWEET_SBEXT_DATA_MAX    1024
++#define SWEET_SBEXT_LOG_MAX     16
+ 
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sbext_enabled(void)
++{
++	static int enabled = -1;
++	if (enabled < 0) {
++		int v = 1;
++		(void)PE_parse_boot_argn("sweetsbext", &v, sizeof(v));
++		enabled = v != 0;
++	}
++	return enabled;
++}
++
++/* op 5: arg -> { ext_class, type, data, flags, out_token, pid, pidversion } */
++static int
++sweet_sbext_issue(struct proc *p, user_addr_t arg)
++{
++	struct {
++		uint64_t ext_class;
++		uint64_t type;
++		uint64_t data;
++		uint64_t flags;
++		uint64_t out_token;
++		int64_t pid;
++		uint64_t pidversion;
++	} req;
++	char *cls, *data, *tok;
++	size_t len;
++	uint64_t n;
++	int err;
++
++	if (!proc_is64bit(p) || arg == USER_ADDR_NULL) {
++		return EFAULT;
++	}
++	if (copyin(arg, &req, sizeof(req))) {
++		return EFAULT;
++	}
++	cls = kalloc_data(SWEET_SBEXT_CLASS_MAX, Z_WAITOK | Z_ZERO);
++	data = kalloc_data(SWEET_SBEXT_DATA_MAX, Z_WAITOK | Z_ZERO);
++	tok = kalloc_data(SWEET_SBEXT_TOKEN_MAX, Z_WAITOK | Z_ZERO);
++	if (cls == NULL || data == NULL || tok == NULL) {
++		err = ENOMEM;
++		goto out;
++	}
++	err = EFAULT;
++	if (copyinstr((user_addr_t)req.ext_class, cls, SWEET_SBEXT_CLASS_MAX, &len)) {
++		goto out;
++	}
++	if (req.data != 0 &&
++	    copyinstr((user_addr_t)req.data, data, SWEET_SBEXT_DATA_MAX, &len)) {
++		goto out;
++	}
++	n = os_atomic_inc(&sweet_sbext_count, relaxed);
++	/* snprintf truncates the data path if the token would pass 0x7ff */
++	(void)snprintf(tok, SWEET_SBEXT_TOKEN_MAX,
++	    "%016llx%016llx%016llx%016llx;00;00000000;00000000;00000000;"
++	    "000000000000001a;%s;01;00000000;0000000000000000;%s",
++	    n, req.type, (uint64_t)proc_pid(p), mach_absolute_time(), cls, data);
++	if (copyout(tok, (user_addr_t)req.out_token, strlen(tok) + 1)) {
++		goto out;
++	}
++	if (n <= SWEET_SBEXT_LOG_MAX) {
++		char name[32];
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("SWEET Sandbox: issue %s type %llu class %.64s\n",
++		    name, req.type, cls);
++	}
++	err = 0;
++out:
++	if (cls) {
++		kfree_data(cls, SWEET_SBEXT_CLASS_MAX);
++	}
++	if (data) {
++		kfree_data(data, SWEET_SBEXT_DATA_MAX);
++	}
++	if (tok) {
++		kfree_data(tok, SWEET_SBEXT_TOKEN_MAX);
++	}
++	return err;
++}
++
++/* op 6: arg -> { token, token_len, handle_out }; the token is not parsed */
++static int
++sweet_sbext_consume(struct proc *p, user_addr_t arg)
++{
++	struct {
++		uint64_t token;
++		uint64_t token_len;
++		uint64_t handle_out;
++	} req;
++	int64_t handle;
++
++	if (!proc_is64bit(p) || arg == USER_ADDR_NULL) {
++		return EFAULT;
++	}
++	if (copyin(arg, &req, sizeof(req))) {
++		return EFAULT;
++	}
++	handle = os_atomic_inc(&sweet_sbext_handle, relaxed);
++	if (copyout(&handle, (user_addr_t)req.handle_out, sizeof(handle))) {
++		return EFAULT;
++	}
++	return 0;
++}
++
++/*
++ * 0240: sandbox container path (op 4). PlugInKit's checkEnvironment asks
++ * sandbox_container_path_for_pid(self) and kills every app extension on
++ * failure. launchd/xpcproxy pass the container in the "Sandbox" spawn
++ * attributes (profile name at +0x10, container path at +0x50); remember it
++ * per pid at exec and answer op 4 from that table. Boot-arg sweetsbcont=0
++ * turns it off (op 4 -> ENOENT as before).
++ */
++#define SWEET_SBCONT_MAX        256
++#define SWEET_SBCONT_PROFILE    0x10
++#define SWEET_SBCONT_PATH       0x50
++static struct {
++	pid_t    pid;
++	uint64_t uniqueid;
++	char     path[MAXPATHLEN];
++} sweet_sbcont[SWEET_SBCONT_MAX];
++static unsigned int sweet_sbcont_next;
++static int sweet_sbcont_logged, sweet_sbcont_blobs_logged;
++static LCK_GRP_DECLARE(sweet_sbcont_grp, "sweet_sbcont");
++static LCK_MTX_DECLARE(sweet_sbcont_mtx, &sweet_sbcont_grp);
++
++static bool
++sweet_sbcont_enabled(void)
++{
++	static int enabled = -1;
++	if (enabled < 0) {
++		int v = 1;
++		(void)PE_parse_boot_argn("sweetsbcont", &v, sizeof(v));
++		enabled = v != 0;
++	}
++	return enabled;
++}
++
++/* bounded string length of blob[off..len); 0 if out of range */
++static size_t
++sweet_sbcont_strlen(const char *blob, size_t len, size_t off, size_t max)
++{
++	if (len <= off) {
++		return 0;
++	}
++	return strnlen(blob + off, MIN(len - off, max - 1));
++}
++
++static void sweet_sandbox_proc_exit(struct proc *p);
++static void sweet_sandbox_proc_notify_exit(struct proc *p);
++
++/* 0240 v2: is the exec worth logging? not spawned by launchd, or an extension */
++static bool
++sweet_sbcont_interesting(struct proc *p, const char *path)
++{
++	size_t n = strlen(path);
++	if (proc_ppid(p) != 1) {
++		return true;
++	}
++	if (strnstr(path, ".appex/", n) != NULL) {
++		return true;
++	}
++	if (n >= 8 && strcmp(path + n - 8, "Provider") == 0) {
++		return true;
++	}
++	return n >= 9 && strcmp(path + n - 9, "Extension") == 0;
++}
++
++/* 0240 v2: every printable run >= 8 chars with its offset, plus 0x00-0x7f hex */
++static void
++sweet_sbcont_dump(pid_t pid, const char *name, const char *blob, size_t len)
++{
++	size_t i = 0;
++	while (i < len) {
++		size_t j = i;
++		while (j < len && blob[j] >= 0x20 && blob[j] < 0x7f) {
++			j++;
++		}
++		if (j - i >= 8) {
++			printf("SWEET Sandbox:   pid %d @0x%zx '%.*s'\n", pid, i,
++			    (int)MIN(j - i, 200), blob + i);
++		}
++		i = j + 1;
++	}
++	for (size_t row = 0; row < 0x80 && row < len; row += 0x40) {
++		char hex[0x40 * 2 + 1];
++		size_t k;
++		for (k = 0; k < 0x40 && row + k < len; k++) {
++			snprintf(hex + k * 2, 3, "%02x", (unsigned char)blob[row + k]);
++		}
++		hex[k * 2] = '\0';
++		printf("SWEET Sandbox:   pid %d (%s) hex @0x%02zx %s\n", pid, name, row, hex);
++	}
++}
++
++/* store path[0..plen) for p; returns true if this is one of the first 64 */
++static bool
++sweet_sbcont_store(struct proc *p, const char *src, size_t plen)
++{
++	pid_t pid = proc_pid(p);
++	uint64_t uid = proc_uniqueid(p);
++	lck_mtx_lock(&sweet_sbcont_mtx);
++	unsigned int i;
++	for (i = 0; i < SWEET_SBCONT_MAX; i++) {
++		if (sweet_sbcont[i].pid == pid) {
++			break;
++		}
++	}
++	if (i == SWEET_SBCONT_MAX) {
++		i = sweet_sbcont_next++ % SWEET_SBCONT_MAX;       /* oldest overwritten */
++	}
++	sweet_sbcont[i].pid = pid;
++	sweet_sbcont[i].uniqueid = uid;
++	memcpy(sweet_sbcont[i].path, src, plen);
++	sweet_sbcont[i].path[plen] = '\0';
++	bool log = sweet_sbcont_logged < 64;
++	if (log) {
++		sweet_sbcont_logged++;
++	}
++	lck_mtx_unlock(&sweet_sbcont_mtx);
++	return log;
++}
++
++/* exec hook: only records, never asks for a transition or fails the exec */
++static int
++sweet_sandbox_check_execve(kauth_cred_t old __unused, struct vnode *vp,
++    off_t offset __unused, struct vnode *scriptvp __unused,
++    struct label *vnodelabel __unused, struct label *scriptvnodelabel __unused,
++    struct label *execlabel __unused, struct proc *p,
++    void *macpolicyattr, size_t macpolicyattrlen)
++{
++	if (!sweet_sbcont_enabled()) {
++		return 0;
++	}
++	pid_t pid = proc_pid(p);
++	/* v5: no clearing here: this hook runs after the HOME scan of the same exec (it clears instead) */
++	if (macpolicyattr == NULL || macpolicyattrlen == 0) {
++		return 0;
++	}
++	const char *blob = macpolicyattr;
++	size_t plen = sweet_sbcont_strlen(blob, macpolicyattrlen, SWEET_SBCONT_PATH, MAXPATHLEN);
++	char name[32];
++	proc_name(pid, name, sizeof(name));
++	/* 0240 v2: bounded blob logging, 4 launchd spawns + 32 interesting ones */
++	static int launchd_logged;
++	char *vpath = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	if (vpath != NULL) {
++		int vlen = MAXPATHLEN;
++		if (vp == NULL || vn_getpath(vp, vpath, &vlen) != 0) {
++			strlcpy(vpath, name, MAXPATHLEN);
++		}
++		bool want = false;
++		if (sweet_sbcont_interesting(p, vpath)) {
++			want = sweet_sbcont_blobs_logged < 32;
++			sweet_sbcont_blobs_logged += want;
++		} else {
++			want = launchd_logged < 4;
++			launchd_logged += want;
++		}
++		if (want) {
++			const char *base = strrchr(vpath, '/');
++			base = base ? base + 1 : vpath;
++			printf("SWEET Sandbox: spawn blob pid %d ppid %d (%.48s) len %zu profile %s container %s\n",
++			    pid, proc_ppid(p), base, macpolicyattrlen,
++			    sweet_sbcont_strlen(blob, macpolicyattrlen, SWEET_SBCONT_PROFILE, 64) ? "yes" : "no",
++			    plen ? "yes" : "no");
++			sweet_sbcont_dump(pid, base, blob, macpolicyattrlen);
++		}
++		kfree_data(vpath, MAXPATHLEN);
++	}
++	if (plen == 0) {
++		return 0;
++	}
++	if (sweet_sbcont_store(p, blob + SWEET_SBCONT_PATH, plen)) {
++		printf("SWEET Sandbox: container for pid %d (%s): %.200s\n", pid, name, blob + SWEET_SBCONT_PATH);
++	}
++	return 0;
++}
++
++/*
++ * 0240 v2: fallback from kern_exec.c after exec_extract_strings: if the
++ * spawn blob gave no container, take HOME=/(private/)var/mobile/Containers/
++ * Data/... from the new environment. Only for images under /System,
++ * /Applications or /private/var/containers; stops at the first HOME=.
++ */
++static int sweet_sbcont_home_logged, sweet_sbcont_op4_logged, sweet_sbcont_uidlog;
++
++void sweet_sbcont_exec_env(struct proc *p, const char *path, const char *env, const char *envend);
++void
++sweet_sbcont_exec_env(struct proc *p, const char *path, const char *env, const char *envend)
++{
++	if (!sweet_sbcont_enabled() || path == NULL || env == NULL) {
++		return;
++	}
++	/* v5: a new exec in this pid drops the old entry here, before anything of this exec is stored (the
++	   exec hook runs later in exec_mach_imgact and used to wipe what this scan had just stored: sb4) */
++	sweet_sandbox_proc_exit(p);
++	if (strncmp(path, "/System/", 8) != 0 && strncmp(path, "/Applications/", 14) != 0 &&
++	    strncmp(path, "/private/var/containers/", 24) != 0 &&
++	    strncmp(path, "/var/containers/", 16) != 0) {
++		return;
++	}
++	pid_t pid = proc_pid(p);
++	uint64_t uid = proc_uniqueid(p);
++	bool have = false;
++	lck_mtx_lock(&sweet_sbcont_mtx);
++	for (unsigned int i = 0; i < SWEET_SBCONT_MAX; i++) {
++		if (sweet_sbcont[i].pid == pid && sweet_sbcont[i].uniqueid == uid) {
++			have = true;
++			break;
++		}
++	}
++	lck_mtx_unlock(&sweet_sbcont_mtx);
++	if (have) {
++		return;
++	}
++	for (const char *s = env; s < envend;) {
++		size_t n = strnlen(s, envend - s);
++		if (n > 5 && strncmp(s, "HOME=", 5) == 0) {
++			const char *h = s + 5;
++			if ((strncmp(h, "/private/var/mobile/Containers/Data/", 36) == 0 ||
++			    strncmp(h, "/var/mobile/Containers/Data/", 28) == 0) && n - 5 < MAXPATHLEN) {
++				bool log = sweet_sbcont_store(p, h, n - 5) && sweet_sbcont_home_logged < 32;
++				if (log) {
++					sweet_sbcont_home_logged++;
++					const char *base = strrchr(path, '/');
++					printf("SWEET Sandbox: HOME container for pid %d (%.48s): %.200s\n",
++					    pid, base ? base + 1 : path, h);
++				}
++			}
++			return;
++		}
++		s += n + 1;
++	}
++}
++
++static void
++sweet_sandbox_proc_exit(struct proc *p)
++{
++	pid_t pid = proc_pid(p);
++	lck_mtx_lock(&sweet_sbcont_mtx);
++	for (unsigned int i = 0; i < SWEET_SBCONT_MAX; i++) {
++		if (sweet_sbcont[i].pid == pid) {
++			sweet_sbcont[i].pid = 0;
++			sweet_sbcont[i].path[0] = '\0';
++		}
++	}
++	lck_mtx_unlock(&sweet_sbcont_mtx);
++}
++
++/* v4: the exit notification is not used to drop entries: an exec retires the old proc after the new image's
++   HOME was recorded (sb3: every lookup ENOENT); an entry is replaced at the pid's next exec instead */
++static void
++sweet_sandbox_proc_notify_exit(struct proc *p)
++{
++	static int logged;
++	if (logged < 8) {
++		pid_t pid = proc_pid(p);
++		int had = 0;
++		lck_mtx_lock(&sweet_sbcont_mtx);
++		for (unsigned int i = 0; i < SWEET_SBCONT_MAX; i++) {
++			had |= sweet_sbcont[i].pid == pid && sweet_sbcont[i].path[0] != '\0';
++		}
++		lck_mtx_unlock(&sweet_sbcont_mtx);
++		if (had) {
++			logged++;
++			printf("SWEET Sandbox: exit notify pid %d with a container entry (kept)\n", pid);
++		}
++	}
++}
++
++/* op 4: arg -> { pid (0 = self), 0, buf, len, 0 }; copies the path with its NUL */
++static int
++sweet_sbcont_path(struct proc *p, user_addr_t arg)
++{
++	struct {
++		uint64_t pid;
++		uint64_t unused1;
++		uint64_t buf;
++		uint64_t len;
++		uint64_t unused2;
++	} req;
++	char *path;
++	size_t plen = 0;
++	pid_t pid;
++	uint64_t uid;
++	int err = ENOENT;
++
++	if (!proc_is64bit(p) || arg == USER_ADDR_NULL) {
++		return EFAULT;
++	}
++	if (copyin(arg, &req, sizeof(req))) {
++		return EFAULT;
++	}
++	pid = (pid_t)req.pid;
++	if (pid == 0 || pid == proc_pid(p)) {
++		pid = proc_pid(p);
++		uid = proc_uniqueid(p);
++	} else {
++		proc_t t = proc_find(pid);
++		if (t == NULL) {
++			return ESRCH;
++		}
++		uid = proc_uniqueid(t);
++		proc_rele(t);
++	}
++	path = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	if (path == NULL) {
++		return ENOMEM;
++	}
++	lck_mtx_lock(&sweet_sbcont_mtx);
++	uint64_t stored = 0;
++	for (unsigned int i = 0; i < SWEET_SBCONT_MAX; i++) {
++		/* pid only (v3): the uniqueid recorded at exec did not match the running image's (sb2: every
++		   lookup ENOENT); entries are cleared at exit and on the next exec of the pid */
++		if (sweet_sbcont[i].pid == pid && sweet_sbcont[i].path[0] != '\0') {
++			plen = strlcpy(path, sweet_sbcont[i].path, MAXPATHLEN) + 1;
++			stored = sweet_sbcont[i].uniqueid;
++			err = 0;
++			break;
++		}
++	}
++	lck_mtx_unlock(&sweet_sbcont_mtx);
++	if (err == 0 && stored != uid && sweet_sbcont_uidlog < 16) {
++		sweet_sbcont_uidlog++;
++		printf("SWEET Sandbox: op4 pid %d uniqueid %llu, stored %llu\n", pid, uid, stored);
++	}
++	if (err == 0) {
++		if (plen > req.len) {
++			err = ERANGE;
++		} else if (copyout(path, (user_addr_t)req.buf, plen)) {
++			err = EFAULT;
++		}
++	}
++	static int late_logged;
++	uint64_t up_s = mach_absolute_time() / 24000000ULL;    /* 24 MHz timebase */
++	char cname[32];
++	proc_name(proc_pid(p), cname, sizeof(cname));
++	int wanted = err == 0 || strnstr(cname, "Provider", sizeof(cname)) || strnstr(cname, "sbcont", sizeof(cname));
++	if (sweet_sbcont_op4_logged < 16 || (up_s > 60 && wanted && late_logged++ < 48)) {     /* 0240 v2-v4 */
++		sweet_sbcont_op4_logged++;
++		char name[32];
++		proc_name(pid, name, sizeof(name));
++		printf("SWEET Sandbox: op4 by %s for pid %d (%s) -> %d [%.200s]\n", cname, pid, name, err,
++		    err == 0 ? path : "");
++	}
++	kfree_data(path, MAXPATHLEN);
++	return err;
++}
++
++static int
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -295,9 +761,12 @@
+ 		printf("SWEET Sandbox: %s op %d\n", name, call);
+ 	}
+ 	switch (call) {
+-	case 4:         /* container path (audit token / pid) */
+-	case 5:         /* extension issue */
+-	case 6:         /* extension consume */
++	case 5:         /* extension issue (0219) */
++		return sweet_sbext_enabled() ? sweet_sbext_issue(p, arg) : ENOENT;
++	case 6:         /* extension consume (0219) */
++		return sweet_sbext_enabled() ? sweet_sbext_consume(p, arg) : ENOENT;
++	case 4:         /* container path (pid); 0240 */
++		return sweet_sbcont_enabled() ? sweet_sbcont_path(p, arg) : ENOENT;
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:
+@@ -349,6 +818,8 @@
+ static const struct mac_policy_ops sweet_sandbox_mac_ops = {
+ 	.mpo_policy_syscall = sweet_sandbox_syscall,
+ 	.mpo_priv_grant = sweet_sandbox_priv_grant,
++	.mpo_cred_check_label_update_execve = sweet_sandbox_check_execve,      /* 0240 */
++	.mpo_proc_notify_exit = sweet_sandbox_proc_notify_exit,                /* 0240 v4: logs only */
+ };
+ 
+ static struct mac_policy_conf sweet_sandbox_mac_conf = {
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -374,6 +374,7 @@
+ static int execargs_free(struct image_params *imgp);
+ static int exec_check_permissions(struct image_params *imgp);
+ static int exec_extract_strings(struct image_params *imgp);
++extern void sweet_sbcont_exec_env(proc_t p, const char *path, const char *env, const char *envend); /* 0240 v2 */
+ static int exec_add_apple_strings(struct image_params *imgp, const load_result_t *load_result);
+ static int exec_handle_sugid(struct image_params *imgp);
+ static int sugid_scripts = 0;
+@@ -1292,6 +1293,9 @@
+ 	AUDIT_ARG(envv, imgp->ip_endargv, imgp->ip_envc,
+ 	    imgp->ip_endenvv - imgp->ip_endargv);
+ 
++	/* 0240 v2: HOME container fallback for Sandbox op 4 (sweetsbcont=0 off) */
++	sweet_sbcont_exec_env(p, imgp->ip_strings + strlen(EXECUTABLE_KEY),
++	    imgp->ip_endargv, imgp->ip_endenvv);
+ 
+ 
+ 	/* reset local idea of thread, uthread, task */

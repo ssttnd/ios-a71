@@ -130,7 +130,14 @@ Bug on a3e98a32: after display off and on the owner reports dead touch. Observed
 
 Owner, still on a3e98a32: touch came back by itself, so that hang is a temporary UI stall, cause unknown. Progressive blur shows a black band instead. Observed: no refusal or error from the bundle in logs/usb-metal6.txt. The fork recorded a similar black band and left it unsolved (status bar in the search pull-down, top ~135 px of the blurred texture). Its draw log (`/var/local/sweet-native-drawlog`) arms only if the file appears after the process starts, so it needs a bundle change or a way to touch the file while iOS runs.
 
-**Next:** owner's report on artifacts, speed; which screen shows the band. Move the GPU stage earlier so the restart is not seen. Later: widgets (retest sandbox patches), time, Wi-Fi per
+Owner on 1e9f6005 (`sweetpresentwait=1 sweetpresentlock=1`, no importsync): "чисто", no artifacts. Keep these. Observed: submit ioctl 1.2-2 ms, 25-35 presents/s under load, gate about 5 ms. Black band is at the top of the screen. Guess: it may be blur over the black wallpaper; not checked.
+Kernel 3b14aa8 adds 0192: with `sweetdrawlogkey=1` a volume press writes the draw log trigger; CI pending when this was written.
+Wallpaper package prepared, NOT written: `build/wallpaper.payload` (sha256 90c18acb..., 47 entries, 15 MB): 16 PNG and 6 CAML for 375x812 variants made with pillow-heif, flag `/private/var/preferences/FeatureFlags/Domain/ExtensionKit.plist` with enforce_xpc_cache_code_signing off (key confirmed in the system plist, override path is a guess from iOS practice). The 6 CAML files get replaced; originals in `research/wallpaper/root` and the v13 image. Needs `sweetamfi=1 sweetpayload=1` and the owner's confirmation. LaunchServices rebuild stays last resort: the fork stalled on the Apple logo with early registration.
+
+Checked for the band: donor's `setScissorRect` is a no-op, but tools/prepare-sweet-native-metal.py already implements scissor and viewport, so that is not the cause. No "not implemented" message in the logs.
+The owner approved writing the wallpaper package, then said stop and asked for the blur first. Package not written.
+
+**Next:** draw log capture of the band on the 0192 kernel; then wallpaper (ask whether the approval still stands); shorten the present lock for FPS. Move the GPU stage earlier so the restart is not seen. Later: widgets (retest sandbox patches), time, Wi-Fi per
 `docs/a71-radio-port.md`. Restore image for boot: `backup/2026-11-06/boot.img`.
 Kernel archive of this build: `research/xnu-kernel-130bb90.zip`.
 
