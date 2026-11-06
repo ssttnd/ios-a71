@@ -1,3 +1,58 @@
+## A71 handoff 2026-11-06 (READ FIRST): lock screen reached
+
+**Observed (owner, on screen):** after writing root v13 and a plain system reboot:
+verbose text, Apple logo with NO progress bar, then the iOS lock screen. No log has
+been pulled from this boot yet; touch/home/apps not yet reported on this root.
+
+**Cause of the old "bar stuck near 99%":** the root had been built by `mkiosroot.sh`
+but `sweet-root-tweaks.py` was never run on it (read directly from the image). Log of
+that boot (flush 517): datamigrator ran; SpringBoard main thread in all 40 samples at
+`FBSystemShellInitialize -> -[BKSSystemShellService _checkIn]` (sync XPC to backboardd);
+backboardd idle in its run loop; CommCenter crash loop. Link between migration and the
+checkIn wait is inferred, supported by the fix working, not stated by any log line.
+
+**On the phone:** `userdata` first 16 GiB = v13, SHA-256 `c6660c54...cd7b81` verified by
+full readback. `boot` unchanged, SHA-256 `9caef9cc...ae1c` (known working; no local
+build has this hash). Its args: `cpus=8 sweetfb_hz=60 sweettouchdelay=3
+sweettouchbitbang=1 sweetusb=2 sweetfb_noconsole=1` plus the usual root args.
+
+**Local (gitignored):** `backup/2026-11-06/` boot, recovery, dtbo, vbmeta*, persist, efs,
+sec_efs, modemst1/2, fsg, fsc, param + `SHA256-phone.txt` (contains IMEI-class data, never
+commit). `backup/ios16-root-20H392-a71-v13.img` clean restore image. `dtb/boot_unpacked`,
+`shim/out/Image`, `build/a71_highmem.adt`, `research/ipsw-x/d22ap.adt` copied from WSL.
+Stock firmware matching the bootloader (A715FXXSBDXB1):
+`Desktop\misc\misc\71stuff\ROMS\Stock`. adb: `Desktop\misc\misc\71stuff\Minimal ADB and Fastboot`.
+
+**Owner rule: do NOT rely on WSL.** Windows folder is the only working copy. WSL `~/ios-a71`
+and unneeded Redmi leftovers get deleted later, only on the owner's request. Still only in WSL:
+`research/dsc` (shared cache for symbolication, re-extractable from the IPSW), `gh` login.
+Editing the HFS+ root currently has no Windows tool (read-only: `tools/hfsread.py`).
+
+**A71 facts learned:**
+- No `fastboot boot`. iOS boots from the `boot` partition. Logs via TWRP.
+- From TWRP use `adb shell setprop sys.powerctl reboot`. Plain `adb reboot` gives reason
+  `reboot,shell` and the bootloader returns to recovery (`androidboot.boot_recovery=1`).
+- TWRP shell arithmetic is 32-bit: never compute userdata offsets on the phone
+  (`tools/pull_log.py` does it in Python). TWRP `dd` reading a long nc stream failed at about
+  15 GiB with `read error: Bad address`: use `tools/a71-write-root.py` (verified 1 GiB chunks).
+- USB is off in iOS: `SWEET USB: controller unpowered or unclocked; DWC3 not read`
+  (Samsung ABL leaves GDSC/clocks off, unlike Xiaomi fastboot). So `sweetusb=2` does nothing;
+  Windows also likely lacks an inbox CDC-ECM driver, so CDC-ACM serial is the suggested transport.
+- Current 0085 log prints `Adreno 618 Core Active!` while GX GDSC timed out and the CP_RB_BASE
+  readback is 0: the GPU is NOT working despite that line.
+- Hardware per device tree: WCN3990, WCD937x + TAS2562, s2mu106/107, PN547.
+
+**GPU/Wi-Fi/BT lead (not yet tried on A71):** https://github.com/DC28088/ios-sweet branch
+`codex/native-adreno-metal` (head 67448d2151, fork of dipa-studio) claims Metal on A618 via
+AIR -> NIR -> Mesa freedreno/ir3, Wi-Fi and Bluetooth on the same SoC, patches 0081-0183.
+Claims are that author's, on Redmi. A71 needs: own signed `a615_zap`, OPP table for 730,
+Wi-Fi/BT rails, MSA/MPSS addresses and BDF from A71 DT, panel and battery and haptic work.
+Patch numbers collide with ours from 0081. Main unknown: Samsung TrustZone behaviour.
+
+**Next (proposed to owner, no decision recorded yet):** owner tests the lock screen; pull log via
+TWRP; add USB log; then base on that branch with A71 patches on top, bring-up in order
+power -> GMU -> SQE/zap -> Metal, then Wi-Fi, BT. Pushing to the fork requires asking first.
+
 ## A71 touch status (2026-10-23) - CONFIRMED WORKING!
 - Touchscreen input on Samsung Galaxy A71 4G (SM-A715F) running Apple iOS 16.7.16 is CONFIRMED FULLY WORKING by the device owner!
 - Transport: Software I2C bit-banging on GPIO 6 (SDA) and GPIO 7 (SCL) via 'sweettouchbitbang=1' successfully bypasses the hardware-locked QUPv3 SE7 FIFO (GENI FIFO_IF_DISABLE_RO=1).

@@ -1,5 +1,8 @@
 import subprocess, sys, os, shutil
 
+# The Polish messages below crash on Windows' default cp1252 console.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # Dynamiczne wyszukiwanie adb w PATH, bieżącym folderze lub znanych ścieżkach
 adb = shutil.which("adb")
 if not adb or not os.path.isfile(adb):
