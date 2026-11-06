@@ -92,6 +92,20 @@ Output is now `shim/out/shim-boot.img`. Kernel zip: newest `Downloads\xnu-kernel
 Yofuness/ios-flame (Pixel 4a, same SD730G/A618). CI moved to macos-15 (85c1c27), since GitHub
 retired macos-14; run 42241740972 was queued when this was written. Pushing now works from Windows.
 
+**2026-11-07 state, branch `a71-gpu` (55c5ede):** fork DC28088 0081-0183 applied cleanly on our 0080
+base (built locally in `research/tree-0080` by reversing 0085..0081 from the CI tree), A71 touch and
+USB console on top as 0184-0188. GPU bring-up is staged by boot arg: sweetgpu=1 read-only, 2 ARC read,
+3 gfx.lvl, 4 CX power, 5 GMU clocks, 6 firmware staging, 7 DMA/SMMU/HFI, 8 GMU/HFI start, 9 SQE/CP. Stages
+6+ need the A71's own firmware in the ADT (`tools/sweet-adreno-firmware.py` in the fork; its zap sizes are
+Redmi's). Metal also needs a userspace bundle on the root.
+**Unsolved boot loop:** images from main 3075cab, b3e4766, 66077bb looped before any log flush, and
+removing the fork's sandbox patches did not help. The last good image is main's 52e492f kernel packaged
+with `SWEETNOTIME=1` (boots, reached home screen; on the phone now, hash 3142e516...). 66077bb differs from
+it only by 0091/0092 (RTC code not executed without its args, a 15 s display probe) plus ufslogsecs=1. Cause
+not known. The fork's sandbox patches were therefore wrongly suspected: retest them.
+**Do not run `tools/a71-usblog.py`/`a71-bootcheck.py` unattended before CREATE_NO_WINDOW (now fixed):**
+detached runs opened a console window every poll and annoyed the owner.
+
 **Next:** owner reports speed and artifacts. Then USB networking that Windows drives without WSL
 (needed for SSH, the donors' install path), then base on the Pixel 4a port per
 `docs/a71-radio-port.md`. Restore image for boot: `backup/2026-11-06/boot.img`.
