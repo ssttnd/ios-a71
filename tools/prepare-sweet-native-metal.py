@@ -511,11 +511,13 @@ index_range(const uint8_t *indices, unsigned count, unsigned index_size, bool re
       if (i == 0) {''','''      unsigned tw = u_minify(t->shape.width, draw->native_color_level[i]);
       unsigned th = u_minify(t->shape.height ? t->shape.height : 1, draw->native_color_level[i]);
       if (draw->native_color_level[i]) {
-         static bool said;
-         if (!said) {
-            said = true;
-            fprintf(stderr, "SweetNativeMetal: rendering into mip level %u of a %ux%u texture\\n",
-                    draw->native_color_level[i], t->shape.width, t->shape.height);
+         static unsigned said;
+         if (said < 12) {
+            said++;
+            fprintf(stderr, "SweetNativeMetal: mip pass level %u of %ux%u flags %#x viewport %g,%g %gx%g scissor %u,%u %ux%u\\n",
+                    draw->native_color_level[i], t->shape.width, t->shape.height, draw->native_flags,
+                    draw->native_viewport[0], draw->native_viewport[1], draw->native_viewport[2], draw->native_viewport[3],
+                    draw->native_scissor[0], draw->native_scissor[1], draw->native_scissor[2], draw->native_scissor[3]);
          }
       }
       if (i == 0) {''')

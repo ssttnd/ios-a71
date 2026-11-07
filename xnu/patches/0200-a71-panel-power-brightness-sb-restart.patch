@@ -1,0 +1,122 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -433,8 +433,9 @@
+ 	const uint32_t ctrl = fDsi[DSI_REG_CTRL / 4], version = fDsi[DSI_REG_VERSION / 4];
+ 	IOLog("SWEET BL: DSI0 version=%#x ctrl=%#x dma_ctrl=%#x int=%#x\n", version, ctrl,
+ 	    fDsi[DSI_REG_DMA_CTRL / 4], fDsi[DSI_REG_INT_CTRL / 4]);
+-	if ((ctrl & 3) != 3) {
+-		IOLog("SWEET BL: DSI0 is not enabled in video mode; no backlight control\n");
++	/* 0200: bit 0 engine, bit 1 video, bit 2 command. The A71's S6E3FA9 is a command mode panel. */
++	if (!(ctrl & 1) || !(ctrl & 6)) {
++		IOLog("SWEET BL: DSI0 is not enabled; no backlight control\n");
+ 		return false;
+ 	}
+ 	/* The bootloader's level is not readable without a DCS read; report the
+@@ -658,6 +659,57 @@
+ 	return done ? 0 : ETIMEDOUT;
+ }
+ 
++/*
++ * 0200: sweetpaneloff=1 sends DCS display off (0x28) when the fade has ended and display on (0x29)
++ * before the next frame. Same engine as the brightness write above: a short write, data id 0x05.
++ */
++extern "C" void sweet_panel_power(int on);
++extern "C" void
++sweet_panel_power(int on)
++{
++	static int enabled = -1;
++	static volatile uint32_t *dsi;
++	if (enabled < 0) {
++		int v = 0;
++		PE_parse_boot_argn("sweetpaneloff", &v, sizeof(v));
++		enabled = v;
++		if (enabled) {
++			dsi = (volatile uint32_t *)ml_io_map(SWEET_DSI0_PA, 0x400);
++		}
++	}
++	if (!enabled || dsi == NULL) {
++		return;
++	}
++	const uint32_t ctrl = dsi[DSI_REG_CTRL / 4], dma_ctrl = dsi[DSI_REG_DMA_CTRL / 4];
++	const uint32_t word = (on ? 0x29u : 0x28u) | (0x05u << 16) | (0x80u << 24);
++	dsi[DSI_REG_CTRL / 4] = ctrl | (1u << 2);
++	dsi[DSI_REG_INT_CTRL / 4] = dsi[DSI_REG_INT_CTRL / 4] | 1u;
++	dsi[DSI_REG_TPG_CTRL / 4] = (1u << 1) | (1u << 2) | (3u << 16);
++	dsi[DSI_REG_TPG_DMA_DATA / 4] = word;
++	dsi[DSI_REG_DMA_CTRL / 4] = (dma_ctrl & ~((1u << 31) | (1u << 30))) | (1u << 26) | (1u << 28);
++	dsi[DSI_REG_DMA_LENGTH / 4] = sizeof(word);
++	__asm__ volatile("dsb sy" ::: "memory");
++	dsi[DSI_REG_DMA_TRIGGER / 4] = 1;
++	unsigned us;
++	for (us = 0; us < 50000 && !(dsi[DSI_REG_INT_CTRL / 4] & 1u); us += 50) {
++		IODelay(50);
++	}
++	const bool done = (dsi[DSI_REG_INT_CTRL / 4] & 1u) != 0;
++	if (done) {
++		dsi[DSI_REG_INT_CTRL / 4] = dsi[DSI_REG_INT_CTRL / 4] | 1u;
++	}
++	dsi[DSI_REG_TPG_CTRL / 4] = 0;
++	dsi[DSI_REG_TPG_FIFO_RESET / 4] = 1;
++	IODelay(1);
++	dsi[DSI_REG_TPG_FIFO_RESET / 4] = 0;
++	dsi[DSI_REG_DMA_CTRL / 4] = dma_ctrl;
++	if (!(ctrl & (1u << 2))) {
++		dsi[DSI_REG_CTRL / 4] = dsi[DSI_REG_CTRL / 4] & ~(1u << 2);
++	}
++	IOLog("SWEET PANEL: DCS %#x %s after %u us ack_err=%#x\n", on ? 0x29u : 0x28u,
++	    done ? "sent" : "NOT acknowledged", us, dsi[DSI_REG_ACK_ERR / 4]);
++}
++
+ /* Advance on an absolute cadence. Skip missed slots instead of queuing bursts. */
+ void
+ AppleCLCD::rearmVsync(void)
+@@ -669,6 +721,7 @@
+ 		if (fFadeStep == 11) {
+ 			fFadeStep = 12;
+ 			sweet_cpufreq_low(1);
++			sweet_panel_power(0);
+ 		}
+ 		fNextVsync += 5 * fVsyncPeriod;
+ 	}
+@@ -1713,6 +1766,7 @@
+ 					sweet_power_save = off;
+ 					if (!off) {
+ 						sweet_cpufreq_low(0);
++						sweet_panel_power(1);
+ 					}
+ 				}
+ 			}
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -632,17 +632,25 @@
+     service. Restart it once here (Sunfish's install script does the same by
+     hand) so the fresh process finds MetalPluginName. */
+  int restart=1;PE_parse_boot_argn("sweetm2restart",&restart,sizeof(restart));
+- if(gles!=1 && restart==1) {
+-  for(int pid=1;pid<99999;pid++) {
++ if(gles!=1 && restart>=1) {
++  /* 0200: sweetm2restart=2 also restarts SpringBoard. On a late GPU start its restart came with
++     backboardd's; the first SpringBoard after boot may ignore the lock screen swipe. */
++  bool bb=false,sb=restart!=2;
++  for(int pid=1;pid<99999 && !(bb && sb);pid++) {
+    proc_t p=proc_find(pid);
+    if(!p)continue;
+-   const bool match=!strcmp(proc_best_name(p),"backboardd");
+-   if(match)proc_signal(pid,SIGKILL);
++   const bool is_bb=!strcmp(proc_best_name(p),"backboardd");
++   const bool is_sb=restart==2 && !strcmp(proc_best_name(p),"SpringBoard");
++   if(is_bb || is_sb)proc_signal(pid,SIGKILL);
+    proc_rele(p);
+-   if(match) {
++   if(is_bb) {
++    bb=true;
+     IOLog("SWEET RENDER: restarted backboardd for Metal discovery\n");
+-    break;
+    }
++   if(is_sb) {
++    sb=true;
++    IOLog("SWEET RENDER: restarted SpringBoard\n");
++   }
+   }
+  }
+  return 0;
