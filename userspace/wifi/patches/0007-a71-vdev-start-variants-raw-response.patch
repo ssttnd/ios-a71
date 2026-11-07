@@ -1,0 +1,67 @@
+diff --git a/phone/wifi/radio.c b/phone/wifi/radio.c
+--- a/phone/wifi/radio.c
++++ b/phone/wifi/radio.c
+@@ -595,6 +595,12 @@
+  */
+ static const uint32_t rd_codes[] = { 0xffffffff, 0x10, 0x37, 0x64, 0x6a, 0x60 };
+ static unsigned rd_try;
++/*
++ * 0007: six regdomains and the whole MSA did not change the -1 (wave8, wave10). The regdomain stays the eeprom's;
++ * each failed start moves to the next of 8 variants instead: bit 0 drops our pre-start commands (ath10k sends none),
++ * bit 1 asks 11NG_HT20 instead of 11G, bit 2 sets WMI_CHAN_FLAG_ALLOW_HT (bit 11 of the mode word).
++ */
++static unsigned v_allow_ht;
+ static int w_regdomain(uint32_t code);
+ 
+ /* ath10k WMI_SERVICE_IS_ENABLED: 4 service bits per 32-bit word (sizeof(u32)) */
+@@ -1361,7 +1367,7 @@
+ 	c = put32(c, freq);
+ 	c = put32(c, 0);
+ 	/* ath10k chan_to_phymode for an HT AP: 11NG_HT20 (5) / 11NA_HT20 (4); bit 3 off: legacy 11G (1) / 11A (0) */
+-	c = put32(c, (steps() & 8) ? (freq < 4000 ? 5 : 4) : (freq < 4000 ? 1 : 0));
++	c = put32(c, ((steps() & 8) ? (freq < 4000 ? 5 : 4) : (freq < 4000 ? 1 : 0)) | (v_allow_ht ? (1u << 11) : 0));
+ 	c = put32(c, (40u << 8) | (40u << 16));
+ 	return put32(c, 40u << 8);
+ }
+@@ -1823,9 +1829,19 @@
+ 	if (steps() & 0x40)
+ 		wm = w_vdev_wmm();
+ 	LOG("join: tx power limit 2G/5G 20 dBm %s, vdev wmm %s", t2 || t5 ? "FAILED" : "ok", wm ? "FAILED" : "ok");
+-	if (rd_try % (sizeof(rd_codes) / sizeof(rd_codes[0]))) {
+-		w_regdomain(rd_codes[rd_try % (sizeof(rd_codes) / sizeof(rd_codes[0]))]);
+-		delay_ms(20);
++	(void)rd_codes;
++	{
++		static uint32_t base_steps;
++		static int have_base;
++		if (!have_base) {
++			base_steps = steps();
++			have_base = 1;
++		}
++		const unsigned v = rd_try % 8;
++		w_steps = (base_steps & ~0x78u) | ((v & 1) ? 0 : 0x70u) | ((v & 2) ? 8u : 0);
++		v_allow_ht = (v >> 2) & 1;
++		LOG("join: variant %u: pre-start %s, phymode %s, allow-ht %s", v, (v & 1) ? "off" : "on",
++		    (v & 2) ? "11NG_HT20" : "11G", v_allow_ht ? "on" : "off");
+ 	}
+ 	fflush(stdout);
+ 	if (w_vdev_start(s_freq, bcn, dtim)) {
+@@ -1888,13 +1904,17 @@
+ static void sta_wmi_event(uint32_t id, const uint8_t *t, uint32_t len)
+ {
+ 	uint16_t l = 0;
+-	uint32_t v[4] = { 0 };
++	uint32_t v[10] = { 0 };
+ 	if (len >= 4)
+ 		memcpy(&l, t, 2);
+ 	if (len < 4u + l)
+ 		return;
+ 	memcpy(v, t + 4, MIN((uint32_t)l, (uint32_t)sizeof(v)));
+ 	if (id == EV_VDEV_START_RESP && l >= 16) {	/* {vdev, req, type, status} */
++		uint16_t tag = 0;
++		memcpy(&tag, t + 2, 2);
++		LOG("vdev start resp raw: tag %#x len %u: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", tag, l,
++		    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9]);
+ 		s_start_status = (int32_t)v[3];
+ 		s_start_resp = 1;
+ 		LOG("vdev start resp: status %d", s_start_status);
