@@ -1,0 +1,49 @@
+diff --git a/phone/wifi/rmtfs.c b/phone/wifi/rmtfs.c
+--- a/phone/wifi/rmtfs.c
++++ b/phone/wifi/rmtfs.c
+@@ -55,18 +55,30 @@
+ 	 * One buffer per phone boot, kept across modem restarts: a fresh 2 MB hyp_assign after
+ 	 * every restart (the old ones never handed back) ends with an SMC that never returns.
+ 	 */
+-	struct timeval bt;
+-	size_t btl = sizeof(bt);
+-	sysctlbyname("kern.boottime", &bt, &btl, NULL, 0);
++	/*
++	 * A71 (0026): kern.boottime is set before the RTC is read here, a few dozen seconds that repeat from boot to boot
++	 * (35-50 s). A new boot then looked like this boot's second run, skipped the hyp_assign below, and the modem's
++	 * first use of the buffer reset the phone (every "from this boot's first run" boot in the logs). The boot
++	 * session UUID is new every boot.
++	 */
++	char boot_id[64] = "";
++	size_t bil = sizeof(boot_id) - 1;
++	if (sysctlbyname("kern.bootsessionuuid", boot_id, &bil, NULL, 0) || !boot_id[0]) {
++		struct timeval bt;
++		size_t btl = sizeof(bt);
++		sysctlbyname("kern.boottime", &bt, &btl, NULL, 0);
++		snprintf(boot_id, sizeof(boot_id), "t%ld.%ld", (long)bt.tv_sec, (long)bt.tv_usec);
++	}
+ 	FILE *f = fopen(RMTFS_DIR "/.buffer", "r");
+-	long long fb = 0;
++	char fb[64] = "";
+ 	unsigned long long fpa = 0;
+ 	if (f) {
+-		if (fscanf(f, "%lld %llx", &fb, &fpa) != 2)
++		if (fscanf(f, "%63s %llx", fb, &fpa) != 2)
+ 			fpa = 0;
+ 		fclose(f);
+ 	}
+-	if (fpa && fb == (long long)bt.tv_sec) {
++	printf("rmtfs: boot %s, saved %s\n", boot_id, fb[0] ? fb : "none");
++	if (fpa && !strcmp(fb, boot_id)) {
+ 		buf_pa = fpa;
+ 		printf("rmtfs: buffer %llx from this boot's first run\n", (unsigned long long)buf_pa);
+ 	} else {
+@@ -82,7 +94,7 @@
+ 		if (hyp_assign(buf_pa, BUF_SIZE, src, 1, dst, 2))
+ 			return -1;
+ 		if ((f = fopen(RMTFS_DIR "/.buffer", "w"))) {
+-			fprintf(f, "%lld %llx\n", (long long)bt.tv_sec, (unsigned long long)buf_pa);
++			fprintf(f, "%s %llx\n", boot_id, (unsigned long long)buf_pa);
+ 			fclose(f);
+ 		}
+ 	}
