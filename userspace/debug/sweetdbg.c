@@ -55,6 +55,13 @@ struct pmem_inject {
 	int32_t kind, a, b, c, d;
 };
 #define PMEM_INJECT	_IOW('P', 7, struct pmem_inject)
+struct pmem_smc {
+	uint64_t x[8];
+};
+#define PMEM_SMC	_IOWR('P', 3, struct pmem_smc)
+#define IMEM_RESTART_REASON	0x146aa65cull	/* DT qcom,msm-imem@146aa000 restart_reason@65c */
+#define RESTART_RECOVERY	0x77665502u	/* what Linux on Qualcomm writes for "reboot recovery" */
+#define PSCI_SYSTEM_RESET	0x84000009u
 
 static char key[129];
 static int listen_fd = -1;
@@ -414,6 +421,25 @@ static void handle(int fd)
 	} else if (!strcmp(c, "wr") && na == 2) {
 		uint32_t v = (uint32_t)strtoul(a[1], NULL, 0);
 		say(fd, pwrite(pm_fd(), &v, 4, (off_t)strtoull(a[0], NULL, 0)) == 4 ? "OK\n" : "ERR %s\n", strerror(errno));
+	} else if (!strcmp(c, "reboot") && na <= 1) {
+		/* reboot [recovery]: restart reason in IMEM (recovery only), sync, PSCI SYSTEM_RESET (as wland 0013) */
+		int rec = na == 1 && !strcmp(a[0], "recovery");
+		uint32_t v = rec ? RESTART_RECOVERY : 0;
+		if (pwrite(pm_fd(), &v, 4, (off_t)IMEM_RESTART_REASON) != 4) {
+			say(fd, "ERR restart reason: %s\n", strerror(errno));
+			return;
+		}
+		uint32_t back = 0;
+		pm_rd32(IMEM_RESTART_REASON, &back);
+		say(fd, "OK restart reason %#x, syncing and resetting\n", back);
+		close(fd);
+		sync();
+		sleep(1);
+		sync();
+		struct pmem_smc s = { .x = { PSCI_SYSTEM_RESET } };
+		ioctl(pm_fd(), PMEM_SMC, &s);
+		printf("sweetdbg: PSCI reset returned %#llx\n", (unsigned long long)s.x[0]);
+		return;
 	} else if (!strcmp(c, "sysctl") && na == 1)
 		cmd_sysctl(fd, a[0]);
 	else if (!strcmp(c, "restart")) {
