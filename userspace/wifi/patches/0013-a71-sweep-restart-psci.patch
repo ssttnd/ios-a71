@@ -1,0 +1,24 @@
+diff --git a/phone/wifi/radio.c b/phone/wifi/radio.c
+--- a/phone/wifi/radio.c
++++ b/phone/wifi/radio.c
+@@ -1951,7 +1951,7 @@
+ 			/* 0012: the board file sweep (wlfw.c) */
+ 			extern char wlfw_sweep_name[32];
+ 			extern int wlfw_sweep_armed;
+-			extern int reboot(int);	/* libSystem; the iOS SDK header hides it */
++			extern void pm_smc(uint64_t x[8]);
+ 			if (wlfw_sweep_name[0]) {
+ 				LOG("SWEEP RESULT: %s -> vdev start status %d chain_mask %#x", wlfw_sweep_name, (int)v[3], v[4]);
+ 				fflush(stdout);
+@@ -1965,7 +1965,10 @@
+ 					fflush(stdout);
+ 					sync();
+ 					sleep(3);
+-					reboot(0);
++					/* 0013: reboot(2) ended in a panic on this port (2026-11-07); PSCI SYSTEM_RESET instead */
++					uint64_t x[8] = { 0x84000009ull, 0, 0, 0, 0, 0, 0, 0 };
++					pm_smc(x);
++					LOG("SWEEP: SYSTEM_RESET returned %lld", (long long)x[0]);
+ 				}
+ 			}
+ 		}
