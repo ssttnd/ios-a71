@@ -1,0 +1,66 @@
+diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
+--- a/phone/wifi/wland.c
++++ b/phone/wifi/wland.c
+@@ -19,6 +19,8 @@
+  *                           /var/local/wland.log (last boot's: .prev); off with /var/local/wland.off or sweetwifi=0
+  * While joined, SIGUSR1 drops the link (tests the rejoin).
+  */
++#include <fcntl.h>
++#include <pthread.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -718,6 +720,22 @@
+  */
+ #define WLAND_LOG	"/var/local/wland.log"
+ #define WLAND_STAMP	"/var/local/wland.boot"
++/*
++ * A71: on 2026-11-07 the phone restarted during Wi-Fi bring-up, boot after boot, with nothing in the kernel log.
++ * This file is on disk during the risky minutes. When it is still there at the next start, that try ended the
++ * boot, so wland stays out and iOS comes up. sweetwlanretry=1 ignores it.
++ */
++#define WLAND_TRY	"/var/local/wland.try"
++#define WLAND_TRY_SECS	300
++static void *try_over(void *arg)
++{
++	(void)arg;
++	sleep(WLAND_TRY_SECS);
++	unlink(WLAND_TRY);
++	sync();
++	printf("wland auto: %d s without a restart, the next boot may try again\n", WLAND_TRY_SECS);
++	return NULL;
++}
+ /* libsystem_kernel: jetsam control (root may change its own limits); MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES */
+ int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t size);
+ struct memlimit_properties { int32_t active; uint32_t active_attr; int32_t inactive; uint32_t inactive_attr; };
+@@ -754,10 +772,29 @@
+ 		fclose(f);
+ 	}
+ 	rename(WLAND_LOG, WLAND_LOG ".prev");
+-	if (freopen(WLAND_LOG, "a", stdout))
++	/* A file loses its tail in a restart. /dev/null goes to the USB log when sweetnull names this process. */
++	const char *sn = strstr(args, "sweetnull=");
++	const char *sne = sn ? strchr(sn, ' ') : NULL;
++	const char *swl = sn ? strstr(sn, "wland") : NULL;
++	const int usb = swl && (!sne || swl < sne);
++	if (freopen(usb ? "/dev/null" : WLAND_LOG, "a", stdout))
+ 		dup2(fileno(stdout), 2);
+ 	setvbuf(stdout, NULL, _IONBF, 0);
+ 	printf("wland auto: boot %ld, memory limit 2048 MB -> %d\n", (long)bt.tv_sec, mrc);
++	if (!access(WLAND_TRY, F_OK) && !strstr(args, "sweetwlanretry=1")) {
++		printf("wland auto: the last try ended that boot (%s is there): staying out\n", WLAND_TRY);
++		return 0;
++	}
++	int tf = open(WLAND_TRY, O_CREAT | O_WRONLY, 0644);
++	if (tf >= 0) {
++		fcntl(tf, F_FULLFSYNC);
++		close(tf);
++	}
++	sync();
++	sleep(2);
++	pthread_t tt;
++	if (pthread_create(&tt, NULL, try_over, NULL) == 0)
++		pthread_detach(tt);
+ 	return up(0);
+ }
+ 
