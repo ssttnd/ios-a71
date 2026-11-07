@@ -1,0 +1,86 @@
+diff --git a/phone/wifi/radio.c b/phone/wifi/radio.c
+--- a/phone/wifi/radio.c
++++ b/phone/wifi/radio.c
+@@ -2358,9 +2358,12 @@
+ 	return 0;
+ }
+ 
++volatile unsigned long radio_heartbeat;	/* 0022: wland.c's watchdog reads it */
++
+ void radio_poll(void)
+ {
+ 	static uint64_t last;
++	radio_heartbeat++;
+ 	uint64_t now = link_ms();
+ 	if (!ce_up || now - last < 2)
+ 		return;
+diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
+--- a/phone/wifi/wland.c
++++ b/phone/wifi/wland.c
+@@ -732,6 +732,55 @@
+  */
+ #define WLAND_TRY	"/var/local/wland.try"
+ #define WLAND_TRY_SECS	60	/* 0016: the restarts came 20-30 s in; 300 s caught every quick trip to TWRP */
++/*
++ * A71 (0022): wland stopped printing 2 minutes after a good join (2026-11-07) and Wi-Fi dropped. When the poll loop
++ * has not moved for 15 s, print where the main thread is: pc, lr and the frame chain, with the image slide, so the
++ * addresses can be looked up in this build. Every 30 s while it stays stuck.
++ */
++#include <mach/mach.h>
++#include <mach-o/dyld.h>
++extern volatile unsigned long radio_heartbeat;
++static thread_act_t main_thread;
++static void *stall_watch(void *arg)
++{
++	(void)arg;
++	unsigned long seen = radio_heartbeat;
++	int still = 0;
++	for (;;) {
++		sleep(5);
++		unsigned long now = radio_heartbeat;
++		if (now != seen || now == 0) {
++			seen = now;
++			still = 0;
++			continue;
++		}
++		still += 5;
++		if (still != 15 && (still - 15) % 30)
++			continue;
++		arm_thread_state64_t st;
++		mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
++		if (thread_get_state(main_thread, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) != KERN_SUCCESS) {
++			printf("wland watch: stuck %d s, no thread state\n", still);
++			continue;
++		}
++		uint64_t pc = arm_thread_state64_get_pc(st), lr = arm_thread_state64_get_lr(st), fp = arm_thread_state64_get_fp(st);
++		printf("wland watch: poll loop stuck %d s; slide %#lx pc %#llx lr %#llx x0 %#llx x1 %#llx x2 %#llx\n", still,
++		       (long)_dyld_get_image_vmaddr_slide(0), (unsigned long long)pc, (unsigned long long)lr,
++		       (unsigned long long)st.__x[0], (unsigned long long)st.__x[1], (unsigned long long)st.__x[2]);
++		for (int i = 0; i < 12 && fp && !(fp & 7); i++) {
++			uint64_t frame[2];
++			vm_size_t got = 0;
++			if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, sizeof(frame), (vm_address_t)frame, &got) ||
++			    got != sizeof(frame))
++				break;
++			printf("wland watch:   frame %d ret %#llx\n", i, (unsigned long long)frame[1]);
++			fp = frame[0];
++		}
++		fflush(stdout);
++	}
++	return NULL;
++}
++
+ static void *try_over(void *arg)
+ {
+ 	(void)arg;
+@@ -802,6 +851,10 @@
+ 	pthread_t tt;
+ 	if (pthread_create(&tt, NULL, try_over, NULL) == 0)
+ 		pthread_detach(tt);
++	main_thread = mach_thread_self();
++	pthread_t wt;
++	if (pthread_create(&wt, NULL, stall_watch, NULL) == 0)
++		pthread_detach(wt);
+ 	return up(0);
+ }
+ 
