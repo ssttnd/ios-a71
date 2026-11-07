@@ -1,0 +1,65 @@
+diff --git a/phone/wifi/radio.c b/phone/wifi/radio.c
+--- a/phone/wifi/radio.c
++++ b/phone/wifi/radio.c
+@@ -562,6 +562,7 @@
+ static uint32_t wmi_svc_map[32], wmi_svc_ext[4], wmi_nreq;
+ static struct wmi_mem_req wmi_req[MAX_MEM_REQS];
+ static int wmi_init_sent, wmi_ready, wmi_seen_bmap, wmi_seen_reqs;
++static uint64_t wmi_init_due;	/* 0014: INIT waits for SERVICE_READY_EXT until this time */
+ static uint32_t wmi_eeprom_rd = 0xffffffff;	/* HAL_REG_CAPABILITIES.eeprom_rd */
+ static uint8_t wmi_mac[6];
+ static uint32_t wmi_rf_chains;
+@@ -709,7 +710,12 @@
+ 	p = put32(p, 0);
+ 	p = put32(p, n);
+ 	/* wmi_tlv_resource_config, 44 x u32, ath10k's values for wcn3990 */
+-	uint32_t rc[44] = { 0 };
++	/*
++	 * A71 (0014): Samsung's fw-api wmi_resource_config has 75 words; ath10k's 44 left the rest 0 in the firmware,
++	 * among them num_max_sta_vdevs (word 62), which caps the station vdevs that may start. Values from qcacld's
++	 * wma_set_default_tgt_config where it sets them.
++	 */
++	uint32_t rc[75] = { 0 };
+ 	rc[0] = NUM_VDEVS;
+ 	rc[1] = NUM_PEERS;
+ 	if (wmi_svc(SVC_RX_FULL_REORDER)) {
+@@ -741,6 +747,10 @@
+ 	rc[37] = 1;
+ 	rc[38] = 1;
+ 	rc[43] = 1u << 9;				/* host_capab: WMI_TLV_FLAG_MGMT_BUNDLE_TX_COMPL as ath10k */
++	rc[52] = 0;					/* max_bssid_rx_filters */
++	rc[55] = 0;					/* max_num_group_keys */
++	rc[60] = 16;					/* max_nlo_ssids */
++	rc[62] = 2;					/* num_max_sta_vdevs */
+ 	p = put_tlv(p, TAG_RESOURCE_CONFIG, sizeof(rc));
+ 	memcpy(p, rc, sizeof(rc));
+ 	p += sizeof(rc);
+@@ -2227,8 +2237,16 @@
+ 	case WMI_EV_SERVICE_READY:
+ 		LOG("wmi: SERVICE_READY, %u bytes", len);
+ 		wmi_svc_ready(d + 4, len - 4);
++		/* 0014: qcacld sends INIT only after SERVICE_READY_EXT; this firmware sends one (0x4009) */
+ 		if (!wmi_init_sent)
++			wmi_init_due = link_ms() + 500;
++		break;
++	case 0x4009:					/* WMI_SERVICE_READY_EXT_EVENTID */
++		LOG("wmi: SERVICE_READY_EXT, %u bytes", len);
++		if (!wmi_init_sent && wmi_init_due) {
++			wmi_init_due = 0;
+ 			wmi_send_init();
++		}
+ 		break;
+ 	case WMI_EV_READY:
+ 		for (uint32_t o = 4; o + 4 <= len;) {
+@@ -2305,6 +2323,11 @@
+ 	if (!ce_up || now - last < 2)
+ 		return;
+ 	last = now;
++	if (wmi_init_due && !wmi_init_sent && now >= wmi_init_due) {
++		wmi_init_due = 0;
++		LOG("wmi: no SERVICE_READY_EXT in 500 ms, INIT anyway");
++		wmi_send_init();
++	}
+ 	ce_poll();
+ 	now = link_ms();				/* what ce_poll started is stamped after the first now */
+ 	if (htt_state == 1 && now > htt_req_ms + 2000) {
