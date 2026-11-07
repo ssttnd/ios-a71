@@ -158,7 +158,9 @@ Rollback for a hang: write `build/ls/launchd.plist.orig` back as `/System/Librar
 
 Session stopped 2026-11-07 at the owner's request, to continue next day. Not yet seen: blur on 6c13b5e, fade, any effect of the rebuild. Current args: `sweetgpu=9 sweetnull=backboardd ufslogsecs=1 sweetgpukhz=650000 sweetmtl=2 sweetgles=0 sweetpresentwait=1 sweetpresentlock=1 sweetamfi=1 sweetdrawlogkey=1 sweetpayload=1`. Flow scripts are in `tools/flow/` (pk2 packages an image from a kernel commit, pm builds a bundle package, chain2 waits for CI and installs, waitpay and waitflash write from TWRP). They hold absolute paths of this PC; ghauth reads the stored git credential at run time and stores nothing.
 
-**Next:** read logs/usb-ls1.txt; owner's report on blur and fade; reboot for the LaunchServices job and check wallpaper; remove debug args; shorten the present lock for FPS. Move the GPU stage earlier so the restart is not seen. Later: widgets (retest sandbox patches), time, Wi-Fi per
+Owner's report on bundle 6c13b5e, image ab0fed23, for next session: blur still pixelated, so the NotMipmapped mapping did not fix it and that explanation is unconfirmed. Screen fade OK. Widgets all white. No wallpaper; the picker cannot take an image from the gallery although screenshots are there. Hardly any hangs. Screen tearing present. Unknown whether the phone rebooted, so whether the LaunchServices job ran: check logs/usb-ls1.txt for `sweet-wallpaper` and for a second boot.
+
+**Next:** read logs/usb-ls1.txt; pixelated blur (check the blur shaders' real sampling, and whether `Tvrb` is the part at fault); reboot for the LaunchServices job if it has not run, then wallpaper and the gallery picker; white widgets; tearing (panel in command mode, the fork's beam race reads zero registers here); remove debug args; shorten the present lock for FPS. Move the GPU stage earlier so the restart is not seen. Later: widgets (retest sandbox patches), time, Wi-Fi per
 `docs/a71-radio-port.md`. Restore image for boot: `backup/2026-11-06/boot.img`.
 Kernel archive of this build: `research/xnu-kernel-130bb90.zip`.
 
