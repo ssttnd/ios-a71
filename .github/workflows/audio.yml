@@ -31,7 +31,7 @@ jobs:
           cd donor/phone/wifi
           xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -Wextra -Wno-unused-parameter \
             -o "$GITHUB_WORKSPACE/$out/adspboot" adspboot.c fastrpc.c smem.c pmem.c glink.c smmu.c pdmapper.c qmi.c \
-            geni_i2c.c cs35l41.c ../sensors/sns_run.c ../sensors/dm_fusion.c ../sensors/sensor.c ../sensors/sns.c \
+            -I. "$GITHUB_WORKSPACE/userspace/audio/tas2562.c" ../sensors/sns_run.c ../sensors/dm_fusion.c ../sensors/sensor.c ../sensors/sns.c \
             ../sensors/pb.c ../sensors/sns_link.c -lm
           cd "$GITHUB_WORKSPACE"
           xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -Wextra -Wno-gnu-conditional-omitted-operand \
