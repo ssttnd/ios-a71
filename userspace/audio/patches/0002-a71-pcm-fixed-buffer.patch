@@ -1,0 +1,52 @@
+diff --git a/phone/wifi/adspboot.c b/phone/wifi/adspboot.c
+--- a/phone/wifi/adspboot.c
++++ b/phone/wifi/adspboot.c
+@@ -129,9 +129,20 @@
+ static uint32_t pcm_sid = 0x1b21, pcm_shift = 1;
+ static uint64_t pcm_pa, pcm_dsp;
+ 
++static uint64_t pcm_fixed;	/* A71 0002: --pcm-pa ADDR */
+ static int pcm_smmu(void)
+ {
+ 	uint16_t sids[1] = { (uint16_t)pcm_sid };
++	if (pcm_fixed) {
++		/* A71: below 4 GB = SID 0x1b20, which the kernel (xnu 0211) routes through a translation-off bank at
++		 * boot: the DSP's address is the physical one, and the apps SMMU is not touched from here */
++		pcm_pa = pcm_dsp = pcm_fixed;
++		if (rec_on)
++			pcm_buf_len = PCM_BUF + REC_READS * REC_BYTES;
++		printf("pcm: fixed buffer pa %llx (%u B) = DSP address (identity bank from the kernel, SMMU untouched)\n",
++		       (unsigned long long)pcm_pa, pcm_buf_len);
++		return 0;
++	}
+ 	if (rec_on)
+ 		pcm_buf_len = PCM_BUF + REC_READS * REC_BYTES;
+ 	pcm_pa = smmu_dry ? 0x100000000ull : pm_alloc(pcm_buf_len, 0x1000);
+@@ -150,6 +161,8 @@
+ 
+ static int adsp_smmu(int one, uint32_t sid, uint32_t mask)
+ {
++	if (pcm_fixed && !rpc_on)
++		return pcm_on ? pcm_smmu() : 0;	/* A71 0002: no apps-SMMU access at all */
+ 	if (one)
+ 		return smmu_identity("ADSP", sid, mask);
+ 	int bad = 0;
+@@ -2604,7 +2617,8 @@
+ 			       (unsigned long long)(pcm_t1 - pcm_t0), pcm_underflow, pcm_handle, pcm_copp);
+ 			if (rec_on)
+ 				rec_summary();	/* sp7 */
+-			smmu_faults("ADSP pcm", pcm_sid);	/* after */
++			if (!pcm_fixed)
++				smmu_faults("ADSP pcm", pcm_sid);	/* after */
+ 			afe_next(1, 0);	/* AFE_HOLD -> stop, clock off */
+ 			return;
+ 		}
+@@ -3477,6 +3491,8 @@
+ 			no_lpi = 1;
+ 		else if (!strcmp(argv[i], "--vote-block") && i + 1 < argc)	/* sp2b: hw_block_id of the vote */
+ 			vote_block = (uint32_t)strtoul(argv[++i], NULL, 0);
++		else if (!strcmp(argv[i], "--pcm-pa") && i + 1 < argc)	/* A71 0002 */
++			pcm_fixed = strtoull(argv[++i], NULL, 0) & ~0xfffull;
+ 		else if (!strcmp(argv[i], "--pcm"))	/* ap6: ASM + ADM PCM to the AFE port, amps untouched; implies --afe */
+ 			apr_on = afe_on = pcm_on = smmu = 1;
+ 		else if (!strcmp(argv[i], "--amp"))	/* sp1: left amp on for the --pcm tone; implies --pcm */

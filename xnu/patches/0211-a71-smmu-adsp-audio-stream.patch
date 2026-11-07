@@ -1,0 +1,83 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -1056,13 +1056,14 @@
+ 	uint32_t id = smr & 0x7fff, m = (smr >> 16) & 0x7fff;
+ 	return ((id ^ sid) & ~(m | mask) & 0x7fff) == 0;
+ }
++/* 0211: the same for any stream (name, sid, mask); the WLAN call keeps its old messages' shape */
+ static void
+-sweet_smmu_wlan_stream(volatile uint32_t *gr0, uint32_t id0, uint32_t id1)
++sweet_smmu_identity_stream(volatile uint32_t *gr0, uint32_t id0, uint32_t id1, const char *name, uint32_t SID, uint32_t MASK)
+ {
+ 	const uint32_t nsmr = id0 & 0xff, ncb = id1 & 0xff;
+ 	const uint64_t psize = (id1 >> 31) ? 0x10000 : 0x1000, npage = 1ull << (((id1 >> 28) & 7) + 1);
+ 	if (psize != 0x1000 || nsmr > 128 || ncb > 128 || (npage + ncb) * psize > 0x100000) {
+-		printf("SWEET SMMU: WLAN stream: unexpected geometry smr=%u cb=%u page=%#llx x %llu\n", nsmr, ncb, psize, npage);
++		printf("SWEET SMMU: %s stream: unexpected geometry smr=%u cb=%u page=%#llx x %llu\n", name, nsmr, ncb, psize, npage);
+ 		return;
+ 	}
+ 	volatile uint32_t *gr1 = (volatile uint32_t *)ml_io_map(0x15000000 + psize, psize);
+@@ -1082,8 +1083,8 @@
+ 		if (((s2cr >> 16) & 3) == 0) {
+ 			used[(s2cr & 0xff) / 64] |= 1ull << ((s2cr & 0xff) % 64);
+ 		}
+-		if (smmu_sid_match(smr, SMMU_WLAN_SID, SMMU_WLAN_MASK)) {
+-			printf("SWEET SMMU: WLAN stream: SMR%u %#x already matches (S2CR %#x)\n", i, smr, s2cr);
++		if (smmu_sid_match(smr, SID, MASK)) {
++			printf("SWEET SMMU: %s stream: SMR%u %#x already matches (S2CR %#x)\n", name, i, smr, s2cr);
+ 			return;
+ 		}
+ 	}
+@@ -1100,7 +1101,7 @@
+ 		}
+ 	}
+ 	if (slot < 0 || cb < 0) {
+-		printf("SWEET SMMU: WLAN stream: no free SMR/bank (SMR %d, bank %d)\n", slot, cb);
++		printf("SWEET SMMU: %s stream: no free SMR/bank (SMR %d, bank %d)\n", name, slot, cb);
+ 		return;
+ 	}
+ 	cbp[0x58 / 4] = 0xffffffff;     /* FSR clear */
+@@ -1114,16 +1115,22 @@
+ 	gr1[cb] = 0x0001f000;                             /* CBAR */
+ 	cbp[0] = 0x000000e0;                              /* SCTLR last */
+ 	gr0[(0xc00 + 4 * slot) / 4] = (uint32_t)cb;       /* S2CR: translate via the bank */
+-	gr0[(0x800 + 4 * slot) / 4] = (1u << 31) | (SMMU_WLAN_MASK << 16) | SMMU_WLAN_SID;
++	gr0[(0x800 + 4 * slot) / 4] = (1u << 31) | (MASK << 16) | SID;
+ 	gr0[0x70 / 4] = 0;                                /* sTLBGSYNC */
+ 	for (int i = 0; i < 1000 && (gr0[0x74 / 4] & 1); i++) {
+ 		delay(1000);
+ 	}
+ 	const uint32_t smr = gr0[(0x800 + 4 * slot) / 4], s2cr = gr0[(0xc00 + 4 * slot) / 4];
+-	const bool ok = (smr >> 31) && smmu_sid_match(smr, SMMU_WLAN_SID, SMMU_WLAN_MASK) &&
++	const bool ok = (smr >> 31) && smmu_sid_match(smr, SID, MASK) &&
+ 	    ((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == (uint32_t)cb;
+-	printf("SWEET SMMU: WLAN %#x/%#x -> CB%d via SMR%d: SMR %#x S2CR %#x SCTLR %#x CBAR %#x -> %s\n",
+-	    SMMU_WLAN_SID, SMMU_WLAN_MASK, cb, slot, smr, s2cr, cbp[0], gr1[cb], ok ? "ok" : "NOT as written");
++	printf("SWEET SMMU: %s %#x/%#x -> CB%d via SMR%d: SMR %#x S2CR %#x SCTLR %#x CBAR %#x -> %s\n",
++	    name, SID, MASK, cb, slot, smr, s2cr, cbp[0], gr1[cb], ok ? "ok" : "NOT as written");
++}
++
++static void
++sweet_smmu_wlan_stream(volatile uint32_t *gr0, uint32_t id0, uint32_t id1)
++{
++	sweet_smmu_identity_stream(gr0, id0, id1, "WLAN", SMMU_WLAN_SID, SMMU_WLAN_MASK);
+ }
+ 
+ /*
+@@ -1198,6 +1205,16 @@
+ 	if (wlan) {
+ 		sweet_smmu_wlan_stream(smmu, id0, id1);
+ 	}
++	/*
++	 * 0211: the audio DSP's buffers (LPASS puts the stream's low bits in DMA address bits 32-35: an address below
++	 * 4 GB is SID 0x1b20). Translation off, so the DSP reads physical memory; adspboot --pcm-pa uses a buffer below
++	 * 4 GB and never touches the SMMU. sweetsmmuadsp=0 leaves it out.
++	 */
++	int adsp = 1;
++	PE_parse_boot_argn("sweetsmmuadsp", &adsp, sizeof(adsp));
++	if (adsp) {
++		sweet_smmu_identity_stream(smmu, id0, id1, "ADSP audio", 0x1b20, 0x0);
++	}
+ 	sweet_smmu_dump_mdss(smmu, id0, id1);
+ }
+ 
