@@ -1,0 +1,48 @@
+diff --git a/phone/wifi/radio.c b/phone/wifi/radio.c
+--- a/phone/wifi/radio.c
++++ b/phone/wifi/radio.c
+@@ -899,13 +899,33 @@
+ vdev_create:
+ 		a = 0;
+ 	}
+-	uint8_t v[4 + 20] = { 0 };
+-	c = put_tlv(v, TAG_VDEV_CREATE_CMD, 20);
++	/*
++	 * A71 (0008): Samsung's qcacld (send_vdev_create_cmd_tlv, A715FXXSBDXB1 kernel) sends the full fixed param with
++	 * num_cfg_txrx_streams = 2, then an array of two wmi_vdev_txrx_streams (tag 0x19b in its wmi_tlv_defs.h): band
++	 * 2G and 5G with the supported tx/rx streams. Without them every vdev start on this firmware answered status -1
++	 * with chain_mask 0.
++	 */
++	const uint32_t nss_v = wmi_rf_chains >= 1 && wmi_rf_chains <= 3 ? wmi_rf_chains : 2;
++	uint8_t v[4 + 36 + 4 + 2 * 16] = { 0 };
++	c = put_tlv(v, TAG_VDEV_CREATE_CMD, 36);
+ 	c = put32(c, 0);				/* vdev 0 */
+ 	c = put32(c, 2);				/* station */
+ 	c = put32(c, 0);
+ 	memcpy(c, radio_mac, 6);
++	c += 8;						/* wmi_mac_addr: two words */
++	c = put32(c, 2);				/* num_cfg_txrx_streams */
++	c = put32(c, 0);				/* pdev_id: WMI_PDEV_ID_SOC */
++	c = put32(c, 0);				/* flags */
++	c = put32(c, 0);				/* vdevid_trans */
++	c = put_tlv(c, TAG_ARRAY_STRUCT, 2 * 16);
++	for (uint32_t band = 0; band < 2; band++) {	/* WMI_TPC_CHAINMASK_CONFIG_BAND_2G, _5G */
++		c = put_tlv(c, 0x19b, 12);
++		c = put32(c, band);
++		c = put32(c, nss_v);
++		c = put32(c, nss_v);
++	}
+ 	int b = wmi_send(CMD_VDEV_CREATE, v, sizeof(v));
++	LOG("vdev create: %u tx/rx streams per band -> %d", nss_v, b);
+ 	/* ath10k_add_interface: vdev NSS from the chain mask (2 streams), WMI_TLV_VDEV_PARAM_NSS 0x22 */
+ 	{
+ 		uint32_t nss = wmi_rf_chains >= 1 && wmi_rf_chains <= 3 ? wmi_rf_chains : 2;
+@@ -1837,7 +1857,7 @@
+ 			base_steps = steps();
+ 			have_base = 1;
+ 		}
+-		const unsigned v = rd_try % 8;
++		const unsigned v = (rd_try + 2) % 8;
+ 		w_steps = (base_steps & ~0x78u) | ((v & 1) ? 0 : 0x70u) | ((v & 2) ? 8u : 0);
+ 		v_allow_ht = (v >> 2) & 1;
+ 		LOG("join: variant %u: pre-start %s, phymode %s, allow-ht %s", v, (v & 1) ? "off" : "on",
