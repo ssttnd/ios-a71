@@ -1,0 +1,20 @@
+diff --git a/phone/wifi/wlfw.c b/phone/wifi/wlfw.c
+--- a/phone/wifi/wlfw.c
++++ b/phone/wifi/wlfw.c
+@@ -325,7 +325,15 @@
+ 		const struct { const char *path; int file_id, type; unsigned seg; } v[] = {
+ 			{ bdf_path, 0, -1, 6144 },
+ 		};
+-		int ok = 0;
++		/*
++		 * A71 (0011): Samsung's icnss (drivers/soc/qcom/icnss_qmi.c, A715FXXSBDXB1) sends no BDF_DOWNLOAD at all:
++		 * after MSA ready and CAP it goes to wlan cfg and mode, and this firmware finds its own board data. The
++		 * bdwlan.b00 sent from here (Samsung's generic bdwlan.bin) went with vdev start -1 and chain_mask 0.
++		 * /var/local/wlan-bdf-host brings the old download back.
++		 */
++		int ok = access("/var/local/wlan-bdf-host", F_OK) != 0;
++		if (ok)
++			printf("wlfw: no board data from the host (icnss does not send any)\n");
+ 		for (unsigned i = 0; i < sizeof(v) / sizeof(v[0]) && !ok; i++) {
+ 			printf("wlfw: BDF try %u: file_id %d type %d seg %u %s\n", i, v[i].file_id, v[i].type, v[i].seg, v[i].path);
+ 			ok = !bdf_download(v[i].path, v[i].file_id, v[i].type, v[i].seg);

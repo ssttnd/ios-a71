@@ -246,3 +246,5 @@ wland.log and wland.log.prev read from the phone in TWRP over adb (block reads, 
 **Wave12 (wland 86552d3, vdev create with streams):** "vdev create: 2 tx/rx streams per band -> 0", scans fine, vdev start still -1, chain_mask 0. Next: wland 0009, vdev start fixed param 104 bytes as qcacld (preferred_tx/rx_streams = rf chains, LDPC_RX flag). Not run yet.
 
 **Wave13 (wland 00ea6c9, qcacld-length vdev start with preferred streams):** still -1, chain_mask 0. wland skips SERVICE_READY_EXT (qcacld waits for it and puts hw_mode into INIT) and logged no unknown events. wland 0010 logs every unhandled WMI event, to see ready-ext or error events.
+
+**Wave14 (wland cb2f3c6, unhandled events logged):** firmware sends 0x4009 SERVICE_READY_EXT (924 bytes) right after our INIT, 0x4022, 0x3a001 (country "US"), many 0x4002 channel info during scans; nothing after vdev start but the -1. qcacld sends INIT after the ext event and skips hw_mode for single-MAC chips. Samsung's icnss_qmi.c sends no BDF_DOWNLOAD at all: wland 0011 stops sending one (we sent bdwlan.bin renamed b00); the package puts all 33 stock bdwlan.* into /var/local/fw/modem in case the firmware asks over tftp.
