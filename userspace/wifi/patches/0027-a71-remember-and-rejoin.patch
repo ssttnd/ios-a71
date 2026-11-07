@@ -1,0 +1,95 @@
+diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
+--- a/phone/wifi/wland.c
++++ b/phone/wifi/wland.c
+@@ -607,13 +607,50 @@
+  * Join after the first scan and stay joined: a failed try again after 5 s (4 times), then every 30 s with a
+  * fresh scan first; a lost link (deauth, kickout, beacon miss) joins again after 3 s.
+  */
++/*
++ * A71 (0027): the network iOS joined from Settings is kept like a wlan.conf one (in memory and in
++ * /var/local/wlan.conf, root only), so a lost link (beacon miss, 2026-11-07) and the next boot join it again;
++ * wifid's own auto-join does not happen here. A leave from wifid (Wi-Fi off, Forget) stops it for this boot.
++ */
++static int conf_from_ios;
++void wland_remember(const char *ssid, const char *pass)
++{
++	if (!strcmp(conf_ssid, ssid) && !strcmp(conf_psk, pass) && conf_from_ios)
++		return;
++	snprintf(conf_ssid, sizeof(conf_ssid), "%s", ssid);
++	snprintf(conf_psk, sizeof(conf_psk), "%s", pass);
++	conf_from_ios = 1;
++	int fd = open(WLAN_CONF, O_WRONLY | O_CREAT | O_TRUNC, 0600);
++	if (fd >= 0) {
++		dprintf(fd, "ssid=%s\npsk=%s\n", ssid, pass);
++		close(fd);
++	}
++	printf("net: remembered '%s' for rejoins and the next boot\n", ssid);
++}
++
++void wland_forget_for_now(void)
++{
++	if (conf_ssid[0])
++		printf("net: wifid left '%s': no rejoins this boot\n", conf_ssid);
++	conf_ssid[0] = 0;
++}
++
+ static void join_poll(void)
+ {
+ 	static int asked, joined, fails;
+ 	static uint64_t next;
+-	if (!conf_ssid[0] || !radio_scans() || bridge_joins)
+-		return;				/* (wifid has taken over: bridge.c) */
++	if (!conf_ssid[0] || !radio_scans())
++		return;
+ 	uint64_t now = link_ms();
++	/* 0027: a join wifid asked for (bridge.c) runs on its own; it counts as ours once it is up */
++	if (bridge_joins && !joined) {
++		if (radio_joined()) {
++			joined = 1;
++			asked = 0;
++			fails = 0;
++		}
++		return;
++	}
+ 	int r = radio_join_result();
+ 	if (asked) {
+ 		if (r == -1)
+diff --git a/phone/wifi/bridge.c b/phone/wifi/bridge.c
+--- a/phone/wifi/bridge.c
++++ b/phone/wifi/bridge.c
+@@ -20,6 +20,9 @@
+ static unsigned scans_at;
+ static uint64_t scan_deadline, join_deadline, last_bg_scan;
+ int bridge_joins;	/* wifid has asked for a network (or to leave): wland's own wlan.conf join stands down */
++extern void wland_remember(const char *ssid, const char *pass);	/* 0027 (wland.c) */
++extern void wland_forget_for_now(void);
++static char last_ssid[33], last_pass[65];
+ 
+ static void bridge_send(uint16_t type, const void *data, size_t len)
+ {
+@@ -121,6 +124,8 @@
+ 	if (radio_joined())
+ 		radio_disconnect();
+ 	int r = radio_join(ssid, pass);
++	snprintf(last_ssid, sizeof(last_ssid), "%s", ssid);
++	snprintf(last_pass, sizeof(last_pass), "%s", pass);
+ 	printf("[%6llu] bridge: join '%s' (%s) -> %d\n", (unsigned long long)link_ms(), ssid,
+ 	       j->key_kind == FW_KEY_PMK ? "PMK" : j->key_kind == FW_KEY_PASSPHRASE ? "passphrase" : "open", r);
+ 	if (r) {
+@@ -178,6 +183,7 @@
+ 		case FW_LEAVE:
+ 			bridge_joins = 1;
+ 			printf("[%6llu] bridge: leave\n", (unsigned long long)link_ms());
++			wland_forget_for_now();
+ 			radio_disconnect();
+ 			bridge_status(FW_LEFT, 0);
+ 			break;
+@@ -197,6 +203,8 @@
+ 		int r = radio_join_result();
+ 		if (r != -1 || now > join_deadline) {
+ 			join_pending = 0;
++			if (r == 0 && last_ssid[0])
++				wland_remember(last_ssid, last_pass);
+ 			bridge_status(FW_JOIN_DONE, r == -1 ? ETIMEDOUT : r);
+ 		}
+ 	}
