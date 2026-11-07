@@ -1,0 +1,99 @@
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -992,6 +992,22 @@
+ 	uint32_t          timeout = kShutdownTimeout;
+ 	static boolean_t  panic_begin_called = FALSE;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * 0204: nothing here can halt or restart the A71 (shutdown from Settings ended in a panic, 2026-11-07).
++	 * reboot(2) has synced and unmounted by now; PSCI SYSTEM_OFF / SYSTEM_RESET as the power key path does.
++	 */
++	if (type == kPEHaltCPU || type == kPERestartCPU || type == kPEUPSDelayHaltCPU) {
++		const bool restart = type == kPERestartCPU;
++		printf("SWEET POWER: %s through PSCI\n", restart ? "restart" : "power off");
++		IODelay(300000);
++		register uint64_t x0 __asm__("x0") = restart ? 0x84000009ULL : 0x84000008ULL;
++		__asm__ volatile("smc #0" : "+r"(x0) : :
++		    "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++		    "x14", "x15", "x16", "x17", "cc", "memory");
++		printf("SWEET POWER: PSCI returned %d\n", (int)x0);
++	}
++#endif
+ 	if (type == kPEHaltCPU || type == kPERestartCPU || type == kPEUPSDelayHaltCPU) {
+ 		/* If we're in the panic path, the locks and memory allocations required below
+ 		 *  could fail. So just try to reboot instead of risking a nested panic.
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -680,7 +680,7 @@
+ 
+ 	/* Touch normally votes L11C at 45 s. The RPMh API also checks completion. */
+ 	/* 0195: sweetgpudelay=s. Before backboardd starts there is nothing to restart for Metal. */
+-	uint32_t delay_s = 60;
++	uint32_t delay_s = 15;	/* 0204: was 60; with sweetm2restart=2 SpringBoard comes back with the GPU */
+ 	(void)PE_parse_boot_argn("sweetgpudelay", &delay_s, sizeof(delay_s));
+ 	printf("SWEET ADRENO: start in %u s\n", delay_s);
+ 	clock_interval_to_deadline(delay_s, NSEC_PER_SEC, &deadline);
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1758,7 +1758,7 @@
+ 				/* 0198: no sleep state exists yet, so at least run slowly while nobody looks. */
+ 				static int save = -1;
+ 				if (save < 0) {
+-					int v = 0;
++					int v = 1;	/* 0204: on unless sweetpowersave=0 */
+ 					PE_parse_boot_argn("sweetpowersave", &v, sizeof(v));
+ 					save = v;
+ 				}
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -244,7 +244,7 @@
+ 		const int cable = sweet_a71_cable_in();
+ 		const bool charging = ma > 15;
+ 		const bool external = cable < 0 ? charging : cable != 0;
+-		static unsigned charge_ma, charge_read;
++		static unsigned charge_ma = 1000, charge_read;	/* 0204: 1000 unless sweetcharge=N (0: leave alone) */
+ 		if (!charge_read) {
+ 			charge_read = 1;
+ 			(void)PE_parse_boot_argn("sweetcharge", &charge_ma, sizeof(charge_ma));
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -259,6 +259,10 @@
+ 	result->version = 1;
+ 	channel_fill(&result->channel, bss->frequency, 0);
+ 	result->rssi = bss->rssi;
++	/* 0204: with noise unknown the status bar drew no bars; a typical 2.4 GHz floor */
++	result->noise_known = 1;
++	result->noise = -95;
++	result->snr = bss->rssi < 0 && bss->rssi > -95 ? (int16_t)(bss->rssi + 95) : 0;
+ 	result->beacon_interval = bss->beacon_interval;
+ 	result->capability = bss->capability;
+ 	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
+@@ -648,6 +652,8 @@
+ 		if (state != NULL) {
+ 			redwood_sta_state(state);
+ 			link.rssi = status == 1 ? state->bss.rssi : 0;
++			link.noise = (uint16_t)(int16_t)-95;
++			link.snr = status == 1 && state->bss.rssi > -95 && state->bss.rssi < 0 ? (uint16_t)(state->bss.rssi + 95) : 0;
+ 			kfree_data(state, sizeof(*state));
+ 		}
+ 		post(EVENT_SSID_CHANGED, NULL, 0);
+--- a/bsd/dev/flame_sta.c
++++ b/bsd/dev/flame_sta.c
+@@ -151,6 +151,16 @@
+ 			}
+ 		}
+ 	}
++	/* 0204: the signal as of the latest (background) scan, not the one from the moment of the join */
++	if (state->phase == REDWOOD_STA_JOINED) {
++		struct flame_wlan_bss t;        /* (on any thread: not static) */
++		for (unsigned i = 0; flame_wlan_heard(i, &t); i++) {
++			if (memcmp(t.bssid, state->bss.bssid, 6) == 0 && t.age_ms < 60000) {
++				state->bss.rssi = t.rssi;
++				break;
++			}
++		}
++	}
+ 	state->last_error = sta_last_error;
+ }
+ 
