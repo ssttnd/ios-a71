@@ -1,0 +1,21 @@
+diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
+--- a/phone/wifi/wland.c
++++ b/phone/wifi/wland.c
+@@ -784,12 +784,11 @@
+ 		dup2(fileno(stdout), 2);
+ 	setvbuf(stdout, NULL, _IONBF, 0);
+ 	printf("wland auto: boot %ld, memory limit 2048 MB -> %d\n", (long)bt.tv_sec, mrc);
+-	/* 0016: a package applied 10 s after the root mount may remove an old mark: look again a little later */
+-	if (!access(WLAND_TRY, F_OK) && !strstr(args, "sweetwlanretry=1")) {
+-		printf("wland auto: %s is there; looking again in 20 s\n", WLAND_TRY);
+-		sleep(20);
+-	}
+-	if (!access(WLAND_TRY, F_OK) && !strstr(args, "sweetwlanretry=1")) {
++	/* 0017: the owner gets out of a boot loop himself, and the guard kept skipping good boots after quick trips
++	   to TWRP. It only logs now; sweetwlanguard=1 brings the skip back. */
++	if (!access(WLAND_TRY, F_OK))
++		printf("wland auto: %s is there (the last try may have ended a boot); trying anyway\n", WLAND_TRY);
++	if (!access(WLAND_TRY, F_OK) && strstr(args, "sweetwlanguard=1")) {
+ 		printf("wland auto: the last try ended that boot (%s is there): staying out\n", WLAND_TRY);
+ 		return 0;
+ 	}
