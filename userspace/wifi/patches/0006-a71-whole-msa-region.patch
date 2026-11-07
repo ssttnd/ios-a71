@@ -1,0 +1,17 @@
+diff --git a/phone/wifi/wlfw.c b/phone/wifi/wlfw.c
+--- a/phone/wifi/wlfw.c
++++ b/phone/wifi/wlfw.c
+@@ -32,7 +32,12 @@
+ 
+ #define CLIENT_ID	0x4b4e454c	/* ath10k's */
+ #define MSA_PA		0x9a700000ull	/* A71 live DT wlan_msa_region (1.5 MB carve-out) */
+-#define MSA_SIZE	0x100000u	/* A71 icnss qcom,wlan-msa-memory: 1 MB */
++/*
++ * A71: the whole wlan_msa_region carve-out, 1.5 MB. With the 1 MB of icnss qcom,wlan-msa-memory every vdev start
++ * answered -1 (2026-11-07). On the Pixel 4a, too small an MSA left the firmware heap's upper half unassigned and
++ * vdev start crashed until the whole region was given (ios-flame docs/features/wifi.md).
++ */
++#define MSA_SIZE	0x180000u
+ /* Sweet ships bdwlan.<board id> (cnss naming): .bXX below 0xff, .XXX above. */
+ #define BDF_DIR		"/var/local/fw/modem/"
+ 
