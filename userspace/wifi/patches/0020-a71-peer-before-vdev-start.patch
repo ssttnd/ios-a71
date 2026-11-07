@@ -1,0 +1,56 @@
+diff --git a/phone/wifi/radio.c b/phone/wifi/radio.c
+--- a/phone/wifi/radio.c
++++ b/phone/wifi/radio.c
+@@ -1383,6 +1383,7 @@
+ static uint32_t s_body_len, s_freq, s_aid, s_tries, s_desc, s_msg1s;
+ static uint64_t s_deadline;
+ static int s_rsn, s_start_resp, s_ptk_set;
++static int s_peer_made;	/* 0020: the BSS peer exists (created before vdev start) */
+ static int32_t s_start_status;
+ static uint8_t s_assoc_req[512];
+ static uint32_t s_assoc_req_len;
+@@ -1797,7 +1798,7 @@
+ 	if (s_state >= S_START) {
+ 		if (s_state >= S_4WAY)
+ 			w_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
+-		if (s_state >= S_AUTH)
++		if (s_state >= S_AUTH || s_peer_made)
+ 			w_peer(CMD_PEER_DELETE, TAG_PEER_DELETE, 0);
+ 		w_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
+ 	}
+@@ -1805,6 +1806,7 @@
+ 		w_link(0);
+ 	s_state = S_IDLE;
+ 	s_ptk_set = 0;
++	s_peer_made = 0;
+ }
+ 
+ static void w_join_end(int result)
+@@ -1888,6 +1890,17 @@
+ 		v_allow_ht = (v >> 2) & 1;
+ 		LOG("join: variant %u: pre-start %s, phymode %s, allow-ht %s", v, (v & 1) ? "off" : "on",
+ 		    (v & 2) ? "11NG_HT20" : "11G", v_allow_ht ? "on" : "off");
++	}
++	/*
++	 * 0020: qcacld's join (lim_process_mlm_post_join_suspend_link -> wma_add_bss_peer_sta, then
++	 * lim_send_switch_chnl_params -> vdev start) creates the BSS peer first. wland created it only after a good
++	 * start; this firmware (HL3.0.1) answered every start -1.
++	 */
++	{
++		int pc = w_peer(CMD_PEER_CREATE, TAG_PEER_CREATE, 1);
++		s_peer_made = !pc;
++		LOG("join: peer create before vdev start -> %d", pc);
++		delay_ms(10);
+ 	}
+ 	fflush(stdout);
+ 	if (w_vdev_start(s_freq, bcn, dtim)) {
+@@ -2160,7 +2173,8 @@
+ 			LOG("join: vdev started (regdomain try %u)", rd_try);
+ 			s_state = S_AUTH;
+ 			s_tries = 1;
+-			w_peer(CMD_PEER_CREATE, TAG_PEER_CREATE, 1);
++			if (!s_peer_made)
++				w_peer(CMD_PEER_CREATE, TAG_PEER_CREATE, 1);
+ 			w_send_auth();
+ 			s_deadline = now + 400;
+ 		} else if (now > s_deadline) {
