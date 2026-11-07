@@ -1,0 +1,47 @@
+name: sweet-audio
+# A71 audio, stage 1: adspboot (audio DSP boot through TrustZone PAS, glink "lpass", APR, AFE SEC_MI2S_RX)
+# from the ios-flame main branch (MIT, Pixel 4a, SM7150) with the A71 patches in userspace/audio/patches,
+# and tasprobe (userspace/audio/tasprobe.c, read-only TAS2562 probe over bit-banged GPIO I2C).
+on:
+  workflow_dispatch:
+  push:
+    branches: [a71-gpu]
+    paths: [userspace/audio/**, .github/workflows/audio.yml]
+env:
+  DONOR_REPO: https://github.com/Yofuness/ios-flame.git
+  DONOR_COMMIT: 9bb3f5e1f776fc091a7a3df3d4e05092e1e85919
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the pinned donor sources
+        run: |
+          git init -q donor
+          git -C donor remote add origin "$DONOR_REPO"
+          git -C donor fetch -q --depth 1 origin "$DONOR_COMMIT"
+          git -C donor checkout -q FETCH_HEAD
+          test "$(git -C donor rev-parse HEAD)" = "$DONOR_COMMIT"
+          for p in userspace/audio/patches/*.patch; do git -C donor apply --verbose "$PWD/$p"; done
+      - name: Build adspboot and tasprobe for iOS 16 arm64
+        run: |
+          out=userspace/out/sweet-audio-ios16
+          mkdir -p "$out"
+          cd donor/phone/wifi
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -Wextra -Wno-unused-parameter \
+            -o "$GITHUB_WORKSPACE/$out/adspboot" adspboot.c fastrpc.c smem.c pmem.c glink.c smmu.c pdmapper.c qmi.c \
+            geni_i2c.c cs35l41.c ../sensors/sns_run.c ../sensors/dm_fusion.c ../sensors/sensor.c ../sensors/sns.c \
+            ../sensors/pb.c ../sensors/sns_link.c -lm
+          cd "$GITHUB_WORKSPACE"
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -Wextra -Wno-gnu-conditional-omitted-operand \
+            -o "$out/tasprobe" userspace/audio/tasprobe.c
+          for f in adspboot tasprobe; do
+            codesign --force --sign - --pagesize 4096 "$out/$f"
+            codesign --verify --strict "$out/$f"
+          done
+          (cd "$out" && shasum -a 256 adspboot tasprobe > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweet-audio-ios16
+          path: userspace/out/sweet-audio-ios16/

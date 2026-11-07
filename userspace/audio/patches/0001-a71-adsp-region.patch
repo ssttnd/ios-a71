@@ -1,0 +1,17 @@
+diff --git a/phone/wifi/adspboot.c b/phone/wifi/adspboot.c
+--- a/phone/wifi/adspboot.c
++++ b/phone/wifi/adspboot.c
+@@ -82,8 +82,11 @@
+ #include "../sensors/sns_run.h"
+ 
+ #define PAS_ADSP	1
+-#define ADSP_PA		0x96b00000ull
+-#define ADSP_SIZE	0x02200000ull
++/* A71 (audio 0001): reserved-memory pil_adsp_region <0x97f00000 0x2800000> (live DT). Everything else this file
++ * takes from the Pixel 4a's tree is the same on the A71's: pas-id 1, smp2p-adsp smem 443/429 IPC bit 26, glink adsp
++ * mbox bit 24, LPI TLMM 0x62b40000 with SEC_MI2S on gpio8-11 (func 3, 3, 4, 2), SEC_MI2S_RX port 0x1002. */
++#define ADSP_PA		0x97f00000ull
++#define ADSP_SIZE	0x02800000ull
+ #define FW_DIR		"/var/local/fw/adsp"
+ #define SMEM_HOST_ADSP	2
+ #define CRASH_ITEM	423

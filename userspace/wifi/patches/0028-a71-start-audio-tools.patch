@@ -1,0 +1,106 @@
+diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
+--- a/phone/wifi/wland.c
++++ b/phone/wifi/wland.c
+@@ -41,6 +41,8 @@
+ #include "radio.h"
+ #include "ipnet.h"
+ #include "bridge.h"
++#include <spawn.h>	/* 0028 */
++extern char **environ;
+ 
+ /* cmd-db aux levels (as in the GPU's arc votes) */
+ /* Every cmd-db entry: name, RPMh slave (3 ARC, 4 VRM, 5 BCM), address. */
+@@ -690,6 +692,85 @@
+ 	asked = 1;
+ }
+ 
++/*
++ * A71 (0028): audio stage 1. There is no shell on the phone and a new launchd job only exists from the boot after
++ * a package, so wland starts the audio tools: 45 s into this loop, once per boot, unless /var/local/adsp-off exists.
++ * First tasprobe (read-only TAS2562 probe, waited for, 20 s at most), then adspboot with the words of
++ * /var/local/adspboot.args (default "boot --afe --watch 30"), not waited for; reaped here. Both write to the
++ * stdout they inherit (the console with sweetnull=...,tasprobe,adspboot).
++ */
++static pid_t audio_spawn(char *const *av)
++{
++	pid_t pid = -1;
++	int e = posix_spawn(&pid, av[0], NULL, NULL, av, environ);
++	printf("audio: start %s -> %s (pid %d)\n", av[0], e ? strerror(e) : "ok", e ? -1 : (int)pid);
++	return e ? -1 : pid;
++}
++
++static void audio_poll(void)
++{
++	static int state;	/* 0 waiting, 1 adspboot running, 2 done */
++	static uint64_t t0;
++	static pid_t dsp = -1;
++	uint64_t now = link_ms();
++	if (state == 2)
++		return;
++	if (state == 1) {
++		int st = 0;
++		if (waitpid(dsp, &st, WNOHANG) == dsp) {
++			printf("audio: adspboot ended, status %#x\n", st);
++			state = 2;
++		}
++		return;
++	}
++	if (!t0) {
++		t0 = now ? now : 1;
++		return;
++	}
++	if (now - t0 < 45000)
++		return;
++	state = 2;
++	if (access("/var/local/adsp-off", F_OK) == 0) {
++		printf("audio: /var/local/adsp-off exists: not started\n");
++		return;
++	}
++	char *probe[] = { "/var/local/bin/tasprobe", NULL };
++	pid_t p = access(probe[0], X_OK) ? -1 : audio_spawn(probe);
++	for (int i = 0; p > 0 && i < 200; i++) {
++		int st = 0;
++		if (waitpid(p, &st, WNOHANG) == p) {
++			printf("audio: tasprobe ended, status %#x\n", st);
++			p = -1;
++			break;
++		}
++		usleep(100000);
++	}
++	if (p > 0) {
++		printf("audio: tasprobe still running after 20 s: killed\n");
++		kill(p, SIGKILL);
++		waitpid(p, NULL, 0);
++	}
++	static char buf[256];
++	char *av[24] = { "/var/local/bin/adspboot" };
++	int ac = 1, fd = open("/var/local/adspboot.args", O_RDONLY);
++	ssize_t n = fd >= 0 ? read(fd, buf, sizeof(buf) - 1) : -1;
++	if (fd >= 0)
++		close(fd);
++	if (n <= 0)
++		n = snprintf(buf, sizeof(buf), "boot --afe --watch 30");
++	buf[n] = 0;
++	for (char *s = strtok(buf, " \t\r\n"); s && ac < 23; s = strtok(NULL, " \t\r\n"))
++		av[ac++] = s;
++	av[ac] = NULL;
++	if (access(av[0], X_OK)) {
++		printf("audio: no %s\n", av[0]);
++		return;
++	}
++	dsp = audio_spawn(av);
++	if (dsp > 0)
++		state = 1;
++}
++
+ static volatile sig_atomic_t drop_asked;
+ 
+ static void on_usr1(int sig)
+@@ -708,6 +789,7 @@
+ 	ipnet_poll();
+ 	bridge_poll();
+ 	join_poll();
++	audio_poll();	/* 0028 */
+ }
+ 
+ /* A71 (0025): wave26 ended by SIGTERM about a minute into a busy link, parent and child alike. Say who sent it, live on. */
