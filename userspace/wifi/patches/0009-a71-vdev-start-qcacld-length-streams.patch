@@ -1,0 +1,31 @@
+diff --git a/phone/wifi/radio.c b/phone/wifi/radio.c
+--- a/phone/wifi/radio.c
++++ b/phone/wifi/radio.c
+@@ -1548,14 +1548,24 @@
+ 
+ static int w_vdev_start(uint32_t freq, uint32_t bcn, uint32_t dtim)
+ {
+-	uint8_t m[4 + 72 + 4 + 24 + 4] = { 0 }, *p;
+-	p = put_tlv(m, TAG_VDEV_START, 72);
++	/*
++	 * A71 (0009): Samsung's qcacld (send_vdev_start_cmd_tlv, A715FXXSBDXB1) sends the whole 104-byte fixed param of
++	 * its fw-api: after disable_hw_ack come preferred_tx_streams, preferred_rx_streams, he_ops, cac_duration_ms,
++	 * regdomain, min_data_rate, mbss_capability_flags, vdevid_trans, and flags carries LDPC_RX_ENABLED. With the
++	 * donor's 72 bytes the firmware answered every start with status -1 and chain_mask 0.
++	 */
++	const uint32_t nss_s = wmi_rf_chains >= 1 && wmi_rf_chains <= 3 ? wmi_rf_chains : 2;
++	uint8_t m[4 + 104 + 4 + 24 + 4] = { 0 }, *p;
++	p = put_tlv(m, TAG_VDEV_START, 104);
+ 	p = put32(p, 0);
+ 	p = put32(p, 0);
+ 	p = put32(p, bcn);
+ 	p = put32(p, dtim);
+-	p = put32(p, 0);
++	p = put32(p, 1u << 3);				/* WMI_UNIFIED_VDEV_START_LDPC_RX_ENABLED */
+ 	p += 36 + 16;					/* ssid (empty for a station), tx rate/power, noa, hw ack */
++	p = put32(p, nss_s);				/* preferred_tx_streams */
++	p = put32(p, nss_s);				/* preferred_rx_streams */
++	p += 6 * 4;					/* he_ops, cac, regdomain, min rate, mbss flags, vdevid_trans */
+ 	p = w_channel(p, freq);
+ 	put_tlv(p, TAG_ARRAY_STRUCT, 0);
+ 	return wmi_send(CMD_VDEV_START, m, sizeof(m));
