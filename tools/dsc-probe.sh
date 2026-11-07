@@ -32,10 +32,10 @@ for r in $(grep -oE '0x[0-9a-fA-F]{9,}' probe/xref2.txt 2>/dev/null | sort -u | 
 	ipsw dyld a2s "$c" "$r" 2>&1 | tee -a probe/a2s.txt
 done
 
-for sym in "-[CAMetalLayer setPixelFormat:]" "-[CAMetalLayer setWantsExtendedDynamicRangeContent:]" \
-	   "-[CAMetalLayer _setPixelFormat:]" "-[CAMetalLayer setColorspace:]" "-[CAMetalLayer setDevice:]" \
-	   "-[NUDevice_iOS initWithName:]" "-[NUDevice_iOS initWithMetalDevice:]" "-[NUDevice_iOS init]" \
-	   "-[NUPlatform_iOS init]" "+[NUPlatform_iOS sharedPlatform]"; do
+for sym in "__ZL32layer_private_check_pixel_formatP20_CAMetalLayerPrivatej" \
+	   "__ZL31layer_private_set_device_formatP20_CAMetalLayerPrivateP11objc_object" \
+	   "-[CAMetalLayer setDevice:]" "_MTLCreateSystemDefaultDevice" "_MTLCopyAllDevices" \
+	   "-[CAMetalLayer setColorspace:nonDefault:]"; do
 	step "disass $sym"
 	ipsw dyld disass "$c" --symbol "$sym" 2>&1 | head -600 | tee -a probe/disass.txt
 done
