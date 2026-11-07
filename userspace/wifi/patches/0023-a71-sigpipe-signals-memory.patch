@@ -1,0 +1,70 @@
+diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
+--- a/phone/wifi/wland.c
++++ b/phone/wifi/wland.c
+@@ -671,6 +671,15 @@
+ 	join_poll();
+ }
+ 
++static void on_fatal_signal(int sig)
++{
++	char m[64];
++	int n = snprintf(m, sizeof(m), "wland: ended by signal %d\n", sig);
++	if (n > 0)
++		write(1, m, (size_t)n);
++	_exit(128 + sig);
++}
++
+ static int net(unsigned secs)
+ {
+ 	if (getenv("WLAND_VERBOSE"))
+@@ -678,6 +687,17 @@
+ 	link_idle = net_idle;
+ 	signal(SIGUSR1, on_usr1);
+ 	signal(SIGCHLD, SIG_IGN);	/* netsvc children (ipnet.c) reap themselves */
++	/*
++	 * A71 (0023): twice wland ended 2 minutes into a busy link with no crash report and no summary, the way
++	 * SIGPIPE ends a process (a write to a socket or pipe whose other end closed). Ignore it, and name any other
++	 * signal that would end the process.
++	 */
++	signal(SIGPIPE, SIG_IGN);
++	{
++		static const int fatal[] = { SIGTERM, SIGHUP, SIGINT, SIGQUIT, SIGUSR2, SIGALRM, SIGXCPU, SIGXFSZ };
++		for (unsigned i = 0; i < sizeof(fatal) / sizeof(fatal[0]); i++)
++			signal(fatal[i], on_fatal_signal);
++	}
+ 	if (link_up(net_cb, 5000))
+ 		return -1;
+ 	if (rmtfs_init())
+@@ -749,12 +769,32 @@
+ 	for (;;) {
+ 		sleep(5);
+ 		unsigned long now = radio_heartbeat;
++		{
++			static int tick2;
++			if ((tick2 += 5) % 30 == 0) {
++				mach_task_basic_info_data_t bi;
++				mach_msg_type_number_t bc = MACH_TASK_BASIC_INFO_COUNT;
++				if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&bi, &bc) == KERN_SUCCESS)
++					printf("wland watch: resident %llu KB\n", (unsigned long long)bi.resident_size / 1024);
++			}
++		}
+ 		if (now != seen || now == 0) {
+ 			seen = now;
+ 			still = 0;
+ 			continue;
+ 		}
+ 		still += 5;
++		{
++			/* 0023: memory every 30 s, for a jetsam kill */
++			static int tick;
++			if ((tick += 5) % 30 == 0 || still == 5) {
++				mach_task_basic_info_data_t bi;
++				mach_msg_type_number_t bc = MACH_TASK_BASIC_INFO_COUNT;
++				if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&bi, &bc) == KERN_SUCCESS)
++					printf("wland watch: resident %llu KB, max %llu KB\n",
++					       (unsigned long long)bi.resident_size / 1024, (unsigned long long)bi.resident_size_max / 1024);
++			}
++		}
+ 		if (still != 15 && (still - 15) % 30)
+ 			continue;
+ 		arm_thread_state64_t st;
