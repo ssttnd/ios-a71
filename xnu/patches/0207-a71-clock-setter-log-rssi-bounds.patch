@@ -1,0 +1,50 @@
+--- a/bsd/kern/kern_time.c
++++ b/bsd/kern/kern_time.c
+@@ -218,6 +218,18 @@
+ 		if (!timeval_fixusec(&atv)) {
+ 			return EPERM;
+ 		}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/* 0207: the lock screen showed 1 January 1970 after the kernel had set the date from the RTC; say who
++		   sets the clock and to what (logged, not refused). */
++		{
++			char who[32] = "?";
++			clock_sec_t was = 0;
++			clock_usec_t wus = 0;
++			proc_selfname(who, sizeof(who));
++			clock_get_calendar_microtime(&was, &wus);
++			printf("SWEET TIME: %s[%d] sets the clock %ld -> %ld\n", who, proc_selfpid(), (long)was, (long)atv.tv_sec);
++		}
++#endif
+ 		setthetime(&atv);
+ 	}
+ 	if (uap->tzp) {
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -393,6 +393,17 @@
+ 		break;
+ 	}
+ 
++	/* 0207: the bounds of the signal scale wifid draws bars from (16 bytes: version, then dBm low/high) */
++	if (request->req_type == 106) {
++		struct {
++			uint32_t version;
++			int32_t low, high;
++			uint32_t unused;
++		} answer = { .version = 1, .low = -90, .high = -45 };
++
++		return give(request, &answer, sizeof(answer));
++	}
++
+ 	/* the rest is about the network joined, and there is none unless the station says so */
+ 	if ((state = kalloc_data(sizeof(*state), Z_WAITOK)) == NULL) {
+ 		return ENOMEM;
+@@ -786,7 +797,7 @@
+ 	error = is_set ? set(request, what, sizeof(what)) : get(request);
+ 	note(request, is_set, error);
+ 	/* (a request that is repeated for ever is said a few hundred times) */
+-	if (said < 800) {
++	if (said < 4000) {	/* 0207: was 800, which ended before the joins */
+ 		said++;
+ 		printf("apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
+ 		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==
