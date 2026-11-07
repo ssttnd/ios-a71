@@ -1,0 +1,62 @@
+diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
+--- a/phone/wifi/wland.c
++++ b/phone/wifi/wland.c
+@@ -673,6 +673,29 @@
+ 	join_poll();
+ }
+ 
++/* A71 (0025): wave26 ended by SIGTERM about a minute into a busy link, parent and child alike. Say who sent it, live on. */
++static void on_term(int sig, siginfo_t *si, void *ctx)
++{
++	(void)ctx;
++	char m[96];
++	int n = snprintf(m, sizeof(m), "wland: signal %d from pid %d (uid %d), ignored\n", sig, si ? (int)si->si_pid : -1,
++			 si ? (int)si->si_uid : -1);
++	if (n > 0)
++		write(1, m, (size_t)n);
++}
++
++static void keep_on_term(void)
++{
++	struct sigaction sa;
++	memset(&sa, 0, sizeof(sa));
++	sa.sa_sigaction = on_term;
++	sa.sa_flags = SA_SIGINFO | SA_RESTART;
++	sigemptyset(&sa.sa_mask);
++	sigaction(SIGTERM, &sa, NULL);
++	sigaction(SIGHUP, &sa, NULL);
++	sigaction(SIGINT, &sa, NULL);
++}
++
+ static void on_fatal_signal(int sig)
+ {
+ 	char m[64];
+@@ -696,9 +719,10 @@
+ 	 */
+ 	signal(SIGPIPE, SIG_IGN);
+ 	{
+-		static const int fatal[] = { SIGTERM, SIGHUP, SIGINT, SIGQUIT, SIGUSR2, SIGALRM, SIGXCPU, SIGXFSZ };
++		static const int fatal[] = { SIGQUIT, SIGUSR2, SIGALRM, SIGXCPU, SIGXFSZ };
+ 		for (unsigned i = 0; i < sizeof(fatal) / sizeof(fatal[0]); i++)
+ 			signal(fatal[i], on_fatal_signal);
++		keep_on_term();		/* 0025 */
+ 	}
+ 	if (link_up(net_cb, 5000))
+ 		return -1;
+@@ -880,6 +904,7 @@
+ 	 * signal: SIGKILL, which only the jetsam kills and a few others send. A parent stays behind and prints how the
+ 	 * child ended; the child asks for jetsam priority CRITICAL (190) like the daemons the phone needs.
+ 	 */
++	keep_on_term();
+ 	{
+ 		pid_t child = fork();
+ 		if (child > 0) {
+@@ -897,6 +922,8 @@
+ 		}
+ 		if (child < 0)
+ 			printf("wland auto: no watching parent (fork: %s)\n", strerror(errno));
++		if (child == 0)
++			printf("wland auto: radio process %d in its own session -> %d\n", (int)getpid(), (int)setsid());
+ 		struct { int32_t priority; uint64_t user_data; } prio = { 190, 0 };
+ 		int pr = memorystatus_control(2, getpid(), 0, &prio, sizeof(prio));
+ 		printf("wland auto: jetsam priority 190 -> %d\n", pr);
