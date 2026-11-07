@@ -1,0 +1,90 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -783,9 +783,14 @@
+ {
+     int enabled=0;
+     char name[32]={0};proc_selfname(name,sizeof(name));
+-    if (call!=0x5a || !PE_parse_boot_argn("sweetgles",&enabled,sizeof(enabled)) ||
+-        enabled!=1 || strcmp(name,"backboardd")) return ENOPOLICY;
+-    uint64_t request[2], flags=0x7b;
++    if (call!=0x5a) return ENOPOLICY;
++    /* 0206: with no answer dyld treats every process as restricted and will not expand @rpath, so apps
++       that keep frameworks inside their bundle die at launch: Music (MusicApplication), Podcasts
++       (NowPlayingUI), Books (BKAudiobooks, BookCore). An ordinary iPhone allows @ paths and fallback
++       paths (AMFI_DYLD_OUTPUT_ALLOW_AT_PATH | _ALLOW_FALLBACK_PATHS). The GLES experiment keeps its set. */
++    uint64_t request[2], flags=0x9;
++    if (PE_parse_boot_argn("sweetgles",&enabled,sizeof(enabled)) && enabled==1 && !strcmp(name,"backboardd"))
++        flags=0x7b;
+     if (copyin(arg,request,sizeof(request)) || !request[1]) return EFAULT;
+     return copyout(&flags,(user_addr_t)request[1],sizeof(flags));
+ }
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -399,6 +399,57 @@
+ 	}
+ 	redwood_sta_state(state);
+ 	switch (request->req_type) {
++	/*
++	 * 0206: wifid asked for these and drew an empty Wi-Fi icon while they were refused. Values for a
++	 * 1x1 2.4 GHz 802.11n link; the noise floor is the one the scan results report.
++	 */
++	case 17: {                              /* noise: the shape of RSSI (16) */
++		struct {
++			uint32_t version, radios, unit;
++			int32_t each[4], all, each_ext[4], all_ext;
++		} answer = { .version = 1, .radios = 1, .each = { -95 }, .all = -95, .each_ext = { -95 }, .all_ext = -95 };
++
++		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
++	case 8:                                 /* rate, Mbit/s, in the value */
++		if (state->phase != REDWOOD_STA_JOINED) {
++			error = ENXIO;
++		} else {
++			request->req_val = 72;
++		}
++		break;
++	case 57:                                /* MCS index, in the value */
++		if (state->phase != REDWOOD_STA_JOINED) {
++			error = ENXIO;
++		} else {
++			request->req_val = 7;
++		}
++		break;
++	case 5:                                 /* power save: off */
++	case 18:                                /* interference mitigation: off */
++		request->req_val = 0;
++		break;
++	case 14: {                              /* PHY modes: supported B|G|N, active N (APPLE80211_MODE_*) */
++		struct {
++			uint32_t version, supported, active;
++		} answer = { .version = 1, .supported = (1u << 2) | (1u << 3) | (1u << 4),
++			     .active = state->phase == REDWOOD_STA_JOINED ? (1u << 4) : 0 };
++
++		error = give(request, &answer, sizeof(answer));
++		break;
++	}
++	case 51:                                /* country code, 3 bytes */
++		error = give(request, "US", 3);
++		break;
++	case 6: {                               /* protection mode: none */
++		struct {
++			uint32_t version, mode, threshold;
++		} answer = { .version = 1 };
++
++		error = give(request, &answer, sizeof(answer));
++		break;
++	}
+ 	case 13:                                /* the state: APPLE80211_S_INIT 0, _SCAN 1, _AUTH 2, _ASSOC 3, _RUN 4 */
+ 		request->req_val = state->phase == REDWOOD_STA_JOINED ? 4 : state->phase == REDWOOD_STA_JOINING ? 2 :
+ 		    state->phase == REDWOOD_STA_SCANNING ? 1 : 0;
+@@ -593,6 +644,9 @@
+ 	}
+ 	case 10:
+ 		return set_scan(request, said, said_size);
++	case 51:                                /* 0206: country code: the firmware keeps its own; taken, not used */
++	case 383:                               /* 0206: wifid set this hundreds of times a boot; taken, not used */
++		return 0;
+ 	default:
+ 		return EOPNOTSUPP;
+ 	}
