@@ -292,3 +292,5 @@ wland.log and wland.log.prev read from the phone in TWRP over adb (block reads, 
 **Wi-Fi drop at 228 s (wave31):** firmware roam event reason 2 then "join: link lost (beacon miss)"; nothing rejoined (wifid does not auto-join here). wland 0027 remembers the network iOS joined (memory + /var/local/wlan.conf, 0600), rejoins after a lost link and at boot through the existing wlan.conf path, and stops for the boot after a wifid leave. Package now replaces wland with a single mv (no rm), so launchd never sees it missing.
 
 **metal_profile=3 (wave32): backboardd aborts at start**, "failed assertion _limits.maxColorAttachments > 0 at line 3793 in -[_MTLDevice initLimits]": the frontend has no limits table for profile 3. Reverted (wave33, same kernel 1fa5990, wland f3a0850 with rejoin). The XR format for AegirPoster needs a limits table for a higher profile in the Metal frontend first.
+
+**metal_profile=5 (wave33):** backboardd aborts at start too (no assertion text, bt in Metal). XR formats need real support in the Metal frontend (limits and families claimed truthfully plus BGR10_XR/BGRA10_XR rendering), not a boot-arg. Back to no profile (wave34).
