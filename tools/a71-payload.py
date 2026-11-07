@@ -9,6 +9,7 @@ ITEM is one of:
   tree:LOCAL_DIR=/dest       every file below LOCAL_DIR; Mach-O files get mode 755
   text:/dest=CONTENT         a small file with this content and a newline, mode 644
   rm:/dest                   unlink /dest
+  mv:/src=/dest              rename within the root
   link:/dest=TARGET          make /dest a symbolic link to TARGET
 
 The package goes to a 256 MiB raw area at the end of userdata, just below the
@@ -25,7 +26,7 @@ AREA_BLOCKS = 65536
 ROOT_BYTES = 16 << 30
 TGT = "/dev/block/by-name/userdata"
 NW = 0x08000000 if os.name == "nt" else 0
-MKDIR, FILE, LINK, RM = 1, 2, 3, 4
+MKDIR, FILE, LINK, RM, MOVE = 1, 2, 3, 4, 5
 COUNT = [0]
 
 
@@ -78,6 +79,10 @@ def build(dst, items):
             dest, target = arg.split("=", 1)
             out.append(entry(LINK, 0o755, 0, dest, target))
             print("  link", dest, "->", target)
+        elif kind == "mv":
+            src, dest = arg.split("=", 1)
+            out.append(entry(MOVE, 0, 0, src, dest))
+            print("  mv", src, "->", dest)
         elif kind == "rm":
             out.append(entry(RM, 0, 0, arg))
             print("  rm", arg)

@@ -1,0 +1,53 @@
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -14588,6 +14588,7 @@
+ int sweet_vfs_mkdir(const char *path, int mode);
+ int sweet_vfs_symlink(const char *target, const char *link);
+ int sweet_vfs_unlink(const char *path);
++int sweet_vfs_rename(const char *from, const char *to);
+ 
+ int
+ sweet_vfs_mkdir(const char *path, int mode)
+@@ -14610,4 +14611,11 @@
+ {
+ 	return unlink1(vfs_context_kernel(), NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
+ }
++
++int
++sweet_vfs_rename(const char *from, const char *to)
++{
++	return renameat_internal(vfs_context_kernel(), AT_FDCWD, CAST_USER_ADDR_T(from), AT_FDCWD,
++	           CAST_USER_ADDR_T(to), UIO_SYSSPACE, 0);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -42,6 +42,7 @@
+ extern int sweet_vfs_mkdir(const char *path, int mode);
+ extern int sweet_vfs_symlink(const char *target, const char *link);
+ extern int sweet_vfs_unlink(const char *path);
++extern int sweet_vfs_rename(const char *from, const char *to);
+ extern kern_return_t thread_terminate(thread_t);
+ struct sync_args;
+ extern int sync(proc_t p, struct sync_args *uap, int32_t *retval);
+@@ -371,6 +372,7 @@
+ #define SP_FILE         2u
+ #define SP_LINK         3u
+ #define SP_RM           4u
++#define SP_MOVE         5u      /* 0196: path -> target; already moved is fine */
+ 
+ struct sp_header {
+ 	char magic[8];
+@@ -467,6 +469,12 @@
+ 			(void)sweet_vfs_unlink(e->path);
+ 			err = sweet_vfs_symlink(e->target, e->path);
+ 			break;
++		case SP_MOVE:
++			err = sweet_vfs_rename(e->path, e->target);
++			if (err == ENOENT || err == EEXIST || err == ENOTEMPTY) {
++				err = 0;
++			}
++			break;
+ 		case SP_RM:
+ 			err = sweet_vfs_unlink(e->path);
+ 			if (err == ENOENT) {
