@@ -1,0 +1,84 @@
+diff --git a/phone/wifi/radio.c b/phone/wifi/radio.c
+--- a/phone/wifi/radio.c
++++ b/phone/wifi/radio.c
+@@ -588,6 +588,14 @@
+ }
+ static int w_pdev_param(uint32_t param, uint32_t value);
+ static int w_vdev_start(uint32_t freq, uint32_t bcn, uint32_t dtim);
++/*
++ * A71: its board file reports regdomain 0, and every vdev start then answered status -1 (2026-11-07). After such
++ * an answer the next join sets another regdomain pair (ath regd.h codes: the eeprom's, FCC1_FCCA, ETSI1_WORLD,
++ * WOR4_WORLD, WORA_WORLD, WOR0_WORLD) until one starts; the log says which.
++ */
++static const uint32_t rd_codes[] = { 0xffffffff, 0x10, 0x37, 0x64, 0x6a, 0x60 };
++static unsigned rd_try;
++static int w_regdomain(uint32_t code);
+ 
+ /* ath10k WMI_SERVICE_IS_ENABLED: 4 service bits per 32-bit word (sizeof(u32)) */
+ static int wmi_svc(uint32_t bit)
+@@ -845,18 +853,7 @@
+ 	 * firmware's own eeprom code, FCC conformance limits. The HL3.2.2 firmware asserted in vdev
+ 	 * start (first TX) without it and with every channel passive.
+ 	 */
+-	{
+-		uint8_t rd[4 + 24] = { 0 }, *q = put_tlv(rd, 0x51, 24);
+-		uint32_t code = wmi_eeprom_rd != 0xffffffff ? (wmi_eeprom_rd & 0xffff) : 0;
+-		q = put32(q, 0);	/* pdev */
+-		q = put32(q, code);
+-		q = put32(q, code);
+-		q = put32(q, code);
+-		q = put32(q, 0x10);	/* CTL_FCC 2 GHz */
+-		put32(q, 0x10);		/* CTL_FCC 5 GHz */
+-		int rc = wmi_send(0x4001, rd, sizeof(rd));
+-		LOG("regdomain: %#x -> %d", code, rc);
+-	}
++	w_regdomain(wmi_eeprom_rd != 0xffffffff ? (wmi_eeprom_rd & 0xffff) : 0);
+ 	/*
+ 	 * ath10k_start's pdev setup. Above all the chain masks: INIT says 0x7 (3 chains), the firmware has 2 and
+ 	 * ath10k narrows it here ((1 << num_rf_chains) - 1); without it the fw indexes per-chain state past 2.
+@@ -1509,6 +1506,20 @@
+ 	return wmi_send(0x500d, m, sizeof(m));
+ }
+ 
++static int w_regdomain(uint32_t code)
++{
++	uint8_t rd[4 + 24] = { 0 }, *q = put_tlv(rd, 0x51, 24);
++	q = put32(q, 0);	/* pdev */
++	q = put32(q, code);
++	q = put32(q, code);
++	q = put32(q, code);
++	q = put32(q, 0x10);	/* CTL_FCC 2 GHz */
++	put32(q, 0x10);		/* CTL_FCC 5 GHz */
++	int rc = wmi_send(0x4001, rd, sizeof(rd));
++	LOG("regdomain: %#x -> %d", code, rc);
++	return rc;
++}
++
+ static int w_vdev_start(uint32_t freq, uint32_t bcn, uint32_t dtim)
+ {
+ 	uint8_t m[4 + 72 + 4 + 24 + 4] = { 0 }, *p;
+@@ -1812,6 +1823,10 @@
+ 	if (steps() & 0x40)
+ 		wm = w_vdev_wmm();
+ 	LOG("join: tx power limit 2G/5G 20 dBm %s, vdev wmm %s", t2 || t5 ? "FAILED" : "ok", wm ? "FAILED" : "ok");
++	if (rd_try % (sizeof(rd_codes) / sizeof(rd_codes[0]))) {
++		w_regdomain(rd_codes[rd_try % (sizeof(rd_codes) / sizeof(rd_codes[0]))]);
++		delay_ms(20);
++	}
+ 	fflush(stdout);
+ 	if (w_vdev_start(s_freq, bcn, dtim)) {
+ 		w_join_end(EIO);
+@@ -2046,10 +2061,12 @@
+ 	if (s_state == S_START) {
+ 		if (s_start_resp) {
+ 			if (s_start_status) {
+-				LOG("join: vdev start status %d", s_start_status);
++				LOG("join: vdev start status %d (regdomain try %u)", s_start_status, rd_try);
++				rd_try++;
+ 				w_join_end(EIO);
+ 				return;
+ 			}
++			LOG("join: vdev started (regdomain try %u)", rd_try);
+ 			s_state = S_AUTH;
+ 			s_tries = 1;
+ 			w_peer(CMD_PEER_CREATE, TAG_PEER_CREATE, 1);
