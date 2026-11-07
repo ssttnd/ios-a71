@@ -45,7 +45,10 @@ cmdline = f"debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogres
 # sweetgpu is the GPU bring-up stage: 1 read-only ... 9 commands. Override with SWEETGPU.
 # The first copy of a boot argument wins, so these are chosen here and not in SWEETARGS.
 cmdline += f" sweetbattery={os.environ.get('SWEETBATTERY', '0')} sweetbacklight={os.environ.get('SWEETBACKLIGHT', '0')}"
-cmdline += f" sweetfbdpudump=0 sweetfbflip={os.environ.get('SWEETFBFLIP', '0')} sweetfbbeam={os.environ.get('SWEETFBBEAM', '0')}"
+cmdline += f" sweetfbdpudump=0 sweetfbbeam={os.environ.get('SWEETFBBEAM', '0')}"
+# The kernel's default for sweetfbflip is off; the line has only 607 bytes.
+if os.environ.get('SWEETFBFLIP', '0') != '0':
+    cmdline += f" sweetfbflip={os.environ['SWEETFBFLIP']}"
 cmdline += f" sweetgpu={int(os.environ.get('SWEETGPU', '1'))}"
 # Less console work: copies of /dev/null writes and the IOKit trace. Empty SWEETQUIET keeps them.
 if os.environ.get('SWEETQUIET', '1'):

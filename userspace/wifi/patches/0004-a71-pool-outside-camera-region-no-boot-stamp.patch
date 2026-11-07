@@ -1,0 +1,33 @@
+diff --git a/phone/wifi/radio.c b/phone/wifi/radio.c
+--- a/phone/wifi/radio.c
++++ b/phone/wifi/radio.c
+@@ -32,7 +32,12 @@
+ 
+ /* ---------------------------------------------------------------- host memory */
+ 
+-#define POOL_PA		0xE0000000ull
++/*
++ * A71 live DT: camera_mem_region covers 0xc2000000-0xe7800000, so the donor's 0xE0000000 is inside it. The phone
++ * restarted just after the rings were programmed there. Nothing in the DT reserves 0xe7800000-0xffffffff, and the
++ * kernel's RAM starts at 4 GB.
++ */
++#define POOL_PA		0xF0000000ull
+ #define POOL_SIZE	0x01000000ull
+ static uint64_t pool_next = POOL_PA;
+ 
+diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
+--- a/phone/wifi/wland.c
++++ b/phone/wifi/wland.c
+@@ -768,10 +768,8 @@
+ 			stamp[0] = 0;
+ 		fclose(f);
+ 	}
+-	if (!strcmp(stamp, now)) {
+-		fprintf(stderr, "wland: already started in this boot\n");
+-		return 1;
+-	}
++	/* A71: kern.boottime is a small number here, the same in many boots, so a matching stamp proves nothing. The job
++	   runs once per boot, without KeepAlive; WLAND_TRY guards against a restart. */
+ 	if ((f = fopen(WLAND_STAMP, "w"))) {
+ 		fputs(now, f);
+ 		fclose(f);
