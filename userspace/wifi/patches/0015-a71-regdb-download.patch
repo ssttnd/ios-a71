@@ -1,0 +1,20 @@
+diff --git a/phone/wifi/wlfw.c b/phone/wifi/wlfw.c
+--- a/phone/wifi/wlfw.c
++++ b/phone/wifi/wlfw.c
+@@ -377,6 +377,16 @@
+ 		 * bdwlan.b00 sent from here (Samsung's generic bdwlan.bin) went with vdev start -1 and chain_mask 0.
+ 		 * /var/local/wlan-bdf-host brings the old download back.
+ 		 */
++		/*
++		 * A71 (0015): Samsung's cnss-daemon also downloads regdb.bin ("Failed to Download the REGDB File" in
++		 * /vendor/bin/cnss-daemon; the file is /vendor/firmware/wlan/qca_cld/regdb.bin). This firmware runs its own
++		 * regulatory (it sends a REG_CHAN_LIST_CC for "US"); without the database every vdev start answered -1.
++		 * bdf_type 2 is REGDB in this downstream message (see bdf_download).
++		 */
++		if (!access(BDF_DIR "regdb.bin", F_OK))
++			printf("wlfw: regdb download -> %d\n", bdf_download(BDF_DIR "regdb.bin", 0, 2, 6144));
++		else
++			printf("wlfw: no %sregdb.bin\n", BDF_DIR);
+ 		int ok = access("/var/local/wlan-bdf-host", F_OK) != 0;
+ 		if (ok)
+ 			printf("wlfw: no board data from the host (icnss does not send any)\n");
