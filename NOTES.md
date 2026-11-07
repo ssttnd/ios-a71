@@ -244,3 +244,5 @@ wland.log and wland.log.prev read from the phone in TWRP over adb (block reads, 
 **Wi-Fi source match found:** github.com/R0Xofficial/android_kernel_samsung_a71 is Samsung's A715FXXSBDXB1 kernel with qcacld-3.0, fw-api and qca-wifi-host-cmn under drivers/net/wireless/qualcomm/wcn39xx (downloads kept in scratchpad sam/). Compare wland's WMI against it before guessing. First finding: qcacld's vdev create carries num_cfg_txrx_streams and two wmi_vdev_txrx_streams (tag 0x19b); ours did not, and the start response had chain_mask 0. wland 0008 adds them (not yet run).
 
 **Wave12 (wland 86552d3, vdev create with streams):** "vdev create: 2 tx/rx streams per band -> 0", scans fine, vdev start still -1, chain_mask 0. Next: wland 0009, vdev start fixed param 104 bytes as qcacld (preferred_tx/rx_streams = rf chains, LDPC_RX flag). Not run yet.
+
+**Wave13 (wland 00ea6c9, qcacld-length vdev start with preferred streams):** still -1, chain_mask 0. wland skips SERVICE_READY_EXT (qcacld waits for it and puts hw_mode into INIT) and logged no unknown events. wland 0010 logs every unhandled WMI event, to see ready-ext or error events.

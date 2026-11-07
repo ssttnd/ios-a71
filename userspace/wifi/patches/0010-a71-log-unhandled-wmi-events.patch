@@ -1,0 +1,22 @@
+diff --git a/phone/wifi/radio.c b/phone/wifi/radio.c
+--- a/phone/wifi/radio.c
++++ b/phone/wifi/radio.c
+@@ -2246,8 +2246,17 @@
+ 		}
+ 		fflush(stdout);
+ 		break;
+-	default:
++	default: {
++		/* A71 (0010): which events this firmware sends that nobody reads (a ready-ext, an error after vdev start) */
++		static unsigned shown;
++		if (shown < 80) {
++			uint32_t w[6] = { 0 };
++			shown++;
++			memcpy(w, d + 4, MIN(len - 4, (uint32_t)sizeof(w)));
++			LOG("wmi: event %#x len %u: %08x %08x %08x %08x %08x %08x", id, len, w[0], w[1], w[2], w[3], w[4], w[5]);
++		}
+ 		break;
++	}
+ 	}
+ }
+ 
