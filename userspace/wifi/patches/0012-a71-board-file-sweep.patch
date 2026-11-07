@@ -1,0 +1,110 @@
+diff --git a/phone/wifi/wlfw.c b/phone/wifi/wlfw.c
+--- a/phone/wifi/wlfw.c
++++ b/phone/wifi/wlfw.c
+@@ -7,6 +7,7 @@
+  */
+ #include <fcntl.h>
+ #include <stdio.h>
++#include <dirent.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+@@ -41,6 +42,8 @@
+ /* Sweet ships bdwlan.<board id> (cnss naming): .bXX below 0xff, .XXX above. */
+ #define BDF_DIR		"/var/local/fw/modem/"
+ 
++char wlfw_sweep_name[32];
++int wlfw_sweep_armed;
+ static uint32_t srv_node, srv_port;
+ static int srv_up, started;
+ static volatile int fw_ready, msa_ready;
+@@ -322,6 +325,49 @@
+ 			snprintf(bdf_path, sizeof(bdf_path), BDF_DIR "bdwlan.b%02x", wlfw.board_id);
+ 		else
+ 			snprintf(bdf_path, sizeof(bdf_path), BDF_DIR "bdwlan.%03x", wlfw.board_id & 0xfff);
++		/*
++		 * A71 (0012): /var/local/wlan-bdf-sweep holds an index. This boot sends the index-th bdwlan.* of BDF_DIR
++		 * (sorted), and the file is advanced before the download, so a crash moves on too. radio.c restarts the
++		 * phone after a failed vdev start and ends the sweep after a good one or past the last file.
++		 */
++		{
++			FILE *sf = fopen("/var/local/wlan-bdf-sweep", "r");
++			unsigned idx = 0;
++			if (sf) {
++				if (fscanf(sf, "%u", &idx) != 1)
++					idx = 0;
++				fclose(sf);
++				static char names[64][32];
++				unsigned n = 0;
++				DIR *dir = opendir(BDF_DIR);
++				struct dirent *e;
++				while (dir && (e = readdir(dir)) && n < 64)
++					if (!strncmp(e->d_name, "bdwlan.", 7) && strlen(e->d_name) < 32)
++						strcpy(names[n++], e->d_name);
++				if (dir)
++					closedir(dir);
++				qsort(names, n, sizeof(names[0]), (int (*)(const void *, const void *))strcmp);
++				if (idx >= n) {
++					printf("wlfw: sweep: past the last of %u board files, sweep over\n", n);
++					unlink("/var/local/wlan-bdf-sweep");
++					unlink("/var/local/wlan-steps.conf");
++					sync();
++				} else {
++					snprintf(bdf_path, sizeof(bdf_path), BDF_DIR "%s", names[idx]);
++					snprintf(wlfw_sweep_name, sizeof(wlfw_sweep_name), "%s", names[idx]);
++					int fd = open("/var/local/wlan-bdf-sweep", O_WRONLY | O_TRUNC);
++					char b[16];
++					int bl = snprintf(b, sizeof(b), "%u\n", idx + 1);
++					int okw = fd >= 0 && write(fd, b, (size_t)bl) == bl && fcntl(fd, F_FULLFSYNC) != -1;
++					if (fd >= 0)
++						close(fd);
++					sync();
++					wlfw_sweep_armed = okw;
++					printf("wlfw: sweep: board file %u of %u: %s (next index %s)\n", idx + 1, n, names[idx],
++					       okw ? "saved" : "NOT saved: no restart");
++				}
++			}
++		}
+ 		const struct { const char *path; int file_id, type; unsigned seg; } v[] = {
+ 			{ bdf_path, 0, -1, 6144 },
+ 		};
+diff --git a/phone/wifi/radio.c b/phone/wifi/radio.c
+--- a/phone/wifi/radio.c
++++ b/phone/wifi/radio.c
+@@ -15,6 +15,7 @@
+  */
+ #include <errno.h>
+ #include <stdio.h>
++#include <unistd.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/sysctl.h>
+@@ -1946,6 +1947,28 @@
+ 		LOG("vdev start resp raw: tag %#x len %u: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", tag, l,
+ 		    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9]);
+ 		s_start_status = (int32_t)v[3];
++		{
++			/* 0012: the board file sweep (wlfw.c) */
++			extern char wlfw_sweep_name[32];
++			extern int wlfw_sweep_armed;
++			extern int reboot(int);	/* libSystem; the iOS SDK header hides it */
++			if (wlfw_sweep_name[0]) {
++				LOG("SWEEP RESULT: %s -> vdev start status %d chain_mask %#x", wlfw_sweep_name, (int)v[3], v[4]);
++				fflush(stdout);
++				if ((int32_t)v[3] == 0) {
++					LOG("SWEEP FOUND: %s starts the vdev; sweep over", wlfw_sweep_name);
++					unlink("/var/local/wlan-bdf-sweep");
++					unlink("/var/local/wlan-steps.conf");
++					sync();
++				} else if (wlfw_sweep_armed) {
++					LOG("SWEEP: restarting for the next board file");
++					fflush(stdout);
++					sync();
++					sleep(3);
++					reboot(0);
++				}
++			}
++		}
+ 		s_start_resp = 1;
+ 		LOG("vdev start resp: status %d", s_start_status);
+ 	} else if (id == EV_PEER_STA_KICKOUT && s_state == S_UP) {
