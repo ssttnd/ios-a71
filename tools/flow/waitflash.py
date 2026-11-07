@@ -20,7 +20,8 @@ if "VERIFY OK" not in f.stdout:
     sys.exit("flash failed")
 log = os.path.join("logs", f"usb-{TAG}.txt")
 open(log, "ab").close()
-subprocess.Popen([sys.executable, "-I", "-u", "-X", "utf8", r"tools\a71-usblog.py", log], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=NW)
+subprocess.Popen([sys.executable, "-I", "-u", "-X", "utf8", r"tools\a71-usblog.py", log], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, close_fds=True,
+                 creationflags=NW | 0x00000200 | 0x01000000)  # new group, breaks away from the job: the log outlives this script
 c = subprocess.run([sys.executable, "-I", "-u", "-X", "utf8", r"tools\a71-bootcheck.py", log, "240"], capture_output=True, text=True, creationflags=NW)
 print(c.stdout[-1200:], flush=True)
 time.sleep(90)

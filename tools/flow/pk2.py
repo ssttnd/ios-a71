@@ -18,7 +18,7 @@ k = zipfile.ZipFile(kz).read("kernel.development.sweet")
 print("kernel", len(k), hashlib.sha256(k).hexdigest()[:16], b"SWEET DRAWLOG: armed" in k, b"SWEET PAYLOAD: finished" in k)
 if os.path.exists(r"shim\out\shim-boot.img"):
     os.remove(r"shim\out\shim-boot.img")
-args = "ufslogsecs=1 sweetgpukhz=650000 sweetmtl=2 sweetgles=0 sweetpresentwait=1 sweetpresentlock=1 " + ARGS
+args = "sweetgpukhz=650000 sweetmtl=2 sweetpresentwait=1 sweetpresentlock=1 " + ARGS
 env = dict(os.environ, SWEETGPU=os.environ.get("SWEETGPU", "9"), SWEETNULL=os.environ.get("SWEETNULL", "backboardd"), SWEETARGS=args.strip())
 q = subprocess.run([sys.executable, "-X", "utf8", r"tools\package_gpu_boot.py", kz], capture_output=True, text=True, env=env, creationflags=NW)
 print(q.stderr[-200:])

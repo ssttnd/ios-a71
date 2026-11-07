@@ -1,0 +1,80 @@
+--- a/bsd/dev/sweet_a71.c
++++ b/bsd/dev/sweet_a71.c
+@@ -27,6 +27,7 @@
+ int sweet_a71_battery(unsigned *percent, unsigned *mv, int *ma);
+ void sweet_a71_charger_log(void);
+ void sweet_a71_power_off(void);
++void sweet_a71_torch_toggle(void);
+ 
+ #define A71_TLMM_NORTH_PA       0x03900000u
+ #define A71_TLMM_NORTH_LEN      0x00300000u
+@@ -171,13 +172,53 @@
+ 	const unsigned soc = (unsigned)d[4] | ((unsigned)d[5] << 8);
+ 	*mv = (unsigned)((uint64_t)volt * 1000u / 8192u);
+ 	*ma = (int)(-(int64_t)cur * 1000 / 4096);
+-	/* In tenths of a percent, over capacity_max (990 in the device tree), rounded. */
+-	unsigned pct = (unsigned)(((uint64_t)soc * 1000u / 16384u * 100u / 990u + 5u) / 10u);
++	/* Over capacity_max (990, that is 99.0%, in the device tree), rounded. 0x13ad: 30.7 -> 31. */
++	unsigned pct = (unsigned)(((uint64_t)soc * 1000u / 16384u * 1000u / 990u + 5u) / 10u);
+ 	*percent = pct > 100 ? 100 : pct;
+ 	if (*mv < 2800 || *mv > 4600) {
+ 		return ERANGE;
+ 	}
+ 	return 0;
++}
++
++static int
++a71_i2c_write(unsigned sda, unsigned scl, unsigned addr, unsigned reg, uint8_t value)
++{
++	int err = 0;
++	lck_mtx_lock(&a71_lock);
++	if (a71_north == 0) {
++		a71_north = ml_io_map(A71_TLMM_NORTH_PA, A71_TLMM_NORTH_LEN);
++	}
++	if (a71_north == 0) {
++		err = ENXIO;
++	} else {
++		a71_start(sda, scl);
++		if (!a71_put(sda, scl, (uint8_t)(addr << 1)) || !a71_put(sda, scl, (uint8_t)reg) || !a71_put(sda, scl, value)) {
++			err = EIO;
++		}
++		a71_stop(sda, scl);
++	}
++	lck_mtx_unlock(&a71_lock);
++	return err;
++}
++
++/*
++ * The registers Samsung's driver changes for rear_torch_flash, read around it on this phone,
++ * at charger address 0x3d: 0x14 00->40, 0x15 00->0c, 0x54 fd->e1, back when it goes off.
++ * iOS's own flashlight button needs its camera stack, so this hangs on both volume keys.
++ */
++void
++sweet_a71_torch_toggle(void)
++{
++	static bool on;
++	static const uint8_t regs[3] = {0x14, 0x15, 0x54};
++	static const uint8_t lit[3] = {0x40, 0x0c, 0xe1}, dark[3] = {0x00, 0x00, 0xfd};
++	int err = 0;
++	on = !on;
++	for (unsigned i = 0; i < 3 && !err; i++) {
++		err = a71_i2c_write(42, 43, 0x3d, regs[i], on ? lit[i] : dark[i]);
++	}
++	printf("SWEET TORCH: %s errno=%d\n", on ? "on" : "off", err);
+ }
+ 
+ /* Read only: compares what iOS leaves in the charger with what Android's driver sets. */
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -120,6 +120,11 @@
+ 				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
+ 				    k, state[k], pon, gpio);
+ 				sweet_hid_key(k, state[k]);
++				/* 0199: both volume keys together toggle the torch. */
++				if (k != 0 && state[1] && state[2]) {
++					extern void sweet_a71_torch_toggle(void);
++					sweet_a71_torch_toggle();
++				}
+ 				if (k != 0 && state[k]) {
+ 					extern void sweet_drawlog_arm(void);
+ 					sweet_drawlog_arm();    /* sweetdrawlogkey=1: bsd/dev/sweet_files.c */
