@@ -334,6 +334,7 @@ air2nir = executable(""")
 };''')
     p.write_text(s)
     p=air/'air_metal.c';s=p.read_text()
+    s=replace(s,'[RWA_MIP_NOT_MIPMAPPED] = PIPE_TEX_MIPFILTER_NONE,','[RWA_MIP_NOT_MIPMAPPED] = PIPE_TEX_MIPFILTER_LINEAR,')
     s=replace(s,'#include "air_metal.h"','#include "sweet_native_ext.h"\n#include "util/u_framebuffer.h"\n#include "util/u_math.h"\n#include <math.h>\n#include <time.h>\n#include "util/u_upload_mgr.h"')
     s=replace(s,'#include "nir_air.h"','#include "nir_air.h"\n#include "air_live_resources.inc"\n#include "air_stage_link.inc"\n#include "air_vertex_exports.inc"')
     # Metal ALWAYS enables primitive restart for indexed strip draws (0xFFFF /
@@ -1124,6 +1125,10 @@ static _Atomic unsigned long long native_wait_until_completed;
 \t\t}
 \t}
 ''')
+    # CoreAnimation's variable blur downsample samples level(n) through a NotMipmapped sampler.
+    # freedreno clamps a MIPFILTER_NONE sampler's LOD to about 0, so every level was built straight
+    # from level 0 and the blur came out pixelated. Only that texture has more than one level, so a
+    # linear mip filter changes nothing for the others.
     # A clamp this driver ignores would sample the wrong level: say so once.
     s=replace(s,'''\t(void)lodMin; (void)lodMax;
 \t[self setFragmentSamplerState:sampler atIndex:index];''','''\tif (lodMin != 0.0f || lodMax < 1000.0f) {

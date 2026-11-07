@@ -147,7 +147,10 @@ Regression in 929ce9e: App Library goes black with artifacts. Observed: `the dra
 
 Image b9c4db8b (kernel d57ff4c with 0193, `sweetamfi=1 sweetdrawlogkey=1 sweetpayload=1`) plus bundle a9b9f80, log logs/usb-all1.txt: boots, no boot loop with 0193 on a71-gpu, package 9/9, no draw failure so far. Screen report pending.
 
-**Next:** owner's report on App Library, widgets, Photos, wallpaper; shorten the present lock for FPS. Move the GPU stage earlier so the restart is not seen. Later: widgets (retest sandbox patches), time, Wi-Fi per
+Owner on that image: Photos FIXED, App Library no longer disappears. Open: the progressive blur is now pixelated; no wallpaper and none can be added; screen off fades in stages. Observed: poster processes never start and do not crash, so providers are probably missing from LaunchServices (fork's finding). Fade cause seen in code: six full reads of uncached panel memory.
+Commit cdf29d4, CI pending: 0194 (24-step fade from a cached copy; volume key draw log now details the 704x256 target), bundle logs sampler states, `userspace/wallpaper` helper built but NOT installed. Installing it means editing the merged launchd.plist and a one-time LaunchServices rebuild: the fork stalled on the Apple logo once with early registration, so confirm with the owner first and use `--rebuild-once` from a delayed job.
+
+**Next:** flash cdf29d4 kernel and bundle; capture sampler and vertex data for the pixelated blur; ask about the LaunchServices rebuild; shorten the present lock for FPS. Move the GPU stage earlier so the restart is not seen. Later: widgets (retest sandbox patches), time, Wi-Fi per
 `docs/a71-radio-port.md`. Restore image for boot: `backup/2026-11-06/boot.img`.
 Kernel archive of this build: `research/xnu-kernel-130bb90.zip`.
 
