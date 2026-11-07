@@ -1,0 +1,11 @@
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -400,7 +400,7 @@
+ 			uint32_t version;
+ 			int32_t low, high;
+ 			uint32_t unused;
+-		} answer = { .version = 1, .low = -90, .high = -45 };
++		} answer = { .version = 1, .low = -100, .high = -60 };	/* 0212: was -90..-45 (1 bar at -78 dBm, Settings 2) */
+ 
+ 		return give(request, &answer, sizeof(answer));
+ 	}
