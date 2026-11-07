@@ -1,0 +1,57 @@
+name: sweet-wifi
+# wland (userland WCN3990 bring-up over /dev/pmem: modem PAS, SMP2P, GLINK/QRTR/QMI WLFW,
+# copy engines/WMI) and netsvc from the ios-flame sunfish branch (MIT, SM7150 + WCN3990),
+# with board patches from userspace/wifi/patches. Kernel side: xnu/patches/0138.
+on:
+  workflow_dispatch:
+  push:
+    branches: [a71-gpu]
+    paths: [userspace/wifi/**, .github/workflows/wifi.yml]
+env:
+  DONOR_REPO: https://github.com/Yofuness/ios-flame.git
+  DONOR_COMMIT: f09fdb58a2c074d131072947b247240532b7d97d
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the pinned donor sources
+        run: |
+          git init -q donor
+          git -C donor remote add origin "$DONOR_REPO"
+          git -C donor fetch -q --depth 1 origin "$DONOR_COMMIT"
+          git -C donor checkout -q FETCH_HEAD
+          test "$(git -C donor rev-parse HEAD)" = "$DONOR_COMMIT"
+          for p in userspace/wifi/patches/*.patch; do git -C donor apply --verbose "$PWD/$p"; done
+      - name: Build wland and netsvc for iOS 16 arm64
+        run: |
+          out=userspace/out/sweet-wifi-ios16
+          mkdir -p "$out"
+          cd donor/phone/wifi
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -Wextra -Wno-unused-parameter \
+            -o "$GITHUB_WORKSPACE/$out/wland" wland.c smem.c pmem.c glink.c link.c qmi.c rmtfs.c pdmapper.c \
+            tftp.c scm.c wlfw.c radio.c ipnet.c bridge.c
+          cd ../tools
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -fobjc-arc -framework Foundation \
+            -framework SystemConfiguration -o "$GITHUB_WORKSPACE/$out/netsvc" netsvc.m
+          cd "$GITHUB_WORKSPACE"
+          codesign --force --sign - --pagesize 4096 "$out/wland"
+          codesign --force --sign - --pagesize 4096 --entitlements donor/phone/tools/netsvc-ents.plist "$out/netsvc"
+          codesign --verify --strict "$out/wland"
+          codesign --verify --strict "$out/netsvc"
+          (cd "$out" && shasum -a 256 wland netsvc > SHA256SUMS)
+          python3 - "$out" <<'PY'
+          import hashlib, json, pathlib, sys
+          out = pathlib.Path(sys.argv[1])
+          patches = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                     for p in sorted(pathlib.Path('userspace/wifi/patches').glob('*.patch'))}
+          files = {n: hashlib.sha256((out / n).read_bytes()).hexdigest() for n in ('wland', 'netsvc')}
+          (out / 'wifi-build.json').write_text(json.dumps(
+              {'donor': 'Yofuness/ios-flame sunfish', 'donor_commit': '${{ env.DONOR_COMMIT }}',
+               'patches': patches, 'files': files}, indent=2) + '\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweet-wifi-ios16
+          path: userspace/out/sweet-wifi-ios16/

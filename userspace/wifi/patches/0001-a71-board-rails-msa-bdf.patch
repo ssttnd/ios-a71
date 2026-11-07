@@ -1,0 +1,68 @@
+diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
+index 8067400..a69979f 100644
+--- a/phone/wifi/wland.c
++++ b/phone/wifi/wland.c
+@@ -132,10 +132,15 @@ static int wlan_power(void)
+ 	 * 640 mV), 1.8-xo L1C, 1.3-rfa L2C, 3.3-ch1 L11C, 3.3-ch0 L10C, both 3312 mV.
+ 	 * /var/local/wlan-rails.conf ("ldoXN MV" per line) replaces the table for experiments.
+ 	 */
++	/*
++	 * Sweet and A71 live FDT icnss@18800000: vdd-cx-mx L9A (cx-mx-config 640 mV),
++	 * vdd-1.8-xo L1C, vdd-1.3-rfa L2C, vdd-3.3-ch0 L10C (3.2-3.312 V). There is no ch1 rail;
++	 * L11C is the touchscreen supply here and must not be revoted.
++	 */
+ 	static struct { char res[16]; uint32_t mv; } ldo[8] = {
+-		{ "ldoa9", 640 }, { "ldoc1", 1800 }, { "ldoc2", 1304 }, { "ldoc11", 3312 }, { "ldoc10", 3312 },
++		{ "ldoa9", 640 }, { "ldoc1", 1800 }, { "ldoc2", 1304 }, { "ldoc10", 3312 },
+ 	};
+-	unsigned nldo = 5;
++	unsigned nldo = 4;
+ 	FILE *rf = fopen("/var/local/wlan-rails.conf", "r");
+ 	if (rf) {
+ 		char res[16];
+@@ -374,8 +379,8 @@ static int qmp_send(const char *msg)
+ /* ---- modem boot: TrustZone PAS (Linux qcom_q6v5_pas + qcom_mdt_loader) ---- */
+ 
+ #define PAS_MODEM	4
+-#define MPSS_PA		0x8b000000ull	/* sunfish modem_region (flame: 0x8dc00000) */
+-#define MPSS_SIZE	0x09800000ull
++#define MPSS_PA		0x8d000000ull	/* A71 live DT modem_region: reg 0x8d000000 (node name still says 8b000000) */
++#define MPSS_SIZE	0x08c00000ull	/* A71 live DT: 0x8c00000 */
+ #define FW_DIR		"/var/local/fw/modem"
+ #define SCM_PIL(cmd)	(0x42000000ull | (2u << 8) | (cmd))
+ 
+diff --git a/phone/wifi/wlfw.c b/phone/wifi/wlfw.c
+index a808e6e..a220f85 100644
+--- a/phone/wifi/wlfw.c
++++ b/phone/wifi/wlfw.c
+@@ -31,10 +31,10 @@
+ #define FW_INIT_DONE_IND 0x38
+ 
+ #define CLIENT_ID	0x4b4e454c	/* ath10k's */
+-#define MSA_PA		0x98d00000ull	/* sunfish wlan_msa_region (flame: 0x8bc00000) */
+-#define MSA_SIZE	0x200000u	/* sunfish DT wlan_msa_mem: 2 MB (1 MB left the fw heap's upper half unassigned) */
+-#define BDF_PATH	"/var/local/fw/modem/bdwlan-sunfish.bin"
+-#define BDF_PATH2	"/var/local/fw/modem/bdwlan-sunfish-EVT1.0.bin"
++#define MSA_PA		0x9a700000ull	/* A71 live DT wlan_msa_region (1.5 MB carve-out) */
++#define MSA_SIZE	0x100000u	/* A71 icnss qcom,wlan-msa-memory: 1 MB */
++/* Sweet ships bdwlan.<board id> (cnss naming): .bXX below 0xff, .XXX above. */
++#define BDF_DIR		"/var/local/fw/modem/"
+ 
+ static uint32_t srv_node, srv_port;
+ static int srv_up, started;
+@@ -312,8 +312,13 @@ int wlfw_start(void)
+ 		for (int t = 0; t < 5000 && !msa_ready; t++)
+ 			link_poll(1);
+ 		/* which request shape this firmware takes is not known yet: try them in turn */
+-		static const struct { const char *path; int file_id, type; unsigned seg; } v[] = {
+-			{ BDF_PATH, 0, -1, 6144 },
++		static char bdf_path[96];
++		if (wlfw.board_id < 0xff)
++			snprintf(bdf_path, sizeof(bdf_path), BDF_DIR "bdwlan.b%02x", wlfw.board_id);
++		else
++			snprintf(bdf_path, sizeof(bdf_path), BDF_DIR "bdwlan.%03x", wlfw.board_id & 0xfff);
++		const struct { const char *path; int file_id, type; unsigned seg; } v[] = {
++			{ bdf_path, 0, -1, 6144 },
+ 		};
+ 		int ok = 0;
+ 		for (unsigned i = 0; i < sizeof(v) / sizeof(v[0]) && !ok; i++) {

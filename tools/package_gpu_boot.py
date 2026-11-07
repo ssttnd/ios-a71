@@ -43,7 +43,9 @@ cmdline = f"debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogres
 # Fork drivers with Redmi values stay off on the A71 until ported: real battery (A71 has
 # s2mu106/107), DSI backlight (A71 is a command-mode panel), display register dump, page flip.
 # sweetgpu is the GPU bring-up stage: 1 read-only ... 9 commands. Override with SWEETGPU.
-cmdline += " sweetbattery=0 sweetbacklight=0 sweetfbdpudump=0 sweetfbflip=0 sweetfbbeam=0"
+# The first copy of a boot argument wins, so these are chosen here and not in SWEETARGS.
+cmdline += f" sweetbattery={os.environ.get('SWEETBATTERY', '0')} sweetbacklight={os.environ.get('SWEETBACKLIGHT', '0')}"
+cmdline += f" sweetfbdpudump=0 sweetfbflip={os.environ.get('SWEETFBFLIP', '0')} sweetfbbeam={os.environ.get('SWEETFBBEAM', '0')}"
 cmdline += f" sweetgpu={int(os.environ.get('SWEETGPU', '1'))}"
 # Less console work: copies of /dev/null writes and the IOKit trace. Empty SWEETQUIET keeps them.
 if os.environ.get('SWEETQUIET', '1'):
@@ -72,6 +74,14 @@ if os.path.exists(os.path.join(fw, 'a615_zap.mdt')):
                    + fw_args('--sqe-firmware', '--sqe-sha256', 'a630_sqe.fw')
                    + fw_args('--zap-metadata', '--zap-metadata-sha256', 'a615_zap.mdt')
                    + fw_args('--zap-code', '--zap-code-sha256', 'a615_zap.b02'), check=True)
+
+# launchd starts wifid only when the device tree has a wlan node.
+if os.environ.get('SWEETWLAN'):
+    wlan_path = adt_path.replace('.adt', '_wlan.adt')
+    if os.path.exists(wlan_path):
+        os.remove(wlan_path)
+    subprocess.run(['python', 'tools/adt-add-wlan.py', adt_path, wlan_path], check=True)
+    adt_path = wlan_path
 
 print("\n2. Packaging SWEETXNU payload...")
 subprocess.run(['python', 'tools/mkpayload.py', kernel_path, adt_path, 'build/a71_payload.bin', '--cmdline', cmdline], check=True)

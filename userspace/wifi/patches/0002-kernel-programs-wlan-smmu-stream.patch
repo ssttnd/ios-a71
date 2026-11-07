@@ -1,0 +1,30 @@
+diff --git a/phone/wifi/radio.c b/phone/wifi/radio.c
+index e4add44..bd17773 100644
+--- a/phone/wifi/radio.c
++++ b/phone/wifi/radio.c
+@@ -17,6 +17,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/sysctl.h>
+ #include <CommonCrypto/CommonHMAC.h>
+ #include <CommonCrypto/CommonKeyDerivation.h>
+ #include <CommonCrypto/CommonSymmetricKeywrap.h>
+@@ -85,6 +86,17 @@ static int sid_match(uint32_t smr, uint32_t sid, uint32_t mask)
+ 
+ int smmu_wlan_identity(void)
+ {
++	/* Sweet: on this phone a load from the apps SMMU stalls the CPU once the system is up, although the same registers read fine
++	 * from the kernel during bsd init. With boot-arg sweetsmmuwlan=1 the kernel (xnu patch 0153) programs this same stream there;
++	 * never touch the SMMU from here then. */
++	char args[1024] = "";
++	size_t len = sizeof(args) - 1;
++	if (!sysctlbyname("kern.bootargs", args, &len, NULL, 0) && strstr(args, "sweetsmmuwlan=1")) {
++		printf("smmu: WLAN %#x/%#x stream programmed by the kernel at boot (sweetsmmuwlan=1); not touching the apps SMMU\n",
++		       WLAN_SID, WLAN_SID_MASK);
++		smmu_done = 1;
++		return 0;
++	}
+ 	uint64_t s = SMMU_PA;
+ 	uint32_t id0 = rd32(s + 0x20), id1 = rd32(s + 0x24);
+ 	uint32_t nsmr = id0 & 0xff, ncb = id1 & 0xff;
