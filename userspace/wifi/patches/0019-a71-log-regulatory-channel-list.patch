@@ -1,0 +1,27 @@
+diff --git a/phone/wifi/radio.c b/phone/wifi/radio.c
+--- a/phone/wifi/radio.c
++++ b/phone/wifi/radio.c
+@@ -2252,6 +2252,23 @@
+ 		if (!wmi_init_sent && wmi_init_due)
+ 			wmi_init_due = link_ms() + 300;
+ 		break;
++	case 0x3a001: {					/* WMI_REG_CHAN_LIST_CC_EVENTID */
++		/*
++		 * 0019: the firmware's own regulatory. Fixed param (fw-api wmi_reg_chan_list_cc_event_fixed_param): status,
++		 * phy_id, alpha2, dfs_region, phybitmap, num_phy, country_id, domain_code, min/max bw 2g, min/max bw 5g,
++		 * num_2g_reg_rules, num_5g_reg_rules; then an array of {tlv, freq_info (start | end << 16), bw_pwr_info,
++		 * flag_info}. Logged whole, to see whether our channel is in it.
++		 */
++		uint32_t w[64] = { 0 };
++		uint32_t n = MIN((len - 4) / 4, (uint32_t)64);
++		memcpy(w, d + 4, n * 4);
++		char cc[3] = { (char)(w[3] & 0xff), (char)((w[3] >> 8) & 0xff), 0 };
++		LOG("reg: CHAN_LIST_CC status %u country '%s' dfs %u country_id %u domain %#x rules 2g %u 5g %u", w[1], cc,
++		    w[4], w[7], w[8], w[13], w[14]);
++		for (uint32_t o = 16; o + 4 <= n; o += 4)
++			LOG("reg: rule %u-%u MHz bw_pwr %#x flags %#x", w[o + 1] & 0xffff, w[o + 1] >> 16, w[o + 2], w[o + 3]);
++		break;
++	}
+ 	case 0x4022:					/* WMI_SERVICE_READY_EXT2_EVENTID */
+ 		LOG("wmi: SERVICE_READY_EXT2, %u bytes", len);
+ 		if (!wmi_init_sent && wmi_init_due) {
