@@ -1,0 +1,33 @@
+diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
+--- a/phone/wifi/wland.c
++++ b/phone/wifi/wland.c
+@@ -715,10 +715,9 @@
+ 	uint64_t now = link_ms();
+ 	if (state == 2)
+ 		return;
+-	if (state == 1) {
+-		int st = 0;
+-		if (waitpid(dsp, &st, WNOHANG) == dsp) {
+-			printf("audio: adspboot ended, status %#x\n", st);
++	if (state == 1) {	/* 0029: SIGCHLD is ignored here, so adspboot reaps itself; only notice that it is gone */
++		if (kill(dsp, 0) && errno == ESRCH) {
++			printf("audio: adspboot ended\n");
+ 			state = 2;
+ 		}
+ 		return;
+@@ -735,6 +734,7 @@
+ 		return;
+ 	}
+ 	char *probe[] = { "/var/local/bin/tasprobe", NULL };
++	signal(SIGCHLD, SIG_DFL);	/* 0029: with SIG_IGN waitpid never returns the child (wave35 stood 20 s) */
+ 	pid_t p = access(probe[0], X_OK) ? -1 : audio_spawn(probe);
+ 	for (int i = 0; p > 0 && i < 200; i++) {
+ 		int st = 0;
+@@ -750,6 +750,7 @@
+ 		kill(p, SIGKILL);
+ 		waitpid(p, NULL, 0);
+ 	}
++	signal(SIGCHLD, SIG_IGN);	/* 0029: back to what netsvc's children need */
+ 	static char buf[256];
+ 	char *av[24] = { "/var/local/bin/adspboot" };
+ 	int ac = 1, fd = open("/var/local/adspboot.args", O_RDONLY);

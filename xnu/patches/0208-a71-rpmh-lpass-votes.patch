@@ -1,0 +1,16 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -820,9 +820,11 @@
+ 		}
+ 	}
+ 	const bool clock = !strcmp(res, "rfclka2");
+-	const bool arc = !strcmp(res, "cx.lvl") || !strcmp(res, "mss.lvl");
++	/* 0208: and the audio DSP's proxy votes (lpass@62400000 vdd_lpi_cx / vdd_lpi_mx, level 385 = nominal) */
++	const bool arc = !strcmp(res, "cx.lvl") || !strcmp(res, "mss.lvl") || !strcmp(res, "lcx.lvl") ||
++	    !strcmp(res, "lmx.lvl");
+ 	if (rail < 0 && !clock && !arc) {
+-		printf("SWEET RPMH: userland vote for %s refused (not a Wi-Fi/modem resource)\n", res);
++		printf("SWEET RPMH: userland vote for %s refused (not a Wi-Fi/modem/ADSP resource)\n", res);
+ 		return EPERM;
+ 	}
+ 	for (unsigned i = 0; i < n; ++i) {
