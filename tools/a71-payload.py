@@ -9,6 +9,7 @@ ITEM is one of:
   tree:LOCAL_DIR=/dest       every file below LOCAL_DIR; Mach-O files get mode 755
   text:/dest=CONTENT         a small file with this content and a newline, mode 644
   rm:/dest                   unlink /dest
+  link:/dest=TARGET          make /dest a symbolic link to TARGET
 
 The package goes to a 256 MiB raw area at the end of userdata, just below the
 persistent log; the root file system does not use it. The kernel applies it at
@@ -73,6 +74,10 @@ def build(dst, items):
         elif kind == "text":
             dest, content = arg.split("=", 1)
             add_file(dest, 0o644, content.encode() + b"\n", made, out)
+        elif kind == "link":
+            dest, target = arg.split("=", 1)
+            out.append(entry(LINK, 0o755, 0, dest, target))
+            print("  link", dest, "->", target)
         elif kind == "rm":
             out.append(entry(RM, 0, 0, arg))
             print("  rm", arg)

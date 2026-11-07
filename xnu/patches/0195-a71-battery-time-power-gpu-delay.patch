@@ -1,0 +1,355 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -121,6 +121,7 @@
+ bsd/dev/sweet_bt_hci.c			standard
+ bsd/dev/sweet_haptic.c			standard
+ bsd/dev/sweet_files.c			standard
++bsd/dev/sweet_a71.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_adreno.c			standard
+ bsd/dev/sweet_adreno_clock.c		standard
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -16,6 +16,8 @@
+ #include <kern/clock.h>
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" int sweet_a71_battery(unsigned *percent, unsigned *mv, int *ma);
++extern "C" void sweet_a71_charger_log(void);
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -36,6 +38,7 @@
+ 	unsigned fPolls;
+ 	unsigned fFailures;     /* 0161: consecutive failed reads */
+ 	bool fSeededSdam;       /* 0162: seeded from the QG driver's SOC: count only, no drift */
++	bool fA71;              /* 0195: sweetbattery=2, the A71's s2mu106 gauge */
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -217,6 +220,33 @@
+ void
+ SweetBattery::poll(void)
+ {
++	if (fA71) {
++		unsigned percent = 0, mv = 0;
++		int ma = 0, err = sweet_a71_battery(&percent, &mv, &ma);
++		if (err) {
++			if (++fFailures % 12 == 1) {
++				IOLog("SWEET BATTERY: s2mu106 read errno=%d (%u failures)\n", err, fFailures);
++			}
++			if (fSocValid) {
++				return;     /* the last reading stands */
++			}
++			publish(100, 4200, 0, true, true, false, true, false, false);
++			return;
++		}
++		fFailures = 0;
++		fSocValid = true;
++		/* The gauge is the source of truth. It does not say whether a cable is in: net charge does. */
++		const bool charging = ma > 15;
++		if (fPolls % 60 == 0) {
++			IOLog("SWEET BATTERY: s2mu106 %u%% %umV %dmA\n", percent, mv, ma);
++		}
++		if (fPolls % 120 == 0) {
++			sweet_a71_charger_log();
++		}
++		fPolls++;
++		publish(percent, mv, ma, charging, charging, charging, charging && percent >= 100, true, true);
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -378,6 +408,11 @@
+ 				IOLog("SWEET RTC: PM6150 RTC %u s: too small, calendar left alone\n", secs);
+ 				return;
+ 			}
++			/* 0195: the RTC counts from an old date on this phone but keeps counting;
++			 * the packager adds the difference it read from TWRP. */
++			uint32_t offset = 0;
++			(void)PE_parse_boot_argn("sweetrtcoff", &offset, sizeof(offset));
++			secs += offset;
+ 			clock_set_calendar_microtime((clock_sec_t)secs, 0);
+ 			clock_sec_t bs = 0;
+ 			clock_usec_t bus = 0;
+@@ -397,7 +432,8 @@
+ 	}
+ 	int real = 1;   /* 0149 hardware: PM6150 QG/SMB5 reads work; sweetbattery=0 = static 100% */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	fA71 = real == 2;
++	fReal = fA71 || (real == 1 && sweet_spmi_init() == 0);
+ 	/*
+ 	 * The A71's RTC does not hold the real date (it reads 1970), and its SPMI arbiter was
+ 	 * not exercised here until a run of images boot-looped, so this is opt-in.
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -95,6 +95,10 @@
+ {
+ 	int state[3] = {0, 0, 0};
+ 	unsigned errors = 0;
++	/* 0195: hold the power key this long to power off (sweetpowerhold=ms, 0 = never). */
++	unsigned hold_ms = 3500, held = 0;
++	bool off_done = false;
++	(void)PE_parse_boot_argn("sweetpowerhold", &hold_ms, sizeof(hold_ms));
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+@@ -121,6 +125,12 @@
+ 					sweet_drawlog_arm();    /* sweetdrawlogkey=1: bsd/dev/sweet_files.c */
+ 				}
+ 			}
++		}
++		held = state[0] ? held + 20 : 0;
++		if (hold_ms && held >= hold_ms && !off_done) {
++			extern void sweet_a71_power_off(void);
++			off_done = true;
++			sweet_a71_power_off();
+ 		}
+ 		keys_wait();
+ 	}
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -737,7 +737,7 @@
+ 		/* Fade out, then black, then idle. 0194: the panel memory is uncached, so reading it
+ 		 * on every step took longer than a refresh and the fade showed as a few stages. It is
+ 		 * read once; every step writes a scaled copy of that frame. */
+-		const uint32_t steps = 24;
++		const uint32_t steps = 10;      /* 0195: a sixth of a second, 24 felt slow */
+ 		uint32_t step = fb->fFadeStep;
+ 		if (step <= steps) {
+ 			fb->fFadeStep = step + 1;
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -679,7 +679,11 @@
+ 	static const char *const names[] = { "mx.lvl", "cx.lvl", "gfx.lvl" };
+ 
+ 	/* Touch normally votes L11C at 45 s. The RPMh API also checks completion. */
+-	clock_interval_to_deadline(60, NSEC_PER_SEC, &deadline);
++	/* 0195: sweetgpudelay=s. Before backboardd starts there is nothing to restart for Metal. */
++	uint32_t delay_s = 60;
++	(void)PE_parse_boot_argn("sweetgpudelay", &delay_s, sizeof(delay_s));
++	printf("SWEET ADRENO: start in %u s\n", delay_s);
++	clock_interval_to_deadline(delay_s, NSEC_PER_SEC, &deadline);
+ 	(void)assert_wait_deadline(&sleep_chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+ 	if (stage >= 4) {
+diff --git a/bsd/dev/sweet_a71.c b/bsd/dev/sweet_a71.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_a71.c
+@@ -0,0 +1,213 @@
++/*
++ * A71 board helpers.
++ *
++ * The gauge and the charger hang on bit-banged I2C buses, as in the phone's device tree:
++ * /soc/12c@14 SDA 101 SCL 102 (s2mu106 fuel gauge 0x3b), /soc/12c@13 SDA 42 SCL 43
++ * (s2mu106 charger 0x3d, flash 0x74). All four pins are in TLMM NORTH.
++ *
++ * Gauge registers, checked against the Samsung driver's own sysfs values on this phone:
++ * 0x04 voltage, mV = raw * 1000 / 8192 (0x7871: 3763, driver 3764)
++ * 0x06 current, signed, charging negative, mA = -raw * 1000 / 4096
++ * 0x08 state of charge, percent = raw * 100 / 16384 (0x0271: 3.81, driver raw 3.65)
++ * The driver then divides by capacity_max 990 (device tree), 99.0%.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc_internal.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++struct sync_args;
++extern int sync(proc_t p, struct sync_args *uap, int32_t *retval);
++
++int sweet_a71_i2c_read(unsigned sda, unsigned scl, unsigned addr, unsigned reg, uint8_t *out, unsigned count);
++int sweet_a71_battery(unsigned *percent, unsigned *mv, int *ma);
++void sweet_a71_charger_log(void);
++void sweet_a71_power_off(void);
++
++#define A71_TLMM_NORTH_PA       0x03900000u
++#define A71_TLMM_NORTH_LEN      0x00300000u
++#define A71_GPIO_CFG(n)         ((uint32_t)(n) * 0x1000u)
++#define A71_GPIO_IO(n)          (A71_GPIO_CFG(n) + 4u)
++#define A71_GPIO_OE             (1u << 9)
++#define A71_I2C_US              4u
++
++static vm_offset_t a71_north;
++static LCK_GRP_DECLARE(a71_grp, "sweet_a71");
++static LCK_MTX_DECLARE(a71_lock, &a71_grp);
++
++static uint32_t
++a71_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(a71_north + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++a71_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(a71_north + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* Open drain: low drives the output enable with the output at 0, high releases to the pull. */
++static void
++a71_line(unsigned pin, bool high)
++{
++	uint32_t cfg = (a71_rd(A71_GPIO_CFG(pin)) & ~(A71_GPIO_OE | (0xfu << 2))) | 3u;
++	if (high) {
++		a71_wr(A71_GPIO_CFG(pin), cfg);
++	} else {
++		a71_wr(A71_GPIO_IO(pin), a71_rd(A71_GPIO_IO(pin)) & ~2u);
++		a71_wr(A71_GPIO_CFG(pin), cfg | A71_GPIO_OE);
++	}
++	delay(A71_I2C_US);
++}
++
++static bool
++a71_get(unsigned pin)
++{
++	return (a71_rd(A71_GPIO_IO(pin)) & 1u) != 0;
++}
++
++static void
++a71_start(unsigned sda, unsigned scl)
++{
++	a71_line(sda, true);
++	a71_line(scl, true);
++	a71_line(sda, false);
++	a71_line(scl, false);
++}
++
++static void
++a71_stop(unsigned sda, unsigned scl)
++{
++	a71_line(sda, false);
++	a71_line(scl, true);
++	a71_line(sda, true);
++}
++
++/* true when the device acknowledged. */
++static bool
++a71_put(unsigned sda, unsigned scl, uint8_t v)
++{
++	for (int i = 7; i >= 0; i--) {
++		a71_line(sda, ((v >> i) & 1u) != 0);
++		a71_line(scl, true);
++		a71_line(scl, false);
++	}
++	a71_line(sda, true);
++	a71_line(scl, true);
++	bool ack = !a71_get(sda);
++	a71_line(scl, false);
++	return ack;
++}
++
++static uint8_t
++a71_take(unsigned sda, unsigned scl, bool more)
++{
++	uint8_t v = 0;
++	a71_line(sda, true);
++	for (int i = 7; i >= 0; i--) {
++		a71_line(scl, true);
++		v = (uint8_t)((v << 1) | (a71_get(sda) ? 1u : 0u));
++		a71_line(scl, false);
++	}
++	a71_line(sda, !more);
++	a71_line(scl, true);
++	a71_line(scl, false);
++	a71_line(sda, true);
++	return v;
++}
++
++int
++sweet_a71_i2c_read(unsigned sda, unsigned scl, unsigned addr, unsigned reg, uint8_t *out, unsigned count)
++{
++	int err = 0;
++	lck_mtx_lock(&a71_lock);
++	if (a71_north == 0) {
++		a71_north = ml_io_map(A71_TLMM_NORTH_PA, A71_TLMM_NORTH_LEN);
++	}
++	if (a71_north == 0) {
++		err = ENXIO;
++		goto out;
++	}
++	a71_start(sda, scl);
++	if (!a71_put(sda, scl, (uint8_t)(addr << 1)) || !a71_put(sda, scl, (uint8_t)reg)) {
++		err = EIO;
++		a71_stop(sda, scl);
++		goto out;
++	}
++	a71_start(sda, scl);
++	if (!a71_put(sda, scl, (uint8_t)((addr << 1) | 1u))) {
++		err = EIO;
++		a71_stop(sda, scl);
++		goto out;
++	}
++	for (unsigned i = 0; i < count; i++) {
++		out[i] = a71_take(sda, scl, i + 1 < count);
++	}
++	a71_stop(sda, scl);
++out:
++	lck_mtx_unlock(&a71_lock);
++	return err;
++}
++
++int
++sweet_a71_battery(unsigned *percent, unsigned *mv, int *ma)
++{
++	uint8_t d[6];
++	int err = sweet_a71_i2c_read(101, 102, 0x3b, 0x04, d, sizeof(d));
++	if (err) {
++		return err;
++	}
++	const unsigned volt = (unsigned)d[0] | ((unsigned)d[1] << 8);
++	const int16_t cur = (int16_t)((unsigned)d[2] | ((unsigned)d[3] << 8));
++	const unsigned soc = (unsigned)d[4] | ((unsigned)d[5] << 8);
++	*mv = (unsigned)((uint64_t)volt * 1000u / 8192u);
++	*ma = (int)(-(int64_t)cur * 1000 / 4096);
++	/* In tenths of a percent, over capacity_max (990 in the device tree), rounded. */
++	unsigned pct = (unsigned)(((uint64_t)soc * 1000u / 16384u * 100u / 990u + 5u) / 10u);
++	*percent = pct > 100 ? 100 : pct;
++	if (*mv < 2800 || *mv > 4600) {
++		return ERANGE;
++	}
++	return 0;
++}
++
++/* Read only: compares what iOS leaves in the charger with what Android's driver sets. */
++void
++sweet_a71_charger_log(void)
++{
++	uint8_t d[16];
++	for (unsigned base = 0x07; base < 0x37; base += 16) {
++		int err = sweet_a71_i2c_read(42, 43, 0x3d, base, d, sizeof(d));
++		if (err) {
++			printf("SWEET CHARGER: read %#x errno=%d\n", base, err);
++			return;
++		}
++		printf("SWEET CHARGER: %02x: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    base, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
++	}
++}
++
++/* PSCI SYSTEM_OFF, after writing out the file system. It does not return when it works. */
++void
++sweet_a71_power_off(void)
++{
++	int32_t rv = 0;
++	printf("SWEET POWER: power key held, syncing and powering off\n");
++	(void)sync(kernproc, NULL, &rv);
++	delay(500000);
++	register uint64_t x0 __asm__("x0") = 0x84000008ULL;
++	__asm__ volatile("smc #0" : "+r"(x0) : :
++	    "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "cc", "memory");
++	printf("SWEET POWER: SYSTEM_OFF returned %d\n", (int)x0);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

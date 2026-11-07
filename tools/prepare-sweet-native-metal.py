@@ -335,6 +335,32 @@ air2nir = executable(""")
     p.write_text(s)
     p=air/'air_metal.c';s=p.read_text()
     s=replace(s,'[RWA_MIP_NOT_MIPMAPPED] = PIPE_TEX_MIPFILTER_NONE,','[RWA_MIP_NOT_MIPMAPPED] = PIPE_TEX_MIPFILTER_LINEAR,')
+    # The progressive blur shows blocks the size of a texel of the smallest level, so that pass
+    # filters it as nearest. Only the variable blur uses mip levels: give any stage that reads such
+    # a texture linear filtering between texels and levels, whichever samplers it asked for.
+    s=replace(s,'''   if (num_ssbo)
+      pipe->set_shader_buffers(pipe, stage, 0, num_ssbo, sb, writable);
+   if (num_views)
+      pipe->set_sampler_views(pipe, stage, 0, num_views, 0, false, views);''','''   bool native_mipped = false;
+   for (unsigned i = 0; i < num_views; i++)
+      native_mipped |= views[i] && views[i]->texture && views[i]->texture->last_level > 0;
+   if (native_mipped) {
+      if (!device->native_mip_sampler) {
+         device->native_mip_sampler = pipe->create_sampler_state(pipe, &(struct pipe_sampler_state){
+            .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE, .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+            .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+            .min_img_filter = PIPE_TEX_FILTER_LINEAR, .mag_img_filter = PIPE_TEX_FILTER_LINEAR,
+            .min_mip_filter = PIPE_TEX_MIPFILTER_LINEAR, .min_lod = 0.0f, .max_lod = 16.0f });
+      }
+      if (device->native_mip_sampler) {
+         for (unsigned i = 0; i < num_samplers; i++)
+            samplers[i] = device->native_mip_sampler;
+      }
+   }
+   if (num_ssbo)
+      pipe->set_shader_buffers(pipe, stage, 0, num_ssbo, sb, writable);
+   if (num_views)
+      pipe->set_sampler_views(pipe, stage, 0, num_views, 0, false, views);''')
     s=replace(s,'#include "air_metal.h"','#include "sweet_native_ext.h"\n#include "util/u_framebuffer.h"\n#include "util/u_math.h"\n#include <math.h>\n#include <time.h>\n#include "util/u_upload_mgr.h"')
     s=replace(s,'#include "nir_air.h"','#include "nir_air.h"\n#include "air_live_resources.inc"\n#include "air_stage_link.inc"\n#include "air_vertex_exports.inc"')
     # Metal ALWAYS enables primitive restart for indexed strip draws (0xFFFF /
@@ -521,6 +547,7 @@ native_render_surface(struct rwa_texture *texture, unsigned level)
 '''+s[at:]
     s=replace(s,'   bool software;','''   bool software;
    bool in_command, lost;
+   void *native_mip_sampler;
    uint64_t native_begin_ns, native_window_ns, native_draw_ns, native_encode_ns, native_finish_ns;
    uint64_t native_draw_count, native_command_count, native_phase_ns[4];
    struct pipe_constant_buffer native_cb[PIPE_SHADER_TYPES][PIPE_MAX_CONSTANT_BUFFERS];
