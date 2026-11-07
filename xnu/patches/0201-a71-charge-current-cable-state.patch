@@ -1,0 +1,102 @@
+--- a/bsd/dev/sweet_a71.c
++++ b/bsd/dev/sweet_a71.c
+@@ -26,6 +26,8 @@
+ int sweet_a71_i2c_read(unsigned sda, unsigned scl, unsigned addr, unsigned reg, uint8_t *out, unsigned count);
+ int sweet_a71_battery(unsigned *percent, unsigned *mv, int *ma);
+ void sweet_a71_charger_log(void);
++int sweet_a71_cable_in(void);
++void sweet_a71_charge_set(unsigned ma);
+ void sweet_a71_power_off(void);
+ void sweet_a71_torch_toggle(void);
+ 
+@@ -237,6 +239,49 @@
+ 	}
+ }
+ 
++/* CHG_STATUS0, low three bits: 3 or 5 is good power on CHGIN (s2mu106_charger.c). -1: not read. */
++int
++sweet_a71_cable_in(void)
++{
++	uint8_t s = 0;
++	if (sweet_a71_i2c_read(42, 43, 0x3d, 0x0e, &s, 1)) {
++		return -1;
++	}
++	return (s & 7) == 3 || (s & 7) == 5;
++}
++
++/*
++ * 0201, sweetcharge=MA. The boot chain leaves 500 mA on the input (CTRL2 0x1a = 0x12) and 500 mA into
++ * the battery (CTRL7 0x1f = 0x09), and nothing here negotiates more, so iOS under load drains on a
++ * cable. Same encodings as Samsung's driver: input (mA - 125) / 25 + 3, battery mA / 50 - 1. The
++ * charger still limits itself on a weak source. There is no temperature watch here, so the battery
++ * current stays low: input at most 1800 mA, battery at most 1500 mA.
++ */
++void
++sweet_a71_charge_set(unsigned ma)
++{
++	if (ma < 500) {
++		return;
++	}
++	const unsigned in = ma > 1800 ? 1800 : ma, bat = ma > 1500 ? 1500 : ma;
++	uint8_t r2 = 0, r7 = 0;
++	int err = sweet_a71_i2c_read(42, 43, 0x3d, 0x1a, &r2, 1);
++	err = err ? err : sweet_a71_i2c_read(42, 43, 0x3d, 0x1f, &r7, 1);
++	if (err) {
++		printf("SWEET CHARGE: read errno=%d\n", err);
++		return;
++	}
++	const uint8_t n2 = (uint8_t)((r2 & 0x80) | (((in - 125) / 25 + 3) & 0x7f));
++	const uint8_t n7 = (uint8_t)((r7 & 0xc0) | ((bat / 50 - 1) & 0x3f));
++	if (n2 == r2 && n7 == r7) {
++		return;
++	}
++	err = a71_i2c_write(42, 43, 0x3d, 0x1a, n2);
++	err = err ? err : a71_i2c_write(42, 43, 0x3d, 0x1f, n7);
++	printf("SWEET CHARGE: input %u mA, battery %u mA: 0x1a %02x->%02x 0x1f %02x->%02x errno=%d\n",
++	    in, bat, r2, n2, r7, n7, err);
++}
++
+ /* PSCI SYSTEM_OFF, after writing out the file system. It does not return when it works. */
+ void
+ sweet_a71_power_off(void)
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -18,6 +18,8 @@
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ extern "C" int sweet_a71_battery(unsigned *percent, unsigned *mv, int *ma);
+ extern "C" void sweet_a71_charger_log(void);
++extern "C" int sweet_a71_cable_in(void);
++extern "C" void sweet_a71_charge_set(unsigned ma);
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -235,8 +237,19 @@
+ 		}
+ 		fFailures = 0;
+ 		fSocValid = true;
+-		/* The gauge is the source of truth. It does not say whether a cable is in: net charge does. */
++		/* 0201: the charger says whether a cable is in; a phone that draws more than the cable gives
++		   still shows it. Net charge stands in when that read fails. */
++		const int cable = sweet_a71_cable_in();
+ 		const bool charging = ma > 15;
++		const bool external = cable < 0 ? charging : cable != 0;
++		static unsigned charge_ma, charge_read;
++		if (!charge_read) {
++			charge_read = 1;
++			(void)PE_parse_boot_argn("sweetcharge", &charge_ma, sizeof(charge_ma));
++		}
++		if (charge_ma && external && fPolls % 12 == 0) {
++			sweet_a71_charge_set(charge_ma);    /* again each minute: a replug can reset it */
++		}
+ 		if (fPolls % 60 == 0) {
+ 			IOLog("SWEET BATTERY: s2mu106 %u%% %umV %dmA\n", percent, mv, ma);
+ 		}
+@@ -244,7 +257,7 @@
+ 			sweet_a71_charger_log();
+ 		}
+ 		fPolls++;
+-		publish(percent, mv, ma, charging, charging, charging, charging && percent >= 100, true, true);
++		publish(percent, mv, ma, external, external, charging, external && percent >= 100, true, true);
+ 		return;
+ 	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;

@@ -1,0 +1,27 @@
+name: sweet-bt
+# BlueTool stub for iOS 16 (userspace/bt, from DC28088/ios-sweet): bluetoothd's com.apple.BlueTool
+# requests all succeed; the kernel (xnu/patches/0154, sweetbt=1) owns the WCN3990.
+on:
+  workflow_dispatch:
+  push:
+    branches: [a71-gpu]
+    paths: [userspace/bt/**, .github/workflows/bt.yml]
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and sign the BlueTool stub for iOS 16 arm64
+        run: |
+          out=userspace/out/sweet-bt-ios16
+          mkdir -p "$out"
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -Wextra -Wno-unused-parameter \
+            -o "$out/BlueTool" userspace/bt/bluetool-stub.c
+          codesign --force --sign - --pagesize 4096 --entitlements userspace/bt/bluetool.entitlements "$out/BlueTool"
+          codesign --verify --strict "$out/BlueTool"
+          (cd "$out" && shasum -a 256 BlueTool > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweet-bt-ios16
+          path: userspace/out/sweet-bt-ios16/

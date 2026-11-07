@@ -83,6 +83,14 @@ if os.environ.get('SWEETWLAN'):
     subprocess.run(['python', 'tools/adt-add-wlan.py', adt_path, wlan_path], check=True)
     adt_path = wlan_path
 
+# bluetoothd needs a bluetooth node; the kernel takes the firmware from it. SWEETBT is the firmware folder.
+if os.environ.get('SWEETBT'):
+    bt_path = adt_path.replace('.adt', '_bt.adt')
+    if os.path.exists(bt_path):
+        os.remove(bt_path)
+    subprocess.run(['python', 'tools/adt-add-bluetooth.py', adt_path, bt_path, os.environ['SWEETBT']], check=True)
+    adt_path = bt_path
+
 print("\n2. Packaging SWEETXNU payload...")
 subprocess.run(['python', 'tools/mkpayload.py', kernel_path, adt_path, 'build/a71_payload.bin', '--cmdline', cmdline], check=True)
 

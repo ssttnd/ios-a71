@@ -1,0 +1,31 @@
+--- a/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.cpp
++++ b/iokit/Kernel/arm/unixnu/NativeAdrenoUserClient.cpp
+@@ -75,7 +75,10 @@
+     if(queue_base%NativeAdrenoAbiMaxQueues || queue_base>UINT32_MAX-NativeAdrenoAbiMaxQueues || (window_start&4095) || (window_bytes&4095) ||
+         (window_bytes && (window_start+window_bytes<window_start || window_start+window_bytes>(UINT64_C(1)<<input_bits_))))
+         return kIOReturnBadArgument;
+-    if(liveObjects() || submit_->rangeOutstanding(queue_base_,NativeAdrenoAbiMaxQueues) ||
++    /* 0202: a client that was just opened still has base 0, the compositor's range. Those jobs are
++       not this client's: asking about them refused every extra client while backboardd had a frame
++       in flight. */
++    if(liveObjects() || (queue_base_ && submit_->rangeOutstanding(queue_base_,NativeAdrenoAbiMaxQueues)) ||
+         submit_->rangeOutstanding(queue_base,NativeAdrenoAbiMaxQueues))return kIOReturnBusy;
+     queue_base_=queue_base;window_start_=window_start;window_bytes_=window_bytes;window_peak_=0;
+     return kIOReturnSuccess;
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -274,7 +274,13 @@
+  if(!error)error=core_->attachTimer(&backend.timer);
+  if(!error)error=core_->attachStatus(&backend.status);
+  if(!error)error=core_->attachDeviceInfo(&info_);
+- if(error) {if(core_->close()!=kIOReturnSuccess)backend.lost=true;return false;}
++ if(error) {
++  /* 0202: the same base 0 question can refuse this close. That says nothing about the GPU: wait for
++     the compositor's work and close again; only a real failure counts as lost. */
++  IOLog("SWEET RENDER: extra client setup failed %#x slot=%u\n",error,slot);
++  if(core_->close()!=kIOReturnSuccess && (quiesce()!=kIOReturnSuccess || core_->close()!=kIOReturnSuccess))backend.lost=true;
++  return false;
++ }
+  mounted_=true;return true;
+ }
+ IOReturn AGXAccelerator::newUserClient(task_t task,void *securityID,UInt32 type,
