@@ -1,0 +1,45 @@
+diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
+--- a/phone/wifi/wland.c
++++ b/phone/wifi/wland.c
+@@ -22,6 +22,8 @@
+ #include <fcntl.h>
+ #include <pthread.h>
+ #include <stdio.h>
++#include <sys/resource.h>
++#include <sys/wait.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+@@ -873,6 +875,32 @@
+ 		dup2(fileno(stdout), 2);
+ 	setvbuf(stdout, NULL, _IONBF, 0);
+ 	printf("wland auto: boot %ld, memory limit 2048 MB -> %d\n", (long)bt.tv_sec, mrc);
++	/*
++	 * A71 (0024): three times wland ended 2 minutes into a busy link with no crash line, no summary and no caught
++	 * signal: SIGKILL, which only the jetsam kills and a few others send. A parent stays behind and prints how the
++	 * child ended; the child asks for jetsam priority CRITICAL (190) like the daemons the phone needs.
++	 */
++	{
++		pid_t child = fork();
++		if (child > 0) {
++			int status = 0;
++			struct rusage ru;
++			memset(&ru, 0, sizeof(ru));
++			while (wait4(child, &status, 0, &ru) < 0 && errno == EINTR)
++				;
++			if (WIFSIGNALED(status))
++				printf("wland auto: the radio process %d ended by signal %d; max resident %ld KB, cpu %ld s\n", child,
++				       WTERMSIG(status), (long)ru.ru_maxrss / 1024, (long)ru.ru_utime.tv_sec + (long)ru.ru_stime.tv_sec);
++			else
++				printf("wland auto: the radio process %d exited with %d\n", child, WEXITSTATUS(status));
++			return 1;
++		}
++		if (child < 0)
++			printf("wland auto: no watching parent (fork: %s)\n", strerror(errno));
++		struct { int32_t priority; uint64_t user_data; } prio = { 190, 0 };
++		int pr = memorystatus_control(2, getpid(), 0, &prio, sizeof(prio));
++		printf("wland auto: jetsam priority 190 -> %d\n", pr);
++	}
+ 	/* 0017: the owner gets out of a boot loop himself, and the guard kept skipping good boots after quick trips
+ 	   to TWRP. It only logs now; sweetwlanguard=1 brings the skip back. */
+ 	if (!access(WLAND_TRY, F_OK))
