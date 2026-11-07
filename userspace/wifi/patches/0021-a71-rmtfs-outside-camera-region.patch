@@ -1,0 +1,17 @@
+diff --git a/phone/wifi/rmtfs.c b/phone/wifi/rmtfs.c
+--- a/phone/wifi/rmtfs.c
++++ b/phone/wifi/rmtfs.c
+@@ -19,7 +19,12 @@
+ #include "scm.h"
+ 
+ #define RMTFS_DIR	"/var/local/fw/rmtfs"
+-#define RMTFS_PA	0xE1000000ull	/* below 4 GB: see rmtfs_init */
++/*
++ * A71 (0021): 0xE1000000 is inside Samsung's camera_mem_region (0xc2000000-0xe7800000, live DT), like radio.c's old
++ * pool. The modem reads and writes this buffer; boots reset during rmtfs work (2026-11-07). Above radio.c's pool
++ * (0xF0000000 + 16 MB), still below 4 GB, in RAM the DT reserves for nobody.
++ */
++#define RMTFS_PA	0xF2000000ull	/* below 4 GB: see rmtfs_init */
+ #define BUF_SIZE	0x200000u
+ #define SECTOR		512
+ 
