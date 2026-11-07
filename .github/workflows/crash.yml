@@ -1,0 +1,31 @@
+name: sweet-crash
+# Symbolicate SWEET console crash lines (tools/crash-input.txt) against the iPhone X iOS 16.7.x
+# shared cache, fetched by ipsw straight from Apple's server (only the cache, not the whole IPSW).
+on:
+  workflow_dispatch:
+  push:
+    branches: [a71-gpu]
+    paths: [tools/crash-input.txt, .github/workflows/crash.yml]
+jobs:
+  symbolicate:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ipsw
+        run: brew install blacktop/tap/ipsw
+      - name: Fetch the shared cache (iPhone10,3, build 20H392)
+        run: |
+          mkdir -p dsc && cd dsc
+          ipsw download ipsw --device iPhone10,3 --build 20H392 --dyld --dyld-arch arm64 --confirm || \
+            ipsw download ipsw --device iPhone10,3 --build 20H392 --dyld --confirm
+          find . -name 'dyld_shared_cache_arm64*' | head
+      - name: Symbolicate
+        run: |
+          cache=$(find "$PWD/dsc" -name dyld_shared_cache_arm64 -type f | head -1)
+          echo "cache: $cache"
+          python3 tools/sweet-crash.py "$cache" none tools/crash-input.txt | tee crash-symbolicated.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crash-symbolicated
+          path: crash-symbolicated.txt
