@@ -1,15 +1,14 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -240,6 +240,8 @@
+@@ -240,6 +240,7 @@
  	/* 0131 hardware: presents averaged 15-66ms (max 247ms) once submits were
  	 * cheap; split them so the remaining cap is measured. */
  	uint64_t      fStatsGateUs, fStatsAcquireUs, fStatsCopyUs, fStatsSwaps;
 +	uint32_t      fPresentedSwap; /* 0197: swap id of the last frame copied to the panel */
-+	bool          fPresentCopying;
  	uint32_t      fPendingFence, fPresentFence;   /* newest GPU fence when SwapEnd recorded the frame */
  	/* Beam-raced copy (0144): the DSC video-mode panel scans this single
  	 * buffer continuously, so a copy that starts behind the scan line tears
-@@ -849,6 +851,11 @@
+@@ -849,6 +850,11 @@
  		}
  		const uint64_t began = mach_absolute_time();
  		fb->present(fb->fPresentRec);
@@ -21,7 +20,7 @@
  		uint64_t ns = 0;
  		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
  		const uint64_t us = ns / NSEC_PER_USEC;
-@@ -1691,7 +1698,39 @@
+@@ -1691,7 +1697,39 @@
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
