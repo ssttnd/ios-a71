@@ -335,6 +335,19 @@ air2nir = executable(""")
     p.write_text(s)
     p=air/'air_metal.c';s=p.read_text()
     s=replace(s,'[RWA_MIP_NOT_MIPMAPPED] = PIPE_TEX_MIPFILTER_NONE,','[RWA_MIP_NOT_MIPMAPPED] = PIPE_TEX_MIPFILTER_LINEAR,')
+    # A71 (2026-11-08): the App Library blur still shows ~10 px blocks, a small texture magnified
+    # nearest. SWEET_FORCE_LINEAR=1 (in /private/var/local/sweet-native-env) makes every sampler,
+    # API and constexpr alike (both pass here), filter linearly; off by default, an experiment.
+    s=replace(s,'''      .min_img_filter = st->min_filter == RWA_FILTER_LINEAR ? PIPE_TEX_FILTER_LINEAR
+                                                            : PIPE_TEX_FILTER_NEAREST,
+      .mag_img_filter = st->mag_filter == RWA_FILTER_LINEAR ? PIPE_TEX_FILTER_LINEAR
+                                                            : PIPE_TEX_FILTER_NEAREST,''','''      .min_img_filter = (st->min_filter == RWA_FILTER_LINEAR || ({ static int sweet_fl = -1;
+                            if (sweet_fl < 0) { const char *e = getenv("SWEET_FORCE_LINEAR");
+                               sweet_fl = e && e[0] == '1'; }
+                            sweet_fl; })) ? PIPE_TEX_FILTER_LINEAR : PIPE_TEX_FILTER_NEAREST,
+      .mag_img_filter = (st->mag_filter == RWA_FILTER_LINEAR ||
+                         (getenv("SWEET_FORCE_LINEAR") && getenv("SWEET_FORCE_LINEAR")[0] == '1'))
+                           ? PIPE_TEX_FILTER_LINEAR : PIPE_TEX_FILTER_NEAREST,''')
     # The progressive blur shows blocks the size of a texel of the smallest level, so that pass
     # filters it as nearest. Only the variable blur uses mip levels: give any stage that reads such
     # a texture linear filtering between texels and levels, whichever samplers it asked for.
