@@ -62,6 +62,69 @@ struct pmem_smc {
 #define IMEM_RESTART_REASON	0x146aa65cull	/* DT qcom,msm-imem@146aa000 restart_reason@65c */
 #define RESTART_RECOVERY	0x77665502u	/* what Linux on Qualcomm writes for "reboot recovery" */
 #define PSCI_SYSTEM_RESET	0x84000009u
+/* SPMI PMIC arbiter v5 (DT qcom,spmi@c440000: core, chnls, obsrvr, intr, cnfg) */
+#define SPMI_CORE	0x0c440000ull
+#define SPMI_CHNLS	0x0c600000ull	/* read/write channel of APID n at + 0x10000 * n */
+#define SPMI_CNFG	0x0c40a000ull
+#define PON_SOFT_RB_SPARE	0x88f	/* PM6150 (SID 0) PON + 0x8f: restart reason in bits 7:1, recovery = 1 */
+static int pm_fd(void);
+static int pm_rd32(uint64_t pa, uint32_t *v);
+
+static int spmi_apid(unsigned sid, unsigned addr, int *owned)
+{
+	uint32_t n = 0;
+	if (pm_rd32(SPMI_CORE + 4, &n))
+		return -1;
+	n &= 0x7ff;
+	unsigned ppid = (sid << 8) | (addr >> 8);
+	int found = -1;
+	for (unsigned i = 0; i < n && i < 512; i++) {
+		uint32_t map = 0, own = 7;
+		if (pm_rd32(SPMI_CORE + 0x900 + 4ull * i, &map) || !map || ((map >> 8) & 0xfff) != ppid)
+			continue;
+		pm_rd32(SPMI_CNFG + 0x700 + 4ull * i, &own);
+		if (found < 0 || (own & 7) == 0) {
+			found = (int)i;
+			*owned = (own & 7) == 0;
+		}
+	}
+	return found;
+}
+
+/* one byte; write = 1 only on an APID the apps EE owns. 0 or an errno */
+static int spmi_xfer(unsigned sid, unsigned addr, int write, uint8_t *val)
+{
+	int owned = 0, apid = spmi_apid(sid, addr, &owned);
+	if (apid < 0)
+		return ENOENT;
+	if (write && !owned)
+		return EPERM;
+	uint64_t ch = SPMI_CHNLS + 0x10000ull * (unsigned)apid;
+	if (write) {
+		uint32_t d = *val;
+		if (pwrite(pm_fd(), &d, 4, (off_t)(ch + 0x10)) != 4)
+			return EIO;
+	}
+	uint32_t cmd = ((write ? 0u : 1u) << 27) | ((addr & 0xffu) << 4);
+	if (pwrite(pm_fd(), &cmd, 4, (off_t)ch) != 4)
+		return EIO;
+	for (int i = 0; i < 1000; i++) {
+		uint32_t st = 0;
+		pm_rd32(ch + 0x08, &st);
+		if (st & 1) {
+			if (st & 0x0e)
+				return EIO;
+			if (!write) {
+				uint32_t d = 0;
+				pm_rd32(ch + 0x18, &d);
+				*val = (uint8_t)d;
+			}
+			return 0;
+		}
+		usleep(10);
+	}
+	return ETIMEDOUT;
+}
 
 static char key[129];
 static int listen_fd = -1;
@@ -431,7 +494,15 @@ static void handle(int fd)
 		}
 		uint32_t back = 0;
 		pm_rd32(IMEM_RESTART_REASON, &back);
-		say(fd, "OK restart reason %#x, syncing and resetting\n", back);
+		/* the PMIC's copy, which the bootloader reads on newer Qualcomm parts */
+		uint8_t sp = 0;
+		int e1 = spmi_xfer(0, PON_SOFT_RB_SPARE, 0, &sp);
+		uint8_t nv = (uint8_t)((sp & 1) | (rec ? 1u << 1 : 0));
+		int e2 = e1 ? e1 : spmi_xfer(0, PON_SOFT_RB_SPARE, 1, &nv);
+		uint8_t sp2 = 0;
+		spmi_xfer(0, PON_SOFT_RB_SPARE, 0, &sp2);
+		say(fd, "OK restart reason %#x; PON spare %#x -> %#x (%s), syncing and resetting\n", back, sp, sp2,
+		    e2 ? strerror(e2) : "written");
 		close(fd);
 		sync();
 		sleep(1);
@@ -440,6 +511,15 @@ static void handle(int fd)
 		ioctl(pm_fd(), PMEM_SMC, &s);
 		printf("sweetdbg: PSCI reset returned %#llx\n", (unsigned long long)s.x[0]);
 		return;
+	} else if (!strcmp(c, "spmi") && (na == 3 || na == 4)) {
+		/* spmi r SID ADDR | spmi w SID ADDR VALUE (owned channels only) */
+		int w = !strcmp(a[0], "w");
+		uint8_t v = na == 4 ? (uint8_t)strtoul(a[3], NULL, 0) : 0;
+		int e = spmi_xfer((unsigned)strtoul(a[1], NULL, 0), (unsigned)strtoul(a[2], NULL, 0), w, &v);
+		if (e)
+			say(fd, "ERR %s\n", strerror(e));
+		else
+			say(fd, "OK %#x\n", v);
 	} else if (!strcmp(c, "sysctl") && na == 1)
 		cmd_sysctl(fd, a[0]);
 	else if (!strcmp(c, "restart")) {
