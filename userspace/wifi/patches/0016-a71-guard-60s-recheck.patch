@@ -1,0 +1,24 @@
+diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
+--- a/phone/wifi/wland.c
++++ b/phone/wifi/wland.c
+@@ -731,7 +731,7 @@
+  * boot, so wland stays out and iOS comes up. sweetwlanretry=1 ignores it.
+  */
+ #define WLAND_TRY	"/var/local/wland.try"
+-#define WLAND_TRY_SECS	300
++#define WLAND_TRY_SECS	60	/* 0016: the restarts came 20-30 s in; 300 s caught every quick trip to TWRP */
+ static void *try_over(void *arg)
+ {
+ 	(void)arg;
+@@ -784,6 +784,11 @@
+ 		dup2(fileno(stdout), 2);
+ 	setvbuf(stdout, NULL, _IONBF, 0);
+ 	printf("wland auto: boot %ld, memory limit 2048 MB -> %d\n", (long)bt.tv_sec, mrc);
++	/* 0016: a package applied 10 s after the root mount may remove an old mark: look again a little later */
++	if (!access(WLAND_TRY, F_OK) && !strstr(args, "sweetwlanretry=1")) {
++		printf("wland auto: %s is there; looking again in 20 s\n", WLAND_TRY);
++		sleep(20);
++	}
+ 	if (!access(WLAND_TRY, F_OK) && !strstr(args, "sweetwlanretry=1")) {
+ 		printf("wland auto: the last try ended that boot (%s is there): staying out\n", WLAND_TRY);
+ 		return 0;
