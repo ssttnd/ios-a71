@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
   push:
     branches: [a71-gpu]
-    paths: [userspace/audio/**, .github/workflows/audio.yml]
+    paths: [userspace/audio/**, userspace/debug/**, .github/workflows/audio.yml]
 env:
   DONOR_REPO: https://github.com/Yofuness/ios-flame.git
   DONOR_COMMIT: 9bb3f5e1f776fc091a7a3df3d4e05092e1e85919
@@ -36,11 +36,12 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -Wextra -Wno-gnu-conditional-omitted-operand \
             -o "$out/tasprobe" userspace/audio/tasprobe.c
-          for f in adspboot tasprobe; do
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -Wextra -o "$out/sweetdbg" userspace/debug/sweetdbg.c
+          for f in adspboot tasprobe sweetdbg; do
             codesign --force --sign - --pagesize 4096 "$out/$f"
             codesign --verify --strict "$out/$f"
           done
-          (cd "$out" && shasum -a 256 adspboot tasprobe > SHA256SUMS)
+          (cd "$out" && shasum -a 256 adspboot tasprobe sweetdbg > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
           name: sweet-audio-ios16

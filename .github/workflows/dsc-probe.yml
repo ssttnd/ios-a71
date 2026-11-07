@@ -1,0 +1,32 @@
+name: sweet-dsc-probe
+# Wallpapers: find what QuartzCore checks before "unsupported extended range format" (AegirPoster's
+# CAMetalLayerInvalid) and what -[NUDevice_iOS initWithName:] asserts on (PhotosPosterProvider), in the
+# iPhone X iOS 16.7 shared cache, so the Metal frontend can answer exactly those questions.
+on:
+  workflow_dispatch:
+  push:
+    branches: [a71-gpu]
+    paths: [tools/dsc-probe.sh, .github/workflows/dsc-probe.yml]
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ipsw
+        run: brew install blacktop/tap/ipsw
+      - name: Fetch the shared cache (iPhone10,3, build 20H392)
+        run: |
+          mkdir -p dsc && cd dsc
+          ipsw download ipsw --device iPhone10,3 --build 20H392 --dyld --dyld-arch arm64 --confirm || \
+            ipsw download ipsw --device iPhone10,3 --build 20H392 --dyld --confirm
+      - name: Probe
+        run: |
+          cache=$(find "$PWD/dsc" -name dyld_shared_cache_arm64 -type f | head -1)
+          bash tools/dsc-probe.sh "$cache" 2>&1 | tee dsc-probe.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsc-probe
+          path: |
+            dsc-probe.txt
+            probe/

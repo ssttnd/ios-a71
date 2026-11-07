@@ -1,0 +1,61 @@
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -36,6 +36,7 @@
+ #include <libkern/libkern.h>
+ #include <sys/errno.h>
+ #include <sys/kern_event.h>
++#include <pexpert/pexpert.h>	/* 0210 */
+ #include <sys/kernel.h>
+ #include <sys/proc.h>
+ #include <sys/redwood_input.h>
+@@ -193,7 +194,7 @@
+ 
+ /* Apple80211's events (APPLE80211_M_...) */
+ enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
+-       EVENT_SCAN_DONE = 10 };
++       EVENT_SCAN_DONE = 10, EVENT_LINK_QUALITY = 17 /* 0210 */ };
+ 
+ static const char interface_name[16] = "en0";   /* (bsd/dev/redwood_net.c makes one interface, and that is its name) */
+ 
+@@ -697,12 +698,39 @@
+ 	case REDWOOD_STA_POWER:
+ 		post(EVENT_POWER_CHANGED, NULL, 0);
+ 		break;
+-	case REDWOOD_STA_SCAN_DONE:
++	case REDWOOD_STA_SCAN_DONE: {
+ 		lck_mtx_lock(&apple80211_lock);
+ 		result_next = 0;
+ 		lck_mtx_unlock(&apple80211_lock);
+ 		post(EVENT_SCAN_DONE, NULL, 0);
+-		break;
++		/*
++		 * 0210: wave35, the status bar kept one bar (the -76 dBm of the join's link event) while Settings, from
++		 * fresh scans, drew two: after the join wifid never asks RSSI (16) again. While joined, each scan (the
++		 * background ones refresh state->bss.rssi, 0204) is followed by a link-quality event carrying the link
++		 * event's layout with the current signal. sweetrssievt=0 turns it off.
++		 */
++		static int lq_on = -1;
++		if (lq_on < 0) {
++			lq_on = 1;
++			(void)PE_parse_boot_argn("sweetrssievt", &lq_on, sizeof(lq_on));
++		}
++		struct redwood_sta_state *state = lq_on ? kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO) : NULL;
++		if (state != NULL) {
++			redwood_sta_state(state);
++			if (state->phase == REDWOOD_STA_JOINED) {
++				struct apple80211_link_changed lq = { .rssi = state->bss.rssi, .noise = (uint16_t)(int16_t)-95,
++					.snr = state->bss.rssi > -95 && state->bss.rssi < 0 ? (uint16_t)(state->bss.rssi + 95) : 0 };
++				static unsigned lq_said;
++				if (lq_said < 20) {
++					lq_said++;
++					printf("apple80211: link quality event, rssi %d\n", state->bss.rssi);
++				}
++				post(EVENT_LINK_QUALITY, &lq, sizeof(lq));
++			}
++			kfree_data(state, sizeof(*state));
++		}
++		break;
++	}
+ 	case REDWOOD_STA_JOIN_DONE:
+ 		lck_mtx_lock(&apple80211_lock);
+ 		join_result = status == 0 ? 1 : status == EAUTH ? 21 : status == ETIMEDOUT ? 9 : 2;

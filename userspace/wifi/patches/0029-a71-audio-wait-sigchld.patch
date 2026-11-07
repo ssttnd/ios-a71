@@ -1,7 +1,26 @@
 diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
 --- a/phone/wifi/wland.c
 +++ b/phone/wifi/wland.c
-@@ -715,10 +715,9 @@
+@@ -707,6 +707,18 @@
+ 	return e ? -1 : pid;
+ }
+ 
++/* 0029: the remote debugging server (userspace/debug/sweetdbg.c), once per wland, if installed */
++static void debug_start(void)
++{
++	static int done;
++	if (done)
++		return;
++	done = 1;
++	char *av[] = { "/var/local/bin/sweetdbg", NULL };
++	if (access(av[0], X_OK) == 0)
++		audio_spawn(av);
++}
++
+ static void audio_poll(void)
+ {
+ 	static int state;	/* 0 waiting, 1 adspboot running, 2 done */
+@@ -715,10 +727,9 @@
  	uint64_t now = link_ms();
  	if (state == 2)
  		return;
@@ -15,7 +34,7 @@ diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
  			state = 2;
  		}
  		return;
-@@ -735,6 +734,7 @@
+@@ -735,6 +746,7 @@
  		return;
  	}
  	char *probe[] = { "/var/local/bin/tasprobe", NULL };
@@ -23,7 +42,7 @@ diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
  	pid_t p = access(probe[0], X_OK) ? -1 : audio_spawn(probe);
  	for (int i = 0; p > 0 && i < 200; i++) {
  		int st = 0;
-@@ -750,6 +750,7 @@
+@@ -750,6 +762,7 @@
  		kill(p, SIGKILL);
  		waitpid(p, NULL, 0);
  	}
@@ -31,3 +50,11 @@ diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
  	static char buf[256];
  	char *av[24] = { "/var/local/bin/adspboot" };
  	int ac = 1, fd = open("/var/local/adspboot.args", O_RDONLY);
+@@ -790,6 +803,7 @@
+ 	bridge_poll();
+ 	join_poll();
+ 	audio_poll();	/* 0028 */
++	debug_start();	/* 0029 */
+ }
+ 
+ /* A71 (0025): wave26 ended by SIGTERM about a minute into a busy link, parent and child alike. Say who sent it, live on. */

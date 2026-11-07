@@ -1,0 +1,38 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -76,6 +76,17 @@
+ };
+ #define PMEM_RPMH       _IOW('P', 5, struct pmem_rpmh)
+ extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets, const uint32_t *values);
++/*
++ * 0209: input injection for remote debugging (userspace/debug/sweetdbg.c), root only like the rest of /dev/pmem.
++ * kind 0: touch, a = finger (0..9), b = down, c/d = panel x/y (1080x2400); kind 1: button, a = 0 power,
++ * 1 volume up, 2 volume down, 3 home, b = down. Same entry points as the touch and key drivers.
++ */
++struct pmem_inject {
++	int32_t kind, a, b, c, d;
++};
++#define PMEM_INJECT     _IOW('P', 7, struct pmem_inject)
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_hid_key(int key, int down);
+ 
+ #define PMEM_MAPS       16              /* 2 MB device windows, round robin */
+ #define PMEM_WIN        0x200000ULL
+@@ -339,6 +350,17 @@
+ 		printf("SWEET PMEM: rpmh %s %u cmds (%#x=%u ...) -> %d\n", r->res, r->n, r->offset[0], r->value[0], err);
+ 		return err;
+ 	}
++	if (cmd == PMEM_INJECT) {
++		const struct pmem_inject *in = (const struct pmem_inject *)data;
++		if (in->kind == 0 && in->a >= 0 && in->a < 10) {
++			sweet_hid_touch(in->a, in->b, in->c, in->d);
++		} else if (in->kind == 1 && in->a >= 0 && in->a < 4) {
++			sweet_hid_key(in->a, in->b);
++		} else {
++			return EINVAL;
++		}
++		return 0;
++	}
+ 	lck_mtx_lock(&sweet_pmem_lock);
+ 	switch (cmd) {
+ 	case PMEM_ALLOC:
