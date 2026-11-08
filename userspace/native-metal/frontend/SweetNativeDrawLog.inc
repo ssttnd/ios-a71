@@ -259,3 +259,17 @@ native_drawlog_detail(unsigned seq, const void *render, id color0, unsigned star
 		}
 	}
 }
+
+/* A71: with /var/local/sweet-stderr present, the process's stderr goes to a file from load time (shaders compile before
+ * the draw log can be armed; set IR3_SHADER_DEBUG=disasm in sweet-native-env to see them). */
+__attribute__((constructor)) static void
+native_early_stderr(void)
+{
+	if (access("/var/local/sweet-stderr", F_OK) != 0)
+		return;
+	int fd = open("/var/tmp/sweet-stderr.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd >= 0) {
+		dup2(fd, 2);
+		close(fd);
+	}
+}
