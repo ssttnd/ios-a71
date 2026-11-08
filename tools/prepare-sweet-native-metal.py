@@ -402,6 +402,38 @@ air2nir = executable(""")
          }
       }
    }
+   /* A71 blur (mip dump 2026-11-08): the passes that render level N of a texture while sampling the same texture read
+      level 0 instead of N-1, so the chain was decimated, not filtered. A view holding only level N-1 fixes that whatever
+      LOD the shader asks for, and it is also the only level such a pass may legally read. */
+   if (device->native_rt_tex && device->native_rt_level > 0) {
+      for (unsigned i = 0; i < num_views; i++) {
+         if (!views[i] || views[i]->texture != device->native_rt_tex)
+            continue;
+         const unsigned want = device->native_rt_level - 1;
+         struct pipe_sampler_view *v = NULL;
+         for (unsigned c = 0; c < ARRAY_SIZE(device->native_level_views); c++) {
+            if (device->native_level_views[c].tex == views[i]->texture && device->native_level_views[c].level == want)
+               v = device->native_level_views[c].view;
+         }
+         if (!v) {
+            struct pipe_sampler_view tmpl = *views[i];
+            tmpl.u.tex.first_level = want;
+            tmpl.u.tex.last_level = want;
+            v = pipe->create_sampler_view(pipe, views[i]->texture, &tmpl);
+            if (v) {
+               unsigned c = device->native_level_next++ % ARRAY_SIZE(device->native_level_views);
+               struct pipe_sampler_view *old = device->native_level_views[c].view;
+               if (old && p_atomic_dec_zero(&old->reference.count))
+                  pipe->sampler_view_destroy(pipe, old);
+               device->native_level_views[c].view = v;
+               device->native_level_views[c].tex = views[i]->texture;
+               device->native_level_views[c].level = want;
+            }
+         }
+         if (v)
+            views[i] = v;
+      }
+   }
    if (native_mipped) {
       if (!device->native_mip_sampler) {
          device->native_mip_sampler = pipe->create_sampler_state(pipe, &(struct pipe_sampler_state){
@@ -630,6 +662,11 @@ native_render_surface(struct rwa_texture *texture, unsigned level)
    unsigned native_pending_views[PIPE_SHADER_TYPES], native_pending_images[PIPE_SHADER_TYPES];
    unsigned native_pending_samplers[PIPE_SHADER_TYPES];
    struct pipe_framebuffer_state batch_fb;
+   /* A71 blur: colour attachment 0 of the current pass, and one-level views of it (see bind_stage) */
+   struct pipe_resource *native_rt_tex;
+   unsigned native_rt_level;
+   struct { struct pipe_sampler_view *view; struct pipe_resource *tex; unsigned level; } native_level_views[12];
+   unsigned native_level_next;
    struct rwa_constant constants[3][256];
    unsigned constant_count[3];''')
     s=replace(s,'/* PRINTFLIKE,', '''static unsigned native_constants(struct rwa_device *, unsigned, void *, const void *,
@@ -782,7 +819,9 @@ bind_stage(''')
                 '   int rc = device->in_command ? 0 : finish_or_say_why(device, true, "dispatch", why, why_size);')
     s=replace(s,'   rc = finish_or_say_why(device, true, "draw", why, why_size);',
                 '   rc = device->in_command ? 0 : finish_or_say_why(device, true, "draw", why, why_size);')
-    s=replace(s,'   pipe->set_framebuffer_state(pipe, &fb);', '''   bool same = device->in_command && device->batch_fb.width == fb.width &&
+    s=replace(s,'   pipe->set_framebuffer_state(pipe, &fb);', '''   device->native_rt_tex = fb.cbufs[0] ? fb.cbufs[0]->texture : NULL;
+   device->native_rt_level = fb.cbufs[0] ? fb.cbufs[0]->u.tex.level : 0;
+   bool same = device->in_command && device->batch_fb.width == fb.width &&
       device->batch_fb.height == fb.height && device->batch_fb.samples == fb.samples &&
       device->batch_fb.nr_cbufs == fb.nr_cbufs;
    for (unsigned i=0; same && i<fb.nr_cbufs; i++)
