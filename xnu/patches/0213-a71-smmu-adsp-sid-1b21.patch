@@ -1,0 +1,22 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -1206,14 +1206,15 @@
+ 		sweet_smmu_wlan_stream(smmu, id0, id1);
+ 	}
+ 	/*
+-	 * 0211: the audio DSP's buffers (LPASS puts the stream's low bits in DMA address bits 32-35: an address below
+-	 * 4 GB is SID 0x1b20). Translation off, so the DSP reads physical memory; adspboot --pcm-pa uses a buffer below
+-	 * 4 GB and never touches the SMMU. sweetsmmuadsp=0 leaves it out.
++	 * 0211/0213: the audio DSP's buffers. LPASS puts the stream's low bits in DMA address bits 32-35; the DT's
++	 * msm-audio-ion stream is 0x1b21 (0x1b20 was refused: the SMR read back 0), so bits 35:32 = 1. Translation off:
++	 * a /dev/pmem buffer at 0x1xxxxxxxx is its own DSP address (adspboot --pcm-pa alloc, no SMMU access there).
++	 * sweetsmmuadsp=0 leaves it out.
+ 	 */
+ 	int adsp = 1;
+ 	PE_parse_boot_argn("sweetsmmuadsp", &adsp, sizeof(adsp));
+ 	if (adsp) {
+-		sweet_smmu_identity_stream(smmu, id0, id1, "ADSP audio", 0x1b20, 0x0);
++		sweet_smmu_identity_stream(smmu, id0, id1, "ADSP audio", 0x1b21, 0x0);
+ 	}
+ 	sweet_smmu_dump_mdss(smmu, id0, id1);
+ }
