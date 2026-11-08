@@ -1,0 +1,67 @@
+diff --git a/phone/wifi/wland.c b/phone/wifi/wland.c
+--- a/phone/wifi/wland.c
++++ b/phone/wifi/wland.c
+@@ -719,17 +719,28 @@
+ 		audio_spawn(av);
+ }
+ 
++#define ADSP_TRY "/var/local/adsp.try"	/* 0030 */
+ static void audio_poll(void)
+ {
+ 	static int state;	/* 0 waiting, 1 adspboot running, 2 done */
+ 	static uint64_t t0;
+ 	static pid_t dsp = -1;
++	static uint64_t started;	/* 0030 */
++	static int tried;
+ 	uint64_t now = link_ms();
+ 	if (state == 2)
+ 		return;
+ 	if (state == 1) {	/* 0029: SIGCHLD is ignored here, so adspboot reaps itself; only notice that it is gone */
++		if (tried && now - started > 120000) {
++			tried = 0;
++			unlink(ADSP_TRY);
++			printf("audio: adspboot survived 2 minutes: the guard is cleared\n");
++		}
+ 		if (kill(dsp, 0) && errno == ESRCH) {
+ 			printf("audio: adspboot ended\n");
++			if (tried)
++				unlink(ADSP_TRY);
++			tried = 0;
+ 			state = 2;
+ 		}
+ 		return;
+@@ -743,6 +754,16 @@
+ 	state = 2;
+ 	if (access("/var/local/adsp-off", F_OK) == 0) {
+ 		printf("audio: /var/local/adsp-off exists: not started\n");
++		return;
++	}
++	/*
++	 * 0030: an audio start that resets the phone would loop for ever, and it runs before Wi-Fi can be reached (2026-11-08).
++	 * The file exists only while a start is in its first 2 minutes: found at boot, that start took the phone down: skip
++	 * this boot (and remove it, so the next boot tries again).
++	 */
++	if (access(ADSP_TRY, F_OK) == 0) {
++		unlink(ADSP_TRY);
++		printf("audio: the last start did not survive 2 minutes: skipped for this boot\n");
+ 		return;
+ 	}
+ 	char *probe[] = { "/var/local/bin/tasprobe", NULL };
+@@ -779,9 +800,16 @@
+ 		printf("audio: no %s\n", av[0]);
+ 		return;
+ 	}
++	close(open(ADSP_TRY, O_WRONLY | O_CREAT, 0644));
++	sync();
+ 	dsp = audio_spawn(av);
+-	if (dsp > 0)
++	if (dsp > 0) {
+ 		state = 1;
++		tried = 1;
++		started = now;
++	} else {
++		unlink(ADSP_TRY);
++	}
+ }
+ 
+ static volatile sig_atomic_t drop_asked;
