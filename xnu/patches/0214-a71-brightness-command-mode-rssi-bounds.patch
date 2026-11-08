@@ -1,0 +1,78 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -414,7 +414,7 @@
+ #define DSI_REG_TPG_FIFO_RESET  0x1ec
+ #define DSI_REG_VERSION         0x1f4
+ #define SWEET_BL_MIN            8u
+-#define SWEET_BL_MAX            2047u
++#define SWEET_BL_MAX            1023u	/* 0214: S6E3FA9, DT gamma_mode2_tx_cmds ends 51 03 ff (was 2047, Xiaomi) */
+ #define SWEET_BL_SCALE          65536u
+ #define SWEET_BL_PEAK_MNITS     420000u   /* panel-peak-brightness 4200000 x 0.1 mnit */
+ 
+@@ -609,14 +609,53 @@
+ 	}
+ }
+ 
++/* 0214: DCS short write with one parameter (data id 0x15), once: 53 20 turns brightness control on (DT gamma_mode2_tx_cmds). */
++static void
++sweet_bl_write_control(volatile uint32_t *dsi)
++{
++	const uint32_t ctrl = dsi[DSI_REG_CTRL / 4], dma_ctrl = dsi[DSI_REG_DMA_CTRL / 4];
++	const uint32_t word = 0x53u | (0x20u << 8) | (0x15u << 16) | (0x80u << 24);
++	dsi[DSI_REG_CTRL / 4] = ctrl | (1u << 2);
++	dsi[DSI_REG_INT_CTRL / 4] = dsi[DSI_REG_INT_CTRL / 4] | 1u;
++	dsi[DSI_REG_TPG_CTRL / 4] = (1u << 1) | (1u << 2) | (3u << 16);
++	dsi[DSI_REG_TPG_DMA_DATA / 4] = word;
++	dsi[DSI_REG_DMA_CTRL / 4] = (dma_ctrl & ~((1u << 31) | (1u << 30))) | (1u << 26) | (1u << 28);
++	dsi[DSI_REG_DMA_LENGTH / 4] = sizeof(word);
++	__asm__ volatile("dsb sy" ::: "memory");
++	dsi[DSI_REG_DMA_TRIGGER / 4] = 1;
++	unsigned us;
++	for (us = 0; us < 50000 && !(dsi[DSI_REG_INT_CTRL / 4] & 1u); us += 50) {
++		IODelay(50);
++	}
++	const bool done = (dsi[DSI_REG_INT_CTRL / 4] & 1u) != 0;
++	if (done) {
++		dsi[DSI_REG_INT_CTRL / 4] = dsi[DSI_REG_INT_CTRL / 4] | 1u;
++	}
++	dsi[DSI_REG_TPG_CTRL / 4] = 0;
++	dsi[DSI_REG_TPG_FIFO_RESET / 4] = 1;
++	IODelay(1);
++	dsi[DSI_REG_TPG_FIFO_RESET / 4] = 0;
++	dsi[DSI_REG_DMA_CTRL / 4] = dma_ctrl;
++	if (!(ctrl & (1u << 2))) {
++		dsi[DSI_REG_CTRL / 4] = dsi[DSI_REG_CTRL / 4] & ~(1u << 2);
++	}
++	IOLog("SWEET BL: DCS 53 20 %s after %u us ack_err=%#x\n", done ? "sent" : "NOT acknowledged", us, dsi[DSI_REG_ACK_ERR / 4]);
++}
++
+ int
+ AppleARMBacklight::sendLevel(uint32_t level)
+ {
+ 	volatile uint32_t *dsi = fDsi;
+ 	const uint32_t ctrl = dsi[DSI_REG_CTRL / 4];
+-	if ((ctrl & 3) != 3) {
+-		IOLog("SWEET BL: DSI0 left video mode (ctrl=%#x); level %u not sent\n", ctrl, level);
++	/* 0214: was (ctrl & 3) != 3, video mode only: the A71 (ctrl 0x1f5, command mode) refused every level */
++	if (!(ctrl & 1) || !(ctrl & 6)) {
++		IOLog("SWEET BL: DSI0 is off (ctrl=%#x); level %u not sent\n", ctrl, level);
+ 		return ENODEV;
++	}
++	static bool control_on;
++	if (!control_on) {
++		control_on = true;
++		sweet_bl_write_control(dsi);
+ 	}
+ 	const uint32_t dma_ctrl = dsi[DSI_REG_DMA_CTRL / 4];
+ 	/* DCS long write: header {WC lsb, WC msb, data id 0x39, LAST|LONG}, then 0x51 hi lo, 0xff pad. */
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -400,7 +400,7 @@
+ 			uint32_t version;
+ 			int32_t low, high;
+ 			uint32_t unused;
+-		} answer = { .version = 1, .low = -100, .high = -60 };	/* 0212: was -90..-45 (1 bar at -78 dBm, Settings 2) */
++		} answer = { .version = 1, .low = -95, .high = -50 };	/* 0214: -90..-45 drew 1 bar at -78 dBm, -100..-60 always 3; Settings 2 */
+ 
+ 		return give(request, &answer, sizeof(answer));
+ 	}
