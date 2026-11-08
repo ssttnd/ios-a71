@@ -1,0 +1,14 @@
+diff --git a/phone/wifi/adspboot.c b/phone/wifi/adspboot.c
+--- a/phone/wifi/adspboot.c
++++ b/phone/wifi/adspboot.c
+@@ -3659,8 +3659,8 @@
+ 	}
+ 	if (rec_on)
+ 		rec_lead = REC_LEAD_PERIODS;
+-	if (amp_db > -20)
+-		amp_db = -20;	/* sp1: ceiling (cs_config clamps too) */
++	if (amp_db > -10)
++		amp_db = -10;	/* A71 2026-11-09: owner found -20 quiet; tas2562.c has the same ceiling */
+ 	atexit(lpi_restore);	/* sp2: runs after amp_off (atexit is LIFO) */
+ 	atexit(amp_off);	/* sp1: every exit path powers the amp down */
+ 	if (amp_check) {
