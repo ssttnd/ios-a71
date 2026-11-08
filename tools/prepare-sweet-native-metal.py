@@ -367,6 +367,27 @@ air2nir = executable(""")
       native_mipped |= views[i] && views[i]->texture && views[i]->texture->last_level > 0;
    /* A71 blur debugging: touch /var/local/sweet-mipdump; the next process start dumps the levels of the texture the
       variable blur reads (its second texture is the 1x366 mask), once, to /var/tmp/mip-N.raw (RGBA8 rows). */
+   /* The finished blur (676x238), read while the next draw samples it: ground truth for the shader's maths. */
+   for (unsigned i = 0; i < num_views; i++) {
+      static bool sweet_final_done;
+      if (sweet_final_done || !views[i] || !views[i]->texture || views[i]->texture->width0 != 676 ||
+          views[i]->texture->height0 != 238 || access("/var/local/sweet-mipdump", F_OK) != 0)
+         continue;
+      sweet_final_done = true;
+      struct pipe_transfer *xfer = NULL;
+      struct pipe_box box = { .width = 676, .height = 238, .depth = 1 };
+      void *m = pipe->texture_map(pipe, views[i]->texture, 0, PIPE_MAP_READ, &box, &xfer);
+      FILE *f = m ? fopen("/var/tmp/mip-final.raw", "wb") : NULL;
+      if (f) {
+         unsigned hdr[2] = { 676, 238 };
+         fwrite(hdr, sizeof(hdr), 1, f);
+         for (unsigned y = 0; y < 238; y++)
+            fwrite((const char *)m + y * xfer->stride, 4, 676, f);
+         fclose(f);
+      }
+      if (m)
+         pipe->texture_unmap(pipe, xfer);
+   }
    struct pipe_resource *sweet_mip_tex = NULL;
    bool sweet_mip_mask = false;
    for (unsigned i = 0; i < num_views; i++) {   /* CoreAnimation binds them at slots 3 and 4 */
@@ -439,7 +460,8 @@ air2nir = executable(""")
          device->native_mip_sampler = pipe->create_sampler_state(pipe, &(struct pipe_sampler_state){
             .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE, .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
             .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
-            .min_img_filter = PIPE_TEX_FILTER_LINEAR, .mag_img_filter = PIPE_TEX_FILTER_LINEAR,
+            .min_img_filter = access("/var/local/sweet-blur-nearest", F_OK) ? PIPE_TEX_FILTER_LINEAR : PIPE_TEX_FILTER_NEAREST,
+            .mag_img_filter = access("/var/local/sweet-blur-nearest", F_OK) ? PIPE_TEX_FILTER_LINEAR : PIPE_TEX_FILTER_NEAREST,
             .min_mip_filter = PIPE_TEX_MIPFILTER_LINEAR, .min_lod = 0.0f, .max_lod = 16.0f });
       }
       if (device->native_mip_sampler) {
