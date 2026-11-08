@@ -1,0 +1,26 @@
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -56,7 +56,9 @@
+  * configured iOS 16 wallpaper) aborts without one; sweetm2extra=0 disables. */
+ bool extra_client(const char *name)
+ {
+- static const char *const names[]={"AegirPoster"};
++ /* 0219: without a device PosterBoard dies in -[PBFHomeScreenPreviewImageBuilder _imageForView:] (nil command queue in
++  * the CARenderer options) and PhotosPosterProvider asserts in -[NUDevice_iOS initWithName:]. p_comm is 16 characters. */
++ static const char *const names[]={"AegirPoster","PosterBoard","PhotosPosterProv"};
+  for(const char *n:names)if(!strcmp(name,n))return true;
+  return false;
+ }
+@@ -291,7 +293,11 @@
+  if(type!=0x4147 || task!=current_task())return kIOReturnUnsupported;
+  char name[32]={};proc_selfname(name,sizeof name);
+  const bool compositor=!strcmp(name,"backboardd");
+- if(!compositor && !(backend.extra_slots && extra_client(name)))return kIOReturnNotPrivileged;
++ if(!compositor && !(backend.extra_slots && extra_client(name))) {
++  static unsigned refused=0;
++  if(refused<32) {++refused;IOLog("SWEET RENDER: %s asked for a Metal device: not on the list\n",name);}
++  return kIOReturnNotPrivileged;
++ }
+  IOLockLock(backend.lock);
+  static unsigned open_traces=0;
+  if(open_traces<16) {++open_traces;IOLog("SWEET RENDER: %s open type=%#x\n",name,type); }
