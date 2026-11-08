@@ -1,0 +1,13 @@
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -60,9 +60,8 @@
+   * the CARenderer options) and PhotosPosterProvider asserts in -[NUDevice_iOS initWithName:]. p_comm is 16 characters. */
+  /* 0221: proc_selfname gives the long name here ("PhotosPosterProvider"), so the 0219 entry never matched. The others
+   * are the processes the "not on the list" log named on 2026-11-08. */
+- static const char *const names[]={"SpringBoard","chronod","Spotlight","FitnessWidget"};
++ /* 0223: SpringBoard with a device dies in -[MPSImageGaussianBlur initWithDevice:] (no MPSDevice for this GPU), a boot loop. */
+  for(const char *p=name;*p;++p) {const char *a=p,*b="Poster";while(*b && *a==*b) {++a;++b;} if(!*b)return true;}
+- for(const char *n:names)if(!strcmp(name,n))return true;
+  return false;
+ }
+ // Release/acquire publishes the completed backend to the framebuffer workloop.
