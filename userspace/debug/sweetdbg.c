@@ -571,6 +571,13 @@ static void handle(int fd)
 			say(fd, "ERR %s\n", strerror(e));
 		else
 			say(fd, "OK\n");
+	} else if (!strcmp(c, "linkevt") && na == 1) {
+		/* linkevt 0|1: a link event when RSSI moves (kernel 0217) */
+		int e = inject(3, atoi(a[0]), 0, 0, 0);
+		if (e)
+			say(fd, "ERR %s\n", strerror(e));
+		else
+			say(fd, "OK\n");
 	} else if (!strcmp(c, "spmi") && (na == 3 || na == 4)) {
 		/* spmi r SID ADDR | spmi w SID ADDR VALUE (owned channels only) */
 		int w = !strcmp(a[0], "w");

@@ -1,0 +1,63 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1018,6 +1018,23 @@
+ 	IOLockUnlock(fLock);
+ 	__atomic_add_fetch(&fStatsSwaps, 1, __ATOMIC_RELAXED);
+ 	sweet_sched_tap_event(0);
++	/*
++	 * 0217: start the present now, not at the next timer tick. The frame sat here for up to 16.7 ms before the present
++	 * thread even began to wait for its fence, and with sweetswapwait CoreAnimation waits for that present: 30 frames
++	 * a second whatever the GPU clock (650 and 700 MHz measured the same). sweetpresentswap=0: back to the tick.
++	 */
++	{
++		static int at_swap = -1;
++		if (at_swap < 0) {
++			int v = 1;
++			PE_parse_boot_argn("sweetpresentswap", &v, sizeof(v));
++			at_swap = v != 0;
++			IOLog("SWEET FB: present %s\n", at_swap ? "at SwapEnd" : "at the vsync tick");
++		}
++		if (at_swap && fPresentThreaded) {
++			requestPresent();
++		}
++	}
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -194,6 +194,7 @@
+ 
+ /* 0215: RSSI_BOUNDS, set at run time (-90..-45 too few bars at -75 dBm, -95..-50 too few, -100..-60 too many) */
+ int redwood_rssi_low = -98, redwood_rssi_high = -55;
++int redwood_rssi_linkevt;	/* 0217: PMEM_INJECT kind 3 */
+ 
+ /* Apple80211's events (APPLE80211_M_...) */
+ enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
+@@ -723,6 +724,14 @@
+ 			if (state->phase == REDWOOD_STA_JOINED) {
+ 				struct apple80211_link_changed lq = { .rssi = state->bss.rssi, .noise = (uint16_t)(int16_t)-95,
+ 					.snr = state->bss.rssi > -95 && state->bss.rssi < 0 ? (uint16_t)(state->bss.rssi + 95) : 0 };
++				/* 0217: run time (sweetdbg linkevt 1): the status bar takes its bars from a link event, so send one when
++				 * the signal has moved by 3 dB. Off by default: wifid may do more than redraw on it. */
++				static int32_t lq_last;
++				if (redwood_rssi_linkevt && (state->bss.rssi - lq_last >= 3 || lq_last - state->bss.rssi >= 3)) {
++					lq_last = state->bss.rssi;
++					printf("apple80211: link event for rssi %d\n", state->bss.rssi);
++					post(EVENT_LINK_CHANGED, &lq, sizeof(lq));
++				}
+ 				static unsigned lq_said;
+ 				if (lq_said < 20) {
+ 					lq_said++;
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -362,6 +362,9 @@
+ 			redwood_rssi_low = in->a;
+ 			redwood_rssi_high = in->b;
+ 			printf("SWEET PMEM: RSSI bounds %d..%d\n", in->a, in->b);
++		} else if (in->kind == 3) {
++			extern int redwood_rssi_linkevt;
++			redwood_rssi_linkevt = in->a != 0;	/* 0217 */
+ 		} else {
+ 			return EINVAL;
+ 		}
