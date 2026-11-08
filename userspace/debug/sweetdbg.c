@@ -511,6 +511,13 @@ static void handle(int fd)
 		ioctl(pm_fd(), PMEM_SMC, &s);
 		printf("sweetdbg: PSCI reset returned %#llx\n", (unsigned long long)s.x[0]);
 		return;
+	} else if (!strcmp(c, "bars") && na == 2) {
+		/* bars LOW HIGH: RSSI_BOUNDS in dBm (kernel 0215) */
+		int e = inject(2, atoi(a[0]), atoi(a[1]), 0, 0);
+		if (e)
+			say(fd, "ERR %s\n", strerror(e));
+		else
+			say(fd, "OK\n");
 	} else if (!strcmp(c, "spmi") && (na == 3 || na == 4)) {
 		/* spmi r SID ADDR | spmi w SID ADDR VALUE (owned channels only) */
 		int w = !strcmp(a[0], "w");

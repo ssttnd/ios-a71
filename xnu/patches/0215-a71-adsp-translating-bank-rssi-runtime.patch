@@ -1,0 +1,165 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -1127,6 +1127,117 @@
+ 	    name, SID, MASK, cb, slot, smr, s2cr, cbp[0], gr1[cb], ok ? "ok" : "NOT as written");
+ }
+ 
++/*
++ * 0215: the ADSP's audio buffer through a TRANSLATING bank, built here at boot because a userland apps-SMMU access later
++ * stalls the CPU. A translation-off bank (0211/0213) reset the phone at the first ASM RUN; ios-flame's translating bank
++ * on the same SoC never did, so these are its values (phone/wifi/smmu.c R_*, "the SM7150 reference"). The DSP puts the
++ * stream in address bits 35:32, so the IOVA is mapped at both 0xa0000000 and 0x1a0000000. Tables and buffer sit in the
++ * unused tail of the splash region (two frames end at 0x9d3c6800), below 4 GB and never mapped cacheable.
++ */
++#define AUDIO_TABLES_PA 0x9d500000ull
++#define AUDIO_BUFFER_PA 0x9d600000ull
++#define AUDIO_BUFFER_LEN 0x40000ull
++#define AUDIO_IOVA      0xa0000000ull
++#define AUDIO_ALIAS     (1ull << 32)
++#define AUDIO_SID       0x1b21u
++static void
++sweet_smmu_audio_bank(volatile uint32_t *gr0, uint32_t id0, uint32_t id1)
++{
++	const uint32_t nsmr = id0 & 0xff, ncb = id1 & 0xff;
++	const uint64_t psize = (id1 >> 31) ? 0x10000 : 0x1000, npage = 1ull << (((id1 >> 28) & 7) + 1);
++	if (psize != 0x1000 || nsmr > 128 || ncb > 128 || (npage + ncb) * psize > 0x100000) {
++		printf("SWEET SMMU: ADSP audio: unexpected geometry\n");
++		return;
++	}
++	volatile uint32_t *gr1 = (volatile uint32_t *)ml_io_map(0x15000000 + psize, psize);
++	volatile uint64_t *tables = (volatile uint64_t *)ml_io_map(AUDIO_TABLES_PA, 0x3000);
++	if (!gr1 || !tables) {
++		return;
++	}
++	uint64_t used[2] = {0, 0};
++	int slot = -1;
++	for (uint32_t i = 0; i < nsmr; i++) {
++		const uint32_t smr = gr0[(0x800 + 4 * i) / 4], s2cr = gr0[(0xc00 + 4 * i) / 4];
++		if (!(smr >> 31)) {
++			if (slot < 0) {
++				slot = (int)i;
++			}
++			continue;
++		}
++		if (((s2cr >> 16) & 3) == 0) {
++			used[(s2cr & 0xff) / 64] |= 1ull << ((s2cr & 0xff) % 64);
++		}
++		if (smmu_sid_match(smr, AUDIO_SID, 0)) {
++			printf("SWEET SMMU: ADSP audio: SMR%u %#x already matches\n", i, smr);
++			return;
++		}
++	}
++	int cb = -1;
++	volatile uint32_t *cbp = NULL;
++	for (uint32_t c = 0; c < ncb && cb < 0; c++) {
++		if (used[c / 64] & (1ull << (c % 64)) || gr1[c] != 0) {
++			continue;
++		}
++		volatile uint32_t *page = (volatile uint32_t *)ml_io_map(0x15000000 + (npage + c) * psize, psize);
++		if (page && !(page[0] & 1)) {
++			cb = (int)c;
++			cbp = page;
++		}
++	}
++	if (slot < 0 || cb < 0) {
++		printf("SWEET SMMU: ADSP audio: no free SMR/bank (SMR %d, bank %d)\n", slot, cb);
++		return;
++	}
++	for (unsigned i = 0; i < 3 * 512; i++) {
++		tables[i] = 0;
++	}
++	const uint64_t l1 = AUDIO_TABLES_PA, l2 = l1 + 0x1000, l3 = l1 + 0x2000;
++	const uint64_t leaf = 3ull | (1ull << 6) | (2ull << 8) | (1ull << 10) | (1ull << 11);     /* attr 0, AP 01, SH 2, AF, nG */
++	tables[(AUDIO_IOVA >> 30) & 0x1ff] = l2 | 3;
++	tables[((AUDIO_IOVA | AUDIO_ALIAS) >> 30) & 0x1ff] = l2 | 3;
++	tables[512 + ((AUDIO_IOVA >> 21) & 0x1ff)] = l3 | 3;
++	for (uint64_t o = 0; o < AUDIO_BUFFER_LEN; o += 0x1000) {
++		tables[1024 + (((AUDIO_IOVA + o) >> 12) & 0x1ff)] = (AUDIO_BUFFER_PA + o) | leaf;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	const uint32_t sctlr = 0x00001127u, tcr = 0x00803519u, tcr2 = 1u | (1u << 4) | (7u << 15), mair0 = 0xf404ff44u, cbar = 0x0001f300u;
++	const uint64_t ttbr = l1 | ((uint64_t)cb << 48);
++	cbp[0] = 0;
++	cbp[0x58 / 4] = 0xffffffff;
++	cbp[0x20 / 4] = (uint32_t)ttbr;
++	cbp[0x24 / 4] = (uint32_t)(ttbr >> 32);
++	cbp[0x28 / 4] = 0;
++	cbp[0x2c / 4] = 0;
++	cbp[0x30 / 4] = tcr;
++	cbp[0x10 / 4] = tcr2;
++	cbp[0x38 / 4] = mair0;
++	cbp[0x3c / 4] = 0;
++	gr1[(0x800 + 4 * cb) / 4] = 0x00000001;
++	gr1[cb] = cbar;
++	cbp[0x610 / 4] = (uint32_t)cb;
++	cbp[0x618 / 4] = 0;
++	cbp[0x7f0 / 4] = 0;
++	for (int i = 0; i < 1000 && (cbp[0x7f4 / 4] & 1); i++) {
++		delay(1000);
++	}
++	cbp[0] = sctlr;
++	const bool bank_ok = cbp[0x30 / 4] == tcr && cbp[0x20 / 4] == (uint32_t)ttbr && gr1[cb] == cbar && (cbp[0] & ~0x1000u) == (sctlr & ~0x1000u);
++	if (!bank_ok) {
++		printf("SWEET SMMU: ADSP audio: CB%d NOT as written (SCTLR %#x TCR %#x CBAR %#x): no stream routed\n", cb, cbp[0], cbp[0x30 / 4], gr1[cb]);
++		return;
++	}
++	gr0[(0xc00 + 4 * slot) / 4] = (uint32_t)cb;
++	gr0[(0x800 + 4 * slot) / 4] = (1u << 31) | AUDIO_SID;
++	gr0[0x70 / 4] = 0;
++	for (int i = 0; i < 1000 && (gr0[0x74 / 4] & 1); i++) {
++		delay(1000);
++	}
++	const uint32_t smr = gr0[(0x800 + 4 * slot) / 4], s2cr = gr0[(0xc00 + 4 * slot) / 4];
++	printf("SWEET SMMU: ADSP audio %#x -> translating CB%d via SMR%d: SMR %#x S2CR %#x SCTLR %#x TCR %#x; IOVA %#llx -> PA %#llx -> %s\n",
++	    AUDIO_SID, cb, slot, smr, s2cr, cbp[0], cbp[0x30 / 4], AUDIO_IOVA, AUDIO_BUFFER_PA,
++	    (smr >> 31) && smmu_sid_match(smr, AUDIO_SID, 0) && (s2cr & 0xff) == (uint32_t)cb ? "ok" : "NOT as written");
++}
++
+ static void
+ sweet_smmu_wlan_stream(volatile uint32_t *gr0, uint32_t id0, uint32_t id1)
+ {
+@@ -1214,7 +1325,7 @@
+ 	int adsp = 1;
+ 	PE_parse_boot_argn("sweetsmmuadsp", &adsp, sizeof(adsp));
+ 	if (adsp) {
+-		sweet_smmu_identity_stream(smmu, id0, id1, "ADSP audio", 0x1b21, 0x0);
++		sweet_smmu_audio_bank(smmu, id0, id1);	/* 0215 */
+ 	}
+ 	sweet_smmu_dump_mdss(smmu, id0, id1);
+ }
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -356,6 +356,12 @@
+ 			sweet_hid_touch(in->a, in->b, in->c, in->d);
+ 		} else if (in->kind == 1 && in->a >= 0 && in->a < 4) {
+ 			sweet_hid_key(in->a, in->b);
++		} else if (in->kind == 2 && in->a < in->b && in->a >= -120 && in->b <= 0) {
++			/* 0215: RSSI_BOUNDS at run time (sweetdbg bars LOW HIGH) */
++			extern int redwood_rssi_low, redwood_rssi_high;
++			redwood_rssi_low = in->a;
++			redwood_rssi_high = in->b;
++			printf("SWEET PMEM: RSSI bounds %d..%d\n", in->a, in->b);
+ 		} else {
+ 			return EINVAL;
+ 		}
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -192,6 +192,9 @@
+     offsetof(struct apple80211_scan_result, age_ms) == 0x84 && offsetof(struct apple80211_scan_result, elements) == 0x8c,
+     "a scan's result as iOS 16.5 has it");
+ 
++/* 0215: RSSI_BOUNDS, set at run time (-90..-45 too few bars at -75 dBm, -95..-50 too few, -100..-60 too many) */
++int redwood_rssi_low = -98, redwood_rssi_high = -55;
++
+ /* Apple80211's events (APPLE80211_M_...) */
+ enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
+        EVENT_SCAN_DONE = 10, EVENT_LINK_QUALITY = 17 /* 0210 */ };
+@@ -400,7 +403,7 @@
+ 			uint32_t version;
+ 			int32_t low, high;
+ 			uint32_t unused;
+-		} answer = { .version = 1, .low = -95, .high = -50 };	/* 0214: -90..-45 drew 1 bar at -78 dBm, -100..-60 always 3; Settings 2 */
++		} answer = { .version = 1, .low = redwood_rssi_low, .high = redwood_rssi_high };	/* 0215: set at run time */
+ 
+ 		return give(request, &answer, sizeof(answer));
+ 	}
