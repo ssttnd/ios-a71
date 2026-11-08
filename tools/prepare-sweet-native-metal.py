@@ -374,9 +374,8 @@ air2nir = executable(""")
          struct pipe_resource *t = views[0]->texture;
          for (unsigned l = 0; l <= t->last_level; l++) {
             struct pipe_transfer *xfer = NULL;
-            struct pipe_box box;
             unsigned w = u_minify(t->width0, l), h = u_minify(t->height0, l);
-            u_box_2d(0, 0, w, h, &box);
+            struct pipe_box box = { .width = (int)w, .height = (int)h, .depth = 1 };
             void *m = pipe->texture_map(pipe, t, l, PIPE_MAP_READ, &box, &xfer);
             char name[64];
             snprintf(name, sizeof(name), "/var/tmp/mip-%u.raw", l);
@@ -410,7 +409,7 @@ air2nir = executable(""")
       pipe->set_shader_buffers(pipe, stage, 0, num_ssbo, sb, writable);
    if (num_views)
       pipe->set_sampler_views(pipe, stage, 0, num_views, 0, false, views);''')
-    s=replace(s,'#include "air_metal.h"','#include "sweet_native_ext.h"\n#include "util/u_framebuffer.h"\n#include "util/u_math.h"\n#include "util/u_box.h"\n#include "util/u_inlines.h"\n#include <math.h>\n#include <stdio.h>\n#include <time.h>\n#include <unistd.h>\n#include "util/u_upload_mgr.h"')
+    s=replace(s,'#include "air_metal.h"','#include "sweet_native_ext.h"\n#include "util/u_framebuffer.h"\n#include "util/u_math.h"\n#include <math.h>\n#include <stdio.h>\n#include <time.h>\n#include <unistd.h>\n#include "util/u_upload_mgr.h"')
     s=replace(s,'#include "nir_air.h"','#include "nir_air.h"\n#include "air_live_resources.inc"\n#include "air_stage_link.inc"\n#include "air_vertex_exports.inc"')
     # Metal ALWAYS enables primitive restart for indexed strip draws (0xFFFF /
     # 0xFFFFFFFF), the donor turned it off ("Metal has no restart index"). The
