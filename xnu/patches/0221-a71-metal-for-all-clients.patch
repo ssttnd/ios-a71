@@ -1,0 +1,40 @@
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -46,19 +46,22 @@
+  /* Slot 0 is backboardd's original window. Extra slots are separate 256 MiB
+   * windows of the same 2 GiB arena above it, each with its own queue range,
+   * so one client's IOVAs can never collide with another's. */
+- bool slot_open[4]={false,false,false,false};
+- unsigned extra_slots=3;
++ bool slot_open[7]={};
++ unsigned extra_slots=6;
+ } backend;
+ /* 0x70000000.. holds the kernel's CP firmware/ring/fence (A618_CP_IOVA): the
+  * 0129 windows overlapped it and every extra BoMap was refused as Busy. */
+-enum : uint64_t {ExtraWindowStart=0x80000000,ExtraWindowBytes=0x10000000};
++enum : uint64_t {ExtraWindowStart=0x80000000,ExtraWindowBytes=0x08000000};
+ /* Processes that receive a Metal device besides backboardd. AegirPoster (the
+  * configured iOS 16 wallpaper) aborts without one; sweetm2extra=0 disables. */
+ bool extra_client(const char *name)
+ {
+  /* 0219: without a device PosterBoard dies in -[PBFHomeScreenPreviewImageBuilder _imageForView:] (nil command queue in
+   * the CARenderer options) and PhotosPosterProvider asserts in -[NUDevice_iOS initWithName:]. p_comm is 16 characters. */
+- static const char *const names[]={"AegirPoster","PosterBoard","PhotosPosterProv"};
++ /* 0221: proc_selfname gives the long name here ("PhotosPosterProvider"), so the 0219 entry never matched. The others
++  * are the processes the "not on the list" log named on 2026-11-08. */
++ static const char *const names[]={"SpringBoard","chronod","Spotlight","FitnessWidget"};
++ if(strstr(name,"Poster"))return true;
+  for(const char *n:names)if(!strcmp(name,n))return true;
+  return false;
+ }
+@@ -641,8 +644,8 @@
+  } else IOLog("SWEET GLES: native A618 transport published; Metal discovery disabled for GLES boot\n");
+  provider->setProperty("model","Adreno 618");
+  provider->setProperty("NativeAdrenoABI",NativeAdrenoAbiVersion,32);
+- int extra=3;PE_parse_boot_argn("sweetm2extra",&extra,sizeof(extra));
+- backend.extra_slots=extra<0?0u:(extra>3?3u:(unsigned)extra);
++ int extra=6;PE_parse_boot_argn("sweetm2extra",&extra,sizeof(extra));
++ backend.extra_slots=extra<0?0u:(extra>6?6u:(unsigned)extra);
+  int import_sync=0;PE_parse_boot_argn("sweetimportsync",&import_sync,sizeof(import_sync));
+  native_adreno_import_sync=import_sync!=0;
+  uint32_t below_kib=2048;PE_parse_boot_argn("sweetimportmin",&below_kib,sizeof(below_kib));
