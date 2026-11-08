@@ -42,6 +42,17 @@ jobs:
             codesign --force --sign - --pagesize 4096 "$out/$f"
             codesign --verify --strict "$out/$f"
           done
+          (cd donor/phone/wifi && xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -I. -o "$GITHUB_WORKSPACE/$out/af_feed" af_feed.c -lm)
+          codesign --force --sign - --pagesize 4096 "$out/af_feed"
+          # CoreAudio HAL plug-in: the sound iOS plays goes to the FIFO adspboot --audio-fifo reads
+          D="$GITHUB_WORKSPACE/$out/SunfishAudio.driver"
+          mkdir -p "$D"
+          (cd donor/phone/audio && xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wno-unused-parameter -Wno-unused-function \
+            -bundle -I../camera -framework CoreFoundation -framework CoreMedia -framework CoreVideo -framework IOSurface -lobjc \
+            -o "$D/SunfishAudio" audio_plugin.c ../camera/inject_media.c ../camera/camera_device.c ../camera/camera_isp.c ../camera/camera_client.c)
+          cp donor/phone/audio/audio_plugin.plist "$D/Info.plist"
+          codesign --force --sign - --pagesize 4096 "$D"
+          nm -gU "$D/SunfishAudio" | grep -q _SunfishAudio_Create
           (cd "$out" && shasum -a 256 adspboot tasprobe sweetdbg > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:

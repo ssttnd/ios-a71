@@ -5,6 +5,8 @@
  *
  * Request: one line, fields separated by TAB: KEY \t COMMAND \t ARG...
  *   run   PATH ARG...        spawn, stdout+stderr streamed back, then "\n[exit N]\n" (killed after 120 s)
+ *   runbg PATH ARG...        a daemon in its own session, output to /dev/null; "OK pid N"
+ *   mv    FROM TO
  *   get   PATH               "OK size\n" + bytes
  *   put   PATH MODE SIZE     then SIZE bytes; written to PATH.sdtmp, renamed, chmod MODE (octal); "OK\n"
  *   ls    PATH               one line per entry: type mode size name
@@ -257,6 +259,49 @@ static void cmd_run(int fd, char **av, int ac)
 	    WIFSIGNALED(st) ? WTERMSIG(st) : 0);
 }
 
+static void *reap_child(void *arg)
+{
+	pid_t pid = (pid_t)(intptr_t)arg;
+	int st = 0;
+	waitpid(pid, &st, 0);
+	printf("sweetdbg: pid %d ended, status %#x\n", pid, st);
+	return NULL;
+}
+
+/* runbg PATH ARG...: a daemon: its own session, stdout and stderr to /dev/null (the console, with sweetnull=NAME) */
+static void cmd_runbg(int fd, char **av, int ac)
+{
+	if (ac < 1) {
+		say(fd, "ERR runbg needs a path\n");
+		return;
+	}
+	posix_spawn_file_actions_t fa;
+	posix_spawnattr_t at;
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+	posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+	posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+	posix_spawnattr_init(&at);
+	posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSID);
+	char *argv[64];
+	int n = 0;
+	for (; n < ac && n < 63; n++)
+		argv[n] = av[n];
+	argv[n] = NULL;
+	pid_t pid = -1;
+	int e = posix_spawn(&pid, argv[0], &fa, &at, argv, environ);
+	posix_spawn_file_actions_destroy(&fa);
+	posix_spawnattr_destroy(&at);
+	if (e) {
+		say(fd, "ERR spawn %s: %s\n", argv[0], strerror(e));
+		return;
+	}
+	pthread_t t;
+	if (!pthread_create(&t, NULL, reap_child, (void *)(intptr_t)pid))
+		pthread_detach(t);
+	say(fd, "OK pid %d\n", pid);
+}
+
 static void cmd_get(int fd, const char *path)
 {
 	int f = open(path, O_RDONLY);
@@ -433,6 +478,14 @@ static void handle(int fd)
 	printf("sweetdbg: %s%s%s\n", c, na ? " " : "", na ? a[0] : "");
 	if (!strcmp(c, "run"))
 		cmd_run(fd, a, na);
+	else if (!strcmp(c, "runbg"))
+		cmd_runbg(fd, a, na);
+	else if (!strcmp(c, "mv") && na == 2) {
+		if (rename(a[0], a[1]))
+			say(fd, "ERR %s\n", strerror(errno));
+		else
+			say(fd, "OK\n");
+	}
 	else if (!strcmp(c, "get") && na == 1)
 		cmd_get(fd, a[0]);
 	else if (!strcmp(c, "put") && na == 3)
