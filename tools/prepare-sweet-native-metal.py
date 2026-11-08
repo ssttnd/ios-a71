@@ -367,11 +367,21 @@ air2nir = executable(""")
       native_mipped |= views[i] && views[i]->texture && views[i]->texture->last_level > 0;
    /* A71 blur debugging: touch /var/local/sweet-mipdump; the next process start dumps the levels of the texture the
       variable blur reads (its second texture is the 1x366 mask), once, to /var/tmp/mip-N.raw (RGBA8 rows). */
-   if (native_mipped && num_views == 2 && views[1] && views[1]->texture && views[1]->texture->width0 == 1) {
+   struct pipe_resource *sweet_mip_tex = NULL;
+   bool sweet_mip_mask = false;
+   for (unsigned i = 0; i < num_views; i++) {   /* CoreAnimation binds them at slots 3 and 4 */
+      if (!views[i] || !views[i]->texture)
+         continue;
+      if (views[i]->texture->last_level > 0)
+         sweet_mip_tex = views[i]->texture;
+      else if (views[i]->texture->width0 == 1)
+         sweet_mip_mask = true;
+   }
+   if (sweet_mip_tex && sweet_mip_mask) {
       static bool sweet_mipdump_done;
       if (!sweet_mipdump_done && access("/var/local/sweet-mipdump", F_OK) == 0) {
          sweet_mipdump_done = true;
-         struct pipe_resource *t = views[0]->texture;
+         struct pipe_resource *t = sweet_mip_tex;
          for (unsigned l = 0; l <= t->last_level; l++) {
             struct pipe_transfer *xfer = NULL;
             unsigned w = u_minify(t->width0, l), h = u_minify(t->height0, l);

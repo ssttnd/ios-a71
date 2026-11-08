@@ -39,7 +39,8 @@ print("Verified Touch (Samsung S6SY771) and GPU driver signatures in kernel!")
 # Same arguments as the A71 boot image known to reach the lock screen, except
 # sweetusb: 3 powers the controller up and offers the console as a serial port.
 sweetusb = os.environ.get('SWEETUSB', '3')
-cmdline = f"debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=60 sweettouchdelay=3 sweettouchbitbang=1 sweetusb={sweetusb} sweetfb_noconsole=1"
+keepsyms = '' if os.environ.get('SWEETKEEPSYMS') == '0' else 'keepsyms=1 '  # 11 bytes of the 607-byte boot line
+cmdline = f"debug=0xc serial=3 cpus=8 {keepsyms}-enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=60 sweettouchdelay=3 sweettouchbitbang=1 sweetusb={sweetusb} sweetfb_noconsole=1"
 # Fork drivers with Redmi values stay off on the A71 until ported: real battery (A71 has
 # s2mu106/107), DSI backlight (A71 is a command-mode panel), display register dump, page flip.
 # sweetgpu is the GPU bring-up stage: 1 read-only ... 9 commands. Override with SWEETGPU.
