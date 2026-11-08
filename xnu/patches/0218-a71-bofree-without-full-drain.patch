@@ -1,0 +1,53 @@
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -427,6 +427,27 @@
+    }
+   }
+  }
++ /* 0218: a BoFree drained the whole GPU under the global lock: 12-21 ms each (84 frees in one 10 s window), and every
++  * other thread's submit waited behind it. The buffer can only be used by jobs submitted before this call, so wait for
++  * those, with the lock taken just for each check. freeBo still refuses a buffer a job holds: then the old drain runs. */
++ bool free_waited=false;
++ if(selector==NativeAdrenoMethodBoFree && backend.pipeline) {
++  const uint64_t wait_began=backend.clock.now_us(backend.clock.cookie);
++  IOLockLock(backend.lock);
++  const bool ok=mounted_ && !closed_ && healthy();
++  const uint32_t target=ok?backend.ring->lastSubmitted():0;
++  IOLockUnlock(backend.lock);
++  IOReturn waited=ok?kIOReturnSuccess:kIOReturnNotReady;
++  while(ok && target) {
++   IOLockLock(backend.lock);
++   waited=healthy()?backend.submit->observeFence(target,&backend.clock,0):kIOReturnIOError;
++   IOLockUnlock(backend.lock);
++   if(waited!=kIOReturnTimeout)break;
++   if(backend.clock.now_us(backend.clock.cookie)-wait_began>=1000000)break;
++   IOSleep(1);
++  }
++  free_waited=!waited;
++ }
+  lock_timed();
+  if(!mounted_ || closed_ || !healthy()) {IOLockUnlock(backend.lock);return kIOReturnNotReady;}
+  const uint64_t began=backend.clock.now_us(backend.clock.cookie);
+@@ -438,7 +459,7 @@
+  // TLB invalidate and the full clean are safe beside running work, and every
+  // job keeps its own fence and references. Pipelining is what lets the CPU
+  // encode frame N+1 while the A618 executes frame N.
+- const bool drains=selector==NativeAdrenoMethodBoFree ||
++ const bool drains=(selector==NativeAdrenoMethodBoFree && !free_waited) ||
+      (!backend.pipeline && (selector==NativeAdrenoMethodBoMap || selector==NativeAdrenoMethodSubmit ||
+       selector==NativeAdrenoMethodSubmitResources));
+  if(drains)
+@@ -452,6 +473,13 @@
+   result=core_->importBo(&request,task_,&reply);
+   if(!result)memcpy(args->structureOutput,&reply,sizeof reply);
+  } else if(!result)result=core_->dispatch(selector,args->structureInput,input,args->structureOutput,output,&backend.clock);
++ if(result==kIOReturnBusy && selector==NativeAdrenoMethodBoFree && free_waited) {
++  /* 0218: something still holds it: the full drain, as before */
++  static unsigned refused=0;
++  if(++refused<=8)IOLog("SWEET RENDER: BoFree busy after the fence wait (%u): draining\n",refused);
++  result=quiesce();
++  if(!result)result=core_->dispatch(selector,args->structureInput,input,args->structureOutput,output,&backend.clock);
++ }
+  if(!result)args->structureOutputSize=output;
+  if(selector==NativeAdrenoMethodBoMap) {
+   static unsigned maps=0;
