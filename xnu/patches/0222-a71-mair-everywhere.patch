@@ -1,0 +1,22 @@
+--- a/iokit/Kernel/arm/unixnu/ArmSmmu4K.c
++++ b/iokit/Kernel/arm/unixnu/ArmSmmu4K.c
+@@ -88,7 +88,7 @@
+         }
+     }
+     result->root_physical = pool;
+-    result->mair = 0xff44;
++    result->mair = 0xfff4;
+     result->table_pages = required;
+     result->leaf_pages = leaves;
+     result->start_level = start;
+--- a/iokit/Kernel/arm/unixnu/ArmSmmu4KLive.c
++++ b/iokit/Kernel/arm/unixnu/ArmSmmu4KLive.c
+@@ -30,7 +30,7 @@
+         pages+=(size_t)extra;
+     }
+     if(pages>a->capacity_pages)return ArmSmmu4KCapacity;
+-    *out=(ArmSmmu4KResult){a->config.table_physical,0xff44,pages,0,start,a->upper_region};
++    *out=(ArmSmmu4KResult){a->config.table_physical,0xfff4,pages,0,start,a->upper_region};
+     return ArmSmmu4KSuccess;
+ }
+ static uint64_t descriptor(const ArmSmmu4KRange *r,uint64_t iova)
