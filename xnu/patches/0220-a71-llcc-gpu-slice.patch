@@ -1,0 +1,95 @@
+--- a/iokit/Kernel/arm/unixnu/ArmSmmu4KContext.c
++++ b/iokit/Kernel/arm/unixnu/ArmSmmu4KContext.c
+@@ -15,7 +15,7 @@
+     if(!c || !r)return !c && !r;
+     if(c->input_bits<32 || c->input_bits>48 || width_code(c->output_bits)<0 ||
+         (c->table_physical&4095) || r->root_physical!=c->table_physical ||
+-        r->mair!=0xff44 || r->upper_region!=upper || !r->table_pages ||
++        r->mair!=0xfff4 || r->upper_region!=upper || !r->table_pages ||
+         r->leaf_pages>c->leaf_budget || r->table_pages>UINT64_MAX/4096 ||
+         r->start_level!=4-(c->input_bits-12+8)/9)return 0;
+     uint64_t limit=UINT64_C(1)<<c->output_bits;
+@@ -54,7 +54,7 @@
+     v.ttbr0=(uint64_t)c->asid<<48;v.ttbr1=v.ttbr0;
+     if(c->lower)v.ttbr0|=c->lower_tables->root_physical;
+     if(c->upper)v.ttbr1|=c->upper_tables->root_physical;
+-    v.mair0=0xff44;v.mair1=0;
++    v.mair0=0xfff4;v.mair1=0; /* 0220: index 0 = outer WB, inner NC (Qualcomm's upstream hint), or the GPU never allocates in LLCC */
+     v.sctlr=0x1067|(c->stall_on_fault<<7)|(c->continue_after_fault<<8);
+     if(c->profile==1) {
+         if(c->id0!=0x48016605 || c->id2!=0x7511 || !c->lower || c->upper ||
+--- a/iokit/Kernel/arm/unixnu/ArmSmmu4KAudit.c
++++ b/iokit/Kernel/arm/unixnu/ArmSmmu4KAudit.c
+@@ -31,7 +31,7 @@
+     uint64_t pool_bytes=(uint64_t)a->capacity_pages*PAGE;
+     if((c->table_physical&4095) || c->table_physical>=limit || pool_bytes>limit-c->table_physical)
+         return ArmSmmu4KBadRange;
+-    if(root!=c->table_physical || b->root_physical!=root || b->mair!=0xff44 ||
++    if(root!=c->table_physical || b->root_physical!=root || b->mair!=0xfff4 ||
+         !b->table_pages || b->table_pages>a->capacity_pages || !b->leaf_pages ||
+         b->start_level!=4-(c->input_bits-12+8)/9 || b->upper_region>1)
+         return ArmSmmu4KStateMismatch;
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -25,6 +25,53 @@
+ #include <pexpert/device_tree.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++/*
++ * 0220: the GPU data slice of the system cache (sdmmagpie table: id 12, 256 KB, priority 1, fixed, bonus ways 0xf; A71 DT
++ * cache-slices agrees). Registers are open to the kernel: read and written through /dev/pmem on 2026-11-08. A618 takes the
++ * CX_MISC path: SCID 12 in all five clients of CNTL_1, CNTL_0 = 3 to override write-no-alloc. sweetllcc=0 leaves it off.
++ * The page-table walker slice (11) stays off: our tables are written non-cacheable.
++ */
++static void
++sweet_llcc_gpu_enable(void)
++{
++	uint32_t on = 1;
++	PE_parse_boot_argn("sweetllcc", &on, sizeof(on));
++	if (!on) {
++		printf("SWEET ADRENO: LLCC off (sweetllcc=0)\n");
++		return;
++	}
++	vm_offset_t bcast = ml_io_map(0x09600000, 0x22000);
++	vm_offset_t bank0 = ml_io_map(0x09200000, 0x22000);
++	vm_offset_t misc = ml_io_map(0x0509e000, 0x1000);
++	if (!bcast || !bank0 || !misc) {
++		printf("SWEET ADRENO: LLCC map failed\n");
++		return;
++	}
++#define LL_W(off, v) (*(volatile uint32_t *)(bcast + (off)) = (v))
++#define LL_R(off) (*(volatile uint32_t *)(bank0 + (off)))
++#define MISC(off) (*(volatile uint32_t *)(misc + (off)))
++	LL_W(0x21064, 0x08000018);	/* ATTR1: 256 KB over 2 banks, priority 1, fixed */
++	LL_W(0x21060, 0x000f0000);	/* ATTR0: bonus ways 0xf */
++	LL_W(0x21f00, LL_R(0x21f00) & ~(1u << 12));	/* capacity-based allocation on for this slice */
++	__builtin_arm_dsb(0xf);
++	LL_W(0xc000, 3);
++	__builtin_arm_dsb(0xf);
++	LL_W(0xc000, 2);
++	__builtin_arm_dsb(0xf);
++	unsigned tries = 0;
++	while ((LL_R(0xc004) & 2) && tries++ < 100)
++		delay(1);
++	const uint32_t status = LL_R(0xc004);
++	MISC(0x8) = (MISC(0x8) & ~0x01ffffffu) | 0x00c6318cu;
++	MISC(0x4) = 3;
++	__builtin_arm_dsb(0xf);
++	printf("SWEET ADRENO: LLCC GPU slice 12 status=%#x attr %#x %#x cad %#x cx_misc %#x %#x\n", status,
++	    LL_R(0x21060), LL_R(0x21064), LL_R(0x21f00), MISC(0x4), MISC(0x8));
++#undef LL_W
++#undef LL_R
++#undef MISC
++}
+ extern int sweet_rpmh_arc_probe(const char *res);
+ extern int sweet_rpmh_arc_read(const char *res);
+ extern int sweet_rpmh_arc_require(const char *res, unsigned minimum);
+@@ -443,6 +490,7 @@
+  };
+  struct a618_cp_result cp;
+  bzero(&cp, sizeof(cp));
++ sweet_llcc_gpu_enable();
+  error = a618_cp_start(&gpu_io, &gmu_io, &memory, sqe, sqe_size,
+      sweet_adreno_barrier, NULL, sweet_gpu_zap_prepare, &request, &cp);
+  printf("SWEET ADRENO: pre-SQE ZAP attempted=%u errno=%d phase=%u status=%lld response=%#llx\n",
