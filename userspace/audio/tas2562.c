@@ -5,7 +5,7 @@
  * Bus: QUP SE0 pins gpio49 (SDA) / gpio50 (SCL) on TLMM WEST, bit-banged open drain (tasprobe found the amp there,
  * wave35); reset gpio8 on TLMM NORTH is driven high. No speaker protection on this phone: hard limits here, whatever
  * the caller asks: only 0x4c is written, analog level at most AMP_LEVEL_MAX (8.5 dBV + 0.5 dB steps), digital
- * volume at most -20 dB, the amp leaves software shutdown only after every configured field reads back, and any
+ * volume at most -10 dB, the amp leaves software shutdown only after every configured field reads back, and any
  * fault latch (over-temperature, over-current, clock error) shuts it down.
  *
  * Registers (book 0): page 0: 0x02 PWR_CTL (bits 1:0 mode 0 active, 1 mute, 2 shutdown; 2 VSNS_PD, 3 ISNS_PD),
@@ -48,7 +48,7 @@
 #define PG2_DVC		0x0c
 
 #define AMP_LEVEL_MAX	4	/* 8.5 .. 10.5 dBV */
-#define VOL_MAX_DB	(-20)
+#define VOL_MAX_DB	(-10)	/* owner 2026-11-08: -20 is clean but quiet; level 0 at -10 dB is under 100 mW into 8 ohm */
 
 static int dry, quiet;
 static int cur_page = -1;
