@@ -37,7 +37,8 @@ jobs:
           xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -Wextra -Wno-gnu-conditional-omitted-operand \
             -o "$out/tasprobe" userspace/audio/tasprobe.c
           xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -Wextra -o "$out/sweetdbg" userspace/debug/sweetdbg.c
-          for f in adspboot tasprobe sweetdbg; do
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -Wextra -o "$out/iobench" userspace/debug/iobench.c
+          for f in adspboot tasprobe sweetdbg iobench; do
             codesign --force --sign - --pagesize 4096 "$out/$f"
             codesign --verify --strict "$out/$f"
           done
