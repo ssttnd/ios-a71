@@ -267,7 +267,9 @@ native_early_stderr(void)
 {
 	if (access("/var/local/sweet-stderr", F_OK) != 0)
 		return;
-	int fd = open("/var/tmp/sweet-stderr.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	char name[64];
+	snprintf(name, sizeof(name), "/var/tmp/sweet-stderr-%d.txt", (int)getpid());
+	int fd = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (fd >= 0) {
 		dup2(fd, 2);
 		close(fd);
