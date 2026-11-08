@@ -335,6 +335,14 @@ air2nir = executable(""")
     p.write_text(s)
     p=air/'air_metal.c';s=p.read_text()
     s=replace(s,'[RWA_MIP_NOT_MIPMAPPED] = PIPE_TEX_MIPFILTER_NONE,','[RWA_MIP_NOT_MIPMAPPED] = PIPE_TEX_MIPFILTER_LINEAR,')
+    # A71: the extended-range formats CAMetalLayer asks for (the Astronomy wallpaper). These surfaces are only ever read
+    # back through the same Metal format, so an unsigned-normalised reading round-trips what was drawn (values outside
+    # [0, 1], the extended part, are clamped). 552/553 are 64 bits per pixel, 554/555 are 32.
+    s=replace(s,'   {  81, "MTLPixelFormatBGRA8Unorm_sRGB", PIPE_FORMAT_B8G8R8A8_SRGB },','''   {  81, "MTLPixelFormatBGRA8Unorm_sRGB", PIPE_FORMAT_B8G8R8A8_SRGB },
+   { 552, "MTLPixelFormatBGRA10_XR",       PIPE_FORMAT_R16G16B16A16_UNORM },
+   { 553, "MTLPixelFormatBGRA10_XR_sRGB",  PIPE_FORMAT_R16G16B16A16_UNORM },
+   { 554, "MTLPixelFormatBGR10_XR",        PIPE_FORMAT_B10G10R10A2_UNORM },
+   { 555, "MTLPixelFormatBGR10_XR_sRGB",   PIPE_FORMAT_B10G10R10A2_UNORM },''')
     # A71 (2026-11-08): the App Library blur still shows ~10 px blocks, a small texture magnified
     # nearest. SWEET_FORCE_LINEAR=1 (in /private/var/local/sweet-native-env) makes every sampler,
     # API and constexpr alike (both pass here), filter linearly; off by default, an experiment.
@@ -994,7 +1002,11 @@ static _Atomic unsigned long long native_wait_until_completed;
     marker='@implementation RedwoodMetalDevice\n'
     s=replace(s,marker,'#include "SweetNativeLibrary.inc"\n\n'+marker)
     at=s.index('- (struct rwa_device *)mesaDevice',s.index(marker))
-    s=s[:at]+'''- (id)newLibraryWithFile:(NSString *)path error:(NSError **)error {
+    s=s[:at]+'''/* A71: QuartzCore's layer_private_check_pixel_format raises CAMetalLayerInvalid ("unsupported extended range
+ * format", the Astronomy wallpaper) unless the device answers YES here. Without raising the feature profile: higher
+ * profiles send CoreAnimation down precompiled pipelines this driver cannot build. */
+- (BOOL)supportsExtendedXR10Formats {return YES;}
+- (id)newLibraryWithFile:(NSString *)path error:(NSError **)error {
     NSData *data=[NSData dataWithContentsOfFile:path options:0 error:error];
     return data?[[SweetNativeLibrary alloc] initWithDevice:self data:data error:error]:nil;
 }

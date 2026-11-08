@@ -8,6 +8,7 @@
  * numbers, sizes). The file's mtime is checked once a second; a file present
  * when the process starts does not arm it. Included by redwoodmetal.m. */
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <time.h>
 
 struct native_drawlog_name {
@@ -108,6 +109,12 @@ native_drawlog_next(void)
 				}
 				if (!first) {
 					remaining = n;
+					/* A71: backboardd's stderr is /dev/null: send the log to a file sweetdbg can fetch */
+					int log_fd = open("/var/tmp/sweet-drawlog.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+					if (log_fd >= 0) {
+						dup2(log_fd, 2);
+						close(log_fd);
+					}
 					fprintf(stderr, "SweetNativeMetal: DRAWLOG armed for %u draws\n", n);
 				}
 			}
