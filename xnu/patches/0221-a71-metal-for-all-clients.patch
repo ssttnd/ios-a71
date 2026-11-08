@@ -23,7 +23,7 @@
 + /* 0221: proc_selfname gives the long name here ("PhotosPosterProvider"), so the 0219 entry never matched. The others
 +  * are the processes the "not on the list" log named on 2026-11-08. */
 + static const char *const names[]={"SpringBoard","chronod","Spotlight","FitnessWidget"};
-+ if(strstr(name,"Poster"))return true;
++ for(const char *p=name;*p;++p) {const char *a=p,*b="Poster";while(*b && *a==*b) {++a;++b;} if(!*b)return true;}
   for(const char *n:names)if(!strcmp(name,n))return true;
   return false;
  }
