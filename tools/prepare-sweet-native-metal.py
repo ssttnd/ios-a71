@@ -365,6 +365,34 @@ air2nir = executable(""")
       pipe->set_sampler_views(pipe, stage, 0, num_views, 0, false, views);''','''   bool native_mipped = false;
    for (unsigned i = 0; i < num_views; i++)
       native_mipped |= views[i] && views[i]->texture && views[i]->texture->last_level > 0;
+   /* A71 blur debugging: touch /var/local/sweet-mipdump; the next process start dumps the levels of the texture the
+      variable blur reads (its second texture is the 1x366 mask), once, to /var/tmp/mip-N.raw (RGBA8 rows). */
+   if (native_mipped && num_views == 2 && views[1] && views[1]->texture && views[1]->texture->width0 == 1) {
+      static bool sweet_mipdump_done;
+      if (!sweet_mipdump_done && access("/var/local/sweet-mipdump", F_OK) == 0) {
+         sweet_mipdump_done = true;
+         struct pipe_resource *t = views[0]->texture;
+         for (unsigned l = 0; l <= t->last_level; l++) {
+            struct pipe_transfer *xfer = NULL;
+            struct pipe_box box;
+            unsigned w = u_minify(t->width0, l), h = u_minify(t->height0, l);
+            u_box_2d(0, 0, w, h, &box);
+            void *m = pipe->texture_map(pipe, t, l, PIPE_MAP_READ, &box, &xfer);
+            char name[64];
+            snprintf(name, sizeof(name), "/var/tmp/mip-%u.raw", l);
+            FILE *f = m ? fopen(name, "wb") : NULL;
+            if (f) {
+               unsigned hdr[2] = { w, h };
+               fwrite(hdr, sizeof(hdr), 1, f);
+               for (unsigned y = 0; y < h; y++)
+                  fwrite((const char *)m + y * xfer->stride, 4, w, f);
+               fclose(f);
+            }
+            if (m)
+               pipe->texture_unmap(pipe, xfer);
+         }
+      }
+   }
    if (native_mipped) {
       if (!device->native_mip_sampler) {
          device->native_mip_sampler = pipe->create_sampler_state(pipe, &(struct pipe_sampler_state){
@@ -382,7 +410,7 @@ air2nir = executable(""")
       pipe->set_shader_buffers(pipe, stage, 0, num_ssbo, sb, writable);
    if (num_views)
       pipe->set_sampler_views(pipe, stage, 0, num_views, 0, false, views);''')
-    s=replace(s,'#include "air_metal.h"','#include "sweet_native_ext.h"\n#include "util/u_framebuffer.h"\n#include "util/u_math.h"\n#include <math.h>\n#include <time.h>\n#include "util/u_upload_mgr.h"')
+    s=replace(s,'#include "air_metal.h"','#include "sweet_native_ext.h"\n#include "util/u_framebuffer.h"\n#include "util/u_math.h"\n#include "util/u_box.h"\n#include "util/u_inlines.h"\n#include <math.h>\n#include <stdio.h>\n#include <time.h>\n#include <unistd.h>\n#include "util/u_upload_mgr.h"')
     s=replace(s,'#include "nir_air.h"','#include "nir_air.h"\n#include "air_live_resources.inc"\n#include "air_stage_link.inc"\n#include "air_vertex_exports.inc"')
     # Metal ALWAYS enables primitive restart for indexed strip draws (0xFFFF /
     # 0xFFFFFFFF), the donor turned it off ("Metal has no restart index"). The
