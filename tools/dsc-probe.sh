@@ -7,4 +7,3 @@ for s in "-[ACAccountStore tetheredSyncSourceTypeForDataclass:]" "-[ACDAccountSt
 	echo "== $s"
 	ipsw dyld disass "$c" --symbol "$s" 2>&1 | grep -E 'bl|Error|error' | head -40 | cut -c1-120 | tee -a probe/disass.txt
 done
-strings -a "$c" 2>/dev/null | grep -i -E 'tetheredsync|TetheredSync' | head -20 | tee probe/str.txt
