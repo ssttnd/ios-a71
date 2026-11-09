@@ -1,0 +1,37 @@
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -46,8 +46,8 @@
+  /* Slot 0 is backboardd's original window. Extra slots are separate 256 MiB
+   * windows of the same 2 GiB arena above it, each with its own queue range,
+   * so one client's IOVAs can never collide with another's. */
+- bool slot_open[7]={};
+- unsigned extra_slots=6;
++ bool slot_open[9]={};
++ unsigned extra_slots=8;
+ } backend;
+ /* 0x70000000.. holds the kernel's CP firmware/ring/fence (A618_CP_IOVA): the
+  * 0129 windows overlapped it and every extra BoMap was refused as Busy. */
+@@ -61,9 +61,9 @@
+  /* 0221: proc_selfname gives the long name here ("PhotosPosterProvider"), so the 0219 entry never matched. The others
+   * are the processes the "not on the list" log named on 2026-11-08. */
+  /* 0223: SpringBoard with a device dies in -[MPSImageGaussianBlur initWithDevice:] (no MPSDevice for this GPU), a boot loop. */
+- for(const char *p=name;*p;++p) {const char *a=p,*b="Poster";while(*b && *a==*b) {++a;++b;} if(!*b)return true;}
+- if(!strcmp(name,"Maps"))return true; /* 0224: its map view stays grey without a device */
+- return false;
++ /* 0225: without a device CoreImage falls back to GL, which does not exist here: Settings died in CI::GLContext::init
++  * (call through NULL) while scaling icons. Everyone gets a device while a slot is free, except SpringBoard (see 0223). */
++ return strcmp(name,"SpringBoard")!=0;
+ }
+ // Release/acquire publishes the completed backend to the framebuffer workloop.
+ static bool presentation_ready=false;
+@@ -644,8 +644,8 @@
+  } else IOLog("SWEET GLES: native A618 transport published; Metal discovery disabled for GLES boot\n");
+  provider->setProperty("model","Adreno 618");
+  provider->setProperty("NativeAdrenoABI",NativeAdrenoAbiVersion,32);
+- int extra=6;PE_parse_boot_argn("sweetm2extra",&extra,sizeof(extra));
+- backend.extra_slots=extra<0?0u:(extra>6?6u:(unsigned)extra);
++ int extra=8;PE_parse_boot_argn("sweetm2extra",&extra,sizeof(extra));
++ backend.extra_slots=extra<0?0u:(extra>8?8u:(unsigned)extra);
+  int import_sync=0;PE_parse_boot_argn("sweetimportsync",&import_sync,sizeof(import_sync));
+  native_adreno_import_sync=import_sync!=0;
+  uint32_t below_kib=2048;PE_parse_boot_argn("sweetimportmin",&below_kib,sizeof(below_kib));
