@@ -2,7 +2,7 @@
 # Called by .github/workflows/dsc-probe.yml with the shared cache path: names for addresses from a crash line, already unslid.
 c="$1"
 mkdir -p probe
-for a in 0x194b3858c 0x194b38924 0x1949e1884 0x1949a3114 0x1d4154ac0 0x18db98780 0x18db68ddc 0x1d4154a04 0x1d4155070 0x1d4154dd8 0x1d414ed44; do
+for a in 0x1a466086c 0x1a4616e8c 0x1a4616e8c 0x1a46189e8 0x1a4613ad4 0x1a461649c 0xcbe9013c 0x1949a3114 0x1949a2f10 0x1949a3114 0x1949a2f10 0x1949a3114; do
 	ipsw dyld a2s "$c" "$a" 2>&1 | tail -1 | tee -a probe/a2s.txt
 done
 echo done
