@@ -1,0 +1,73 @@
+diff --git a/phone/wifi/af_ring.h b/phone/wifi/af_ring.h
+--- a/phone/wifi/af_ring.h
++++ b/phone/wifi/af_ring.h
+@@ -12,9 +12,9 @@
+ #include <stdint.h>
+ #include <string.h>
+ 
+-#define AF_RING_FRAMES	9600	/* 200 ms */
++#define AF_RING_FRAMES	24000	/* 500 ms: the stream takes about 270 ms to come up; the head of a sound must survive that (A71) */
+ #define AF_RING_HIGH	4800	/* 100 ms */
+-#define AF_RING_HARD	7200
++#define AF_RING_HARD	20000
+ #define AF_RING_LOW	960	/* 20 ms */
+ 
+ struct af_ring {
+diff --git a/phone/wifi/adspboot.c b/phone/wifi/adspboot.c
+--- a/phone/wifi/adspboot.c
++++ b/phone/wifi/adspboot.c
+@@ -2322,6 +2322,14 @@
+ static uint64_t af_last_sound, af_retry, af_next_crash;
+ static struct af_ring af_r;
+ static struct af_dc af_g;
++/*
++ * A71 2026-11-09: choppy sound. Counters of a paced tone: no DSP underflow, but over half the pulls short. WRITE_DONE
++ * comes in bursts and the ring holds only about 20 ms, so a burst was refilled with what was there plus zeros: a 10 ms
++ * hole each. A returned period now waits for its samples while at least AF_KEEP_QUEUED are at the DSP; af_poll sends it.
++ */
++#define AF_KEEP_QUEUED	3
++static unsigned af_held[PCM_PERIODS], af_nheld;
++static uint32_t af_held_total, af_forced;
+ 
+ #define PCM_WD_MS	(af_on && !af_full_off ? 3000 : 1000)	/* sp25: a stall must not kill a stream with its periods coming */
+ 
+@@ -2697,9 +2705,16 @@
+ 	if (pcm_step != P_PLAY)
+ 		return;
+ 	if (af_on) {	/* sp23: no period limit; af_poll starts the amp and asks for the stop */
+-		if (!af_stop_req)
+-			pcm_write(p % PCM_PERIODS);
+-		else if (!pcm_out) {
++		if (!af_stop_req) {
++			if (af_r.n >= PCM_FRAMES || pcm_out < AF_KEEP_QUEUED) {
++				if (af_r.n < PCM_FRAMES)
++					af_forced++;
++				pcm_write(p % PCM_PERIODS);
++			} else {
++				af_held[af_nheld++] = p % PCM_PERIODS;
++				af_held_total++;
++			}
++		} else if (!pcm_out) {
+ 			pcm_step = P_TEARDOWN;
+ 			pcm_run();
+ 		}
+@@ -2968,6 +2983,10 @@
+ 	if (af_fails >= AF_MAX_FAILS)
+ 		printf("audio: %d failed streams in a row: no more in this run\n", af_fails);
+ 	af_retry = ok ? 0 : now_ms() + AF_RETRY_MS;
++	if (af_held_total || af_forced)
++		printf("audio: %u periods waited for samples, %u sent short
++", af_held_total, af_forced);
++	af_nheld = af_held_total = af_forced = 0;
+ 	af_up = af_want = af_stop_req = 0;
+ 	amp_used = amp_mid_read = amp_diag_n = 0;
+ 	pcm_sent = pcm_done = pcm_out = pcm_underflow = pcm_werr = pcm_tone_at = 0;
+@@ -3012,6 +3031,8 @@
+ 	ssize_t n;
+ 	for (int i = 0; i < 16 && (n = read(af_fd, b, sizeof(b))) > 0; i++)
+ 		af_ring_put(&af_r, b, (size_t)n);
++	while (af_nheld && af_r.n >= PCM_FRAMES && pcm_step == P_PLAY && !af_stop_req)
++		pcm_write(af_held[--af_nheld]);
+ 	if (!amp_ready && !amp.up && !af_amp_dead && (!af_up || af_full_off)) {	/* cs_power_down cleared it; sp25: only with no stream up, as it stalls this loop */
+ 		uint64_t t = now_ms();
+ 		if (amp_prepare()) {
