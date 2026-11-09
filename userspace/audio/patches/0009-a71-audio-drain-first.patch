@@ -1,0 +1,61 @@
+diff --git a/phone/wifi/adspboot.c b/phone/wifi/adspboot.c
+--- a/phone/wifi/adspboot.c
++++ b/phone/wifi/adspboot.c
+@@ -2334,6 +2334,18 @@
+ #define AF_KEEP_QUEUED	3
+ static unsigned af_held[PCM_PERIODS], af_nheld;
+ static uint32_t af_held_total, af_forced;
++static uint32_t af_in;	/* frames taken from the FIFO since the last stats line */
++static void af_drain(void)
++{
++	if (af_fd < 0)
++		return;
++	uint8_t b[4096];
++	ssize_t n;
++	for (int i = 0; i < 16 && (n = read(af_fd, b, sizeof(b))) > 0; i++) {
++		af_ring_put(&af_r, b, (size_t)n);
++		af_in += (uint32_t)n / 4;
++	}
++}
+ /* A71: one line per 100 pulls while there is sound */
+ static struct { uint32_t pulls, partial, empty, lmin, lmax, omin, bmax; int active; } af_st;
+ static void af_stat(uint32_t lvl, uint32_t got, int sound)
+@@ -2349,11 +2361,15 @@
+ 	else if (got < PCM_FRAMES)
+ 		af_st.partial++;
+ 	af_st.active |= sound != 0;
++	static uint64_t t0;
+ 	if (++af_st.pulls < 100)
+ 		return;
++	uint64_t t1 = now_ms();
+ 	if (af_st.active)
+-		printf("audio: 100 pulls: %u partial, %u empty, ring %u..%u, at DSP min %u, burst max %u, held now %u\n",
+-		       af_st.partial, af_st.empty, af_st.lmin, af_st.lmax, af_st.omin, af_st.bmax, af_nheld);
++		printf("audio: 100 pulls in %llu ms: %u frames in, %u partial, %u empty, ring %u..%u, at DSP min %u, burst max %u, held now %u\n",
++		       (unsigned long long)(t1 - t0), af_in, af_st.partial, af_st.empty, af_st.lmin, af_st.lmax, af_st.omin, af_st.bmax, af_nheld);
++	t0 = t1;
++	af_in = 0;
+ 	memset(&af_st, 0, sizeof(af_st));
+ }
+ 
+@@ -2743,6 +2759,8 @@
+ 		if (burst_n > af_st.bmax)
+ 			af_st.bmax = burst_n;
+ 		if (!af_stop_req) {
++			if (af_r.n < PCM_FRAMES)
++				af_drain();	/* the WRITE_DONEs are handled before this pass's FIFO read */
+ 			if (af_r.n >= PCM_FRAMES || pcm_out < AF_KEEP_QUEUED) {
+ 				if (af_r.n < PCM_FRAMES)
+ 					af_forced++;
+@@ -3063,10 +3081,7 @@
+ 	}
+ 	if (af_fd < 0)
+ 		return;
+-	uint8_t b[4096];
+-	ssize_t n;
+-	for (int i = 0; i < 16 && (n = read(af_fd, b, sizeof(b))) > 0; i++)
+-		af_ring_put(&af_r, b, (size_t)n);
++	af_drain();
+ 	while (af_nheld && af_r.n >= PCM_FRAMES && pcm_step == P_PLAY && !af_stop_req)
+ 		pcm_write(af_held[--af_nheld]);
+ 	if (!amp_ready && !amp.up && !af_amp_dead && (!af_up || af_full_off)) {	/* cs_power_down cleared it; sp25: only with no stream up, as it stalls this loop */
