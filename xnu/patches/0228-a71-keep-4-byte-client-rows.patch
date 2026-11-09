@@ -1,0 +1,25 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -335,9 +335,20 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+      * SpringBoard's 1125x2436 BGRA snapshot surfaces (4512-byte rows) then could not
+      * be imported as backboardd render targets (usage 0x5): App Library background
+      * and the search status bar went black. 4/8-byte surfaces are rendered by the
+-     * GPU, as before 0182; CPU-written glyph masks (LA08/A8) keep their rows. */
++     * GPU, as before 0182; CPU-written glyph masks (LA08/A8) keep their rows.
++     * 0228: apps also write BGRA images at the 32-byte rows they asked for: rounding
++     * those to 64 shears them by 8 texels per row (Mail's logos). Only processes
++     * that render to their surfaces keep the rounding. */
++    bool renders = strcmp(creator, "backboardd") == 0 || strcmp(creator, "SpringBoard") == 0 ||
++        strcmp(creator, "Maps") == 0 || strcmp(creator, "FitnessWidget") == 0;
++    for (const char *c = creator; *c && !renders; c++) {
++        if (strncmp(c, "Poster", 6) == 0) {
++            renders = true;
++        }
++    }
+     const bool keep_asked = asked != 0 && !roundall && strcmp(creator, "backboardd") != 0 &&
+-        s->bytesPerElement < 4;
++        (s->bytesPerElement < 4 || !renders);
+     if (keep_asked && (asked & 63)) {
+         static unsigned kept;
+         if (kept++ < 32) {
