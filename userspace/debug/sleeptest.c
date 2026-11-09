@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 static int cmp(const void *a, const void *b)
@@ -73,6 +74,14 @@ int main(int argc, char **argv)
 {
 	if (argc > 1 && !strcmp(argv[1], "scan"))
 		return scan();
+	if (argc > 2 && !strcmp(argv[1], "coal")) {
+		/* kern.timer_coalesce_bg_scale: -5 by default, a background sleep is stretched 32 times, up to 100 ms */
+		int v = atoi(argv[2]), old = 0;
+		size_t len = sizeof(old);
+		int r = sysctlbyname("kern.timer_coalesce_bg_scale", &old, &len, &v, sizeof(v));
+		printf("kern.timer_coalesce_bg_scale: %d -> %d, result %d\n", old, v, r);
+		argc = 1;
+	}
 	printf("darwin background before: process %d thread %d\n", getpriority(PRIO_DARWIN_PROCESS, 0), getpriority(PRIO_DARWIN_THREAD, 0));
 	if (argc > 1) {
 		int a = setpriority(PRIO_DARWIN_PROCESS, 0, 0), b = setpriority(PRIO_DARWIN_THREAD, 0, 0);
