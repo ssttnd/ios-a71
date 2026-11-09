@@ -1,14 +1,18 @@
 /*
  * How long usleep really takes on the phone, at normal and at real-time priority.
  * The audio daemon sleeps 2 ms per loop, yet its FIFO data and WRITE_DONE events arrive in lumps of about 40 ms.
+ * sleeptest unbg: leave the darwin background band first. sleeptest qos: also ask for the interactive QoS class.
  */
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach/thread_policy.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 static int cmp(const void *a, const void *b)
@@ -46,11 +50,20 @@ static void set_realtime(void)
 	printf("real-time policy: %s\n", k == KERN_SUCCESS ? "set" : mach_error_string(k));
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+	printf("darwin background before: process %d thread %d\n", getpriority(PRIO_DARWIN_PROCESS, 0), getpriority(PRIO_DARWIN_THREAD, 0));
+	if (argc > 1) {
+		int a = setpriority(PRIO_DARWIN_PROCESS, 0, 0), b = setpriority(PRIO_DARWIN_THREAD, 0, 0);
+		printf("cleared: %d %d; now process %d thread %d\n", a, b, getpriority(PRIO_DARWIN_PROCESS, 0), getpriority(PRIO_DARWIN_THREAD, 0));
+		if (!strcmp(argv[1], "qos"))
+			printf("qos: %d\n", pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0));
+	}
 	static const unsigned d[] = { 1000, 2000, 10000 };
 	for (unsigned i = 0; i < 3; i++)
 		measure(d[i], d[i] == 10000 ? 150 : 400, "normal");
+	if (argc > 1)
+		return 0;
 	set_realtime();
 	for (unsigned i = 0; i < 3; i++)
 		measure(d[i], d[i] == 10000 ? 150 : 400, "rt    ");

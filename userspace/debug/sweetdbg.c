@@ -36,6 +36,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
@@ -627,6 +628,8 @@ static void load_key(void)
 
 int main(void)
 {
+	/* launched under wland as a background process: usleep(1 ms) took 26-33 ms (sleeptest, 2026-11-09), children inherit it */
+	setpriority(PRIO_DARWIN_PROCESS, 0, 0);
 	signal(SIGPIPE, SIG_IGN);
 	setsid();
 	load_key();

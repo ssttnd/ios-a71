@@ -1,0 +1,47 @@
+diff --git a/phone/wifi/adspboot.c b/phone/wifi/adspboot.c
+--- a/phone/wifi/adspboot.c
++++ b/phone/wifi/adspboot.c
+@@ -70,6 +70,10 @@
+ #include <errno.h>
+ #include <sys/stat.h>
+ #include "af_ring.h"
++#include <sys/resource.h>
++#include <mach/mach.h>
++#include <mach/mach_time.h>
++#include <mach/thread_policy.h>
+ #include "pmem.h"
+ #include "smem.h"
+ #include "glink.h"
+@@ -3493,6 +3497,23 @@
+ 		printf("adsp: glink item %u: %s\n", it, smem_get(SMEM_HOST_ADSP, it, &pa, &sz) ? "none" : "present");
+ 	crash_reason();
+ 	return 0;
++}
++
++/*
++ * A71 2026-11-09: a child of wland runs in the background band: usleep(2 ms) took 55-66 ms (sleeptest), so this loop woke
++ * in lumps and the DSP's periods came back four at a time. As a real-time thread the same sleep takes 2.01 ms.
++ */
++static void audio_realtime(void)
++{
++	mach_timebase_info_data_t tb;
++	mach_timebase_info(&tb);
++	const uint64_t ms = 1000000ull * tb.denom / tb.numer;
++	thread_time_constraint_policy_data_t p = { (uint32_t)(5 * ms), (uint32_t)(1 * ms), (uint32_t)(4 * ms), 1 };
++	setpriority(PRIO_DARWIN_PROCESS, 0, 0);
++	setpriority(PRIO_DARWIN_THREAD, 0, 0);
++	kern_return_t k = thread_policy_set(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&p,
++	    THREAD_TIME_CONSTRAINT_POLICY_COUNT);
++	printf("audio: real-time policy: %s\n", k == KERN_SUCCESS ? "set" : mach_error_string(k));
+ }
+ 
+ int main(int argc, char **argv)
+@@ -3712,6 +3733,8 @@
+ 	}
+ 	if (rec_on)
+ 		rec_lead = REC_LEAD_PERIODS;
++	if (af_on)
++		audio_realtime();
+ 	if (amp_db > -10)
+ 		amp_db = -10;	/* A71 2026-11-09: owner found -20 quiet; tas2562.c has the same ceiling */
+ 	atexit(lpi_restore);	/* sp2: runs after amp_off (atexit is LIFO) */
