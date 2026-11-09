@@ -335,6 +335,84 @@ air2nir = executable(""")
     p.write_text(s)
     p=air/'air_metal.c';s=p.read_text()
     s=replace(s,'[RWA_MIP_NOT_MIPMAPPED] = PIPE_TEX_MIPFILTER_NONE,','[RWA_MIP_NOT_MIPMAPPED] = PIPE_TEX_MIPFILTER_LINEAR,')
+    # A71: the App Library blur keeps visible blocks on a 4-pixel grid although the mip chain and the linear sampler are
+    # right (NOTES 2026-11-09). The final pass filters each level by hand with a B-spline of four txl taps. Pointing the four
+    # taps at the unshifted coordinate leaves bilinear per level, and the mix between levels stays. A file
+    # /var/local/sweet-blur-bicubic restores the original shader.
+    s=replace(s,'''/* Clone, finalise and compile one stage, handing the driver a copy it may steal.''','''static bool
+sweet_find_op(nir_scalar s, nir_op op, int depth, nir_scalar *out)
+{
+   s = nir_scalar_chase_movs(s);
+   if (!nir_scalar_is_alu(s))
+      return false;
+   if (nir_scalar_alu_op(s) == op) {
+      *out = s;
+      return true;
+   }
+   if (!depth)
+      return false;
+   for (unsigned i = 0; i < nir_op_infos[nir_scalar_alu_op(s)].num_inputs; i++) {
+      if (sweet_find_op(nir_scalar_chase_alu_src(s, i), op, depth - 1, out))
+         return true;
+   }
+   return false;
+}
+
+/* tap = (floor(size * base - 0.5) + offset) / size: find base */
+static bool
+sweet_tap_base(nir_scalar tap, nir_scalar *base)
+{
+   nir_scalar fl, m;
+   if (!sweet_find_op(tap, nir_op_ffloor, 5, &fl) ||
+       !sweet_find_op(nir_scalar_chase_alu_src(fl, 0), nir_op_fmul, 2, &m))
+      return false;
+   for (unsigned k = 0; k < 2; k++) {
+      nir_scalar a = nir_scalar_chase_movs(nir_scalar_chase_alu_src(m, k));
+      if (nir_scalar_is_alu(a) && (nir_scalar_alu_op(a) == nir_op_u2f32 || nir_scalar_alu_op(a) == nir_op_i2f32)) {
+         *base = nir_scalar_chase_alu_src(m, 1 - k);
+         return true;
+      }
+   }
+   return false;
+}
+
+static void
+sweet_blur_taps(nir_shader *s)
+{
+   if (!s->info.name || strcmp(s->info.name, "variable_blur_frag_lph") ||
+       access("/var/local/sweet-blur-bicubic", F_OK) == 0)
+      return;
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+   nir_builder b = nir_builder_create(impl);
+   unsigned count = 0;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_tex)
+            continue;
+         nir_tex_instr *tex = nir_instr_as_tex(instr);
+         int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+         if (tex->op != nir_texop_txl || ci < 0 || tex->src[ci].src.ssa->num_components != 2)
+            continue;
+         nir_scalar bx, by;
+         if (!sweet_tap_base(nir_get_scalar(tex->src[ci].src.ssa, 0), &bx) ||
+             !sweet_tap_base(nir_get_scalar(tex->src[ci].src.ssa, 1), &by))
+            continue;
+         b.cursor = nir_before_instr(instr);
+         nir_src_rewrite(&tex->src[ci].src, nir_vec2(&b, nir_channel(&b, bx.def, bx.comp), nir_channel(&b, by.def, by.comp)));
+         count++;
+      }
+   }
+   nir_metadata_preserve(impl, nir_metadata_none);
+   fprintf(stderr, "SweetNativeMetal: variable blur: %u bicubic taps made plain%c", count, 10);
+}
+
+/* Clone, finalise and compile one stage, handing the driver a copy it may steal.''')
+    s=replace(s,'''   finalize_for_gallium(clone, device->screen);
+
+   struct pipe_shader_state templ = { .type = PIPE_SHADER_IR_NIR, .ir.nir = clone };''','''   finalize_for_gallium(clone, device->screen);
+   sweet_blur_taps(clone);
+
+   struct pipe_shader_state templ = { .type = PIPE_SHADER_IR_NIR, .ir.nir = clone };''')
     # A71: the extended-range formats CAMetalLayer asks for (the Astronomy wallpaper). These surfaces are only ever read
     # back through the same Metal format, so an unsigned-normalised reading round-trips what was drawn (values outside
     # [0, 1], the extended part, are clamped). 552/553 are 64 bits per pixel, 554/555 are 32.
