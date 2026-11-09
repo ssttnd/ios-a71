@@ -388,14 +388,12 @@ static void cmd_threads(int fd, int pid)
 	kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
 
 	if (kr != KERN_SUCCESS) {
-		say(fd, "ERR task_for_pid %d
-", kr);
+		say(fd, "ERR task_for_pid %d\n", kr);
 		return;
 	}
 	kr = task_threads(task, &th, &n);
 	if (kr != KERN_SUCCESS) {
-		say(fd, "ERR task_threads %d
-", kr);
+		say(fd, "ERR task_threads %d\n", kr);
 		mach_port_deallocate(mach_task_self(), task);
 		return;
 	}
@@ -406,8 +404,7 @@ static void cmd_threads(int fd, int pid)
 		int len;
 
 		if (thread_get_state(th[i], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) != KERN_SUCCESS) {
-			say(fd, "T%u no state
-", i);
+			say(fd, "T%u no state\n", i);
 			mach_port_deallocate(mach_task_self(), th[i]);
 			continue;
 		}
@@ -426,14 +423,12 @@ static void cmd_threads(int fd, int pid)
 				break;
 			fp = pair[0];
 		}
-		say(fd, "%s
-", line);
+		say(fd, "%s\n", line);
 		mach_port_deallocate(mach_task_self(), th[i]);
 	}
 	vm_deallocate(mach_task_self(), (vm_address_t)th, n * sizeof(*th));
 	mach_port_deallocate(mach_task_self(), task);
-	say(fd, "OK
-");
+	say(fd, "OK\n");
 }
 
 static void cmd_ps(int fd)
