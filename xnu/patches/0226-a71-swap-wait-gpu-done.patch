@@ -1,0 +1,33 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -243,6 +243,7 @@
+ 	 * cheap; split them so the remaining cap is measured. */
+ 	uint64_t      fStatsGateUs, fStatsAcquireUs, fStatsCopyUs, fStatsSwaps;
+ 	uint32_t      fPresentedSwap; /* 0197: swap id of the last frame copied to the panel */
++	uint32_t      fGateDoneSwap;  /* 0226: swap id of the last frame the GPU finished */
+ 	uint32_t      fPendingFence, fPresentFence;   /* newest GPU fence when SwapEnd recorded the frame */
+ 	/* Beam-raced copy (0144): the DSC video-mode panel scans this single
+ 	 * buffer continuously, so a copy that starts behind the scan line tears
+@@ -1423,6 +1424,11 @@
+ 	if(gate.state<0) {
+ 		IOLockLock(fLock);fDirty=true;IOLockUnlock(fLock);
+ 		return; // retain the last complete panel frame after a GPU fault
++	}
++	{
++		uint32_t gate_id;
++		memcpy(&gate_id, rec + 0x50, sizeof(gate_id));
++		__atomic_store_n(&fGateDoneSwap, gate_id, __ATOMIC_RELEASE);
+ 	}
+ 	uint32_t mask = get32(rec, 0x104);
+ 	if (!fFlipProbed) {
+@@ -1853,7 +1859,9 @@
+ 			}
+ 			const uint64_t began = mach_absolute_time();
+ 			uint64_t ns = 0;
+-			while (!fFB->fPowerOff && (int32_t)(__atomic_load_n(&fFB->fPresentedSwap, __ATOMIC_ACQUIRE) - want) < 0) {
++			/* 0226, sweetswapwait=2: answer when the GPU has finished the frame, not after the 2.6 ms copy: GPU 15.4 + copy 2.6 ms was 18 ms, over the 16.7 ms tick */
++			while (!fFB->fPowerOff && (int32_t)(__atomic_load_n(&fFB->fPresentedSwap, __ATOMIC_ACQUIRE) - want) < 0 &&
++			    (on != 2 || (int32_t)(__atomic_load_n(&fFB->fGateDoneSwap, __ATOMIC_ACQUIRE) - want) < 0)) {
+ 				absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+ 				if (ns >= 40000000ULL) {
+ 					break;
