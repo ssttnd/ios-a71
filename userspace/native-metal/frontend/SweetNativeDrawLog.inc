@@ -294,7 +294,9 @@ native_ci_no_gl(id cls, SEL cmd, id eagl, id options)
 	NSMutableDictionary *o = options ? [NSMutableDictionary dictionaryWithDictionary:options] : [NSMutableDictionary dictionary];
 	if (key && *key)
 		o[*key] = @YES;
-	return ((id (*)(id, SEL, id, id))native_ci_orig)(cls, cmd, eagl, o);
+	(void)o;
+	(void)native_ci_orig;
+	return nil;	/* no GL on this phone: the original crashes through NULL even with the software flag */
 }
 
 __attribute__((constructor)) static void
