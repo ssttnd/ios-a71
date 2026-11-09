@@ -1,0 +1,10 @@
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -62,6 +62,7 @@
+   * are the processes the "not on the list" log named on 2026-11-08. */
+  /* 0223: SpringBoard with a device dies in -[MPSImageGaussianBlur initWithDevice:] (no MPSDevice for this GPU), a boot loop. */
+  for(const char *p=name;*p;++p) {const char *a=p,*b="Poster";while(*b && *a==*b) {++a;++b;} if(!*b)return true;}
++ if(!strcmp(name,"Maps"))return true; /* 0224: its map view stays grey without a device */
+  return false;
+ }
+ // Release/acquire publishes the completed backend to the framebuffer workloop.
