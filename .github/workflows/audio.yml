@@ -38,7 +38,8 @@ jobs:
             -o "$out/tasprobe" userspace/audio/tasprobe.c
           xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -Wextra -o "$out/sweetdbg" userspace/debug/sweetdbg.c
           xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -Wextra -o "$out/iobench" userspace/debug/iobench.c
-          for f in adspboot tasprobe sweetdbg iobench; do
+          xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -Wextra -o "$out/sleeptest" userspace/debug/sleeptest.c
+          for f in adspboot tasprobe sweetdbg iobench sleeptest; do
             codesign --force --sign - --pagesize 4096 "$out/$f"
             codesign --verify --strict "$out/$f"
           done
