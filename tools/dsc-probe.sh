@@ -1,8 +1,10 @@
 #!/bin/bash
-# Called by .github/workflows/dsc-probe.yml with the shared cache path: names for addresses from a crash line, already unslid.
+# Called by .github/workflows/dsc-probe.yml with the shared cache path. What accountsd does for tetheredSyncSourceTypeForDataclass.
 c="$1"
 mkdir -p probe
-for a in 0x1c2611030 0x1c2622b18 0x1c2622db8 0x1c2611524 0x186e5c148 0x186e5d2e0 0x186e61d20 0x1811b0ef8 0x1811b0da4 0xb81ab0d8 0x1a4624344; do
-	ipsw dyld a2s "$c" "$a" 2>&1 | tail -1 | tee -a probe/a2s.txt
+ipsw dyld macho "$c" Accounts --objc 2>&1 | grep -i -E 'tethered' | head -20 | tee probe/objc.txt
+for s in "-[ACAccountStore tetheredSyncSourceTypeForDataclass:]" "-[ACDAccountStore tetheredSyncSourceTypeForDataclass:completion:]" "-[ACRemoteAccountStoreSession tetheredSyncSourceTypeForDataclass:completion:]"; do
+	echo "== $s"
+	ipsw dyld disass "$c" --symbol "$s" 2>&1 | grep -E 'bl|Error|error' | head -40 | cut -c1-120 | tee -a probe/disass.txt
 done
-echo done
+strings -a "$c" 2>/dev/null | grep -i -E 'tetheredsync|TetheredSync' | head -20 | tee probe/str.txt
