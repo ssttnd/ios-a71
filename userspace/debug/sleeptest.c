@@ -50,8 +50,29 @@ static void set_realtime(void)
 	printf("real-time policy: %s\n", k == KERN_SUCCESS ? "set" : mach_error_string(k));
 }
 
+extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
+extern int proc_name(int pid, void *buffer, uint32_t buffersize);
+
+/* sleeptest scan: which processes the kernel treats as background daemons (PROC_FLAG_IOS_APPLEDAEMON and the rest) */
+static int scan(void)
+{
+	for (int pid = 1; pid < 3000; pid++) {
+		uint32_t info[128];
+		char name[64] = "";
+		if (proc_pidinfo(pid, 3 /* PROC_PIDTBSDINFO */, 0, info, sizeof(info)) <= 0)
+			continue;
+		proc_name(pid, name, sizeof(name));
+		const uint32_t f = info[0];
+		printf("%5d %-26s %s%s%s%s%s\n", pid, name, f & 0x20000 ? "BG-DAEMON " : "", f & 0x8000 ? "int-bg " : "", f & 0x10000 ? "ext-bg " : "",
+		    f & 0x100000 ? "adaptive " : "", f & 0x1000000 ? "app" : "");
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
+	if (argc > 1 && !strcmp(argv[1], "scan"))
+		return scan();
 	printf("darwin background before: process %d thread %d\n", getpriority(PRIO_DARWIN_PROCESS, 0), getpriority(PRIO_DARWIN_THREAD, 0));
 	if (argc > 1) {
 		int a = setpriority(PRIO_DARWIN_PROCESS, 0, 0), b = setpriority(PRIO_DARWIN_THREAD, 0, 0);
