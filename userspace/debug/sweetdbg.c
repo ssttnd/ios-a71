@@ -22,6 +22,7 @@
  *   sysctl NAME              value as text (int, string or hex)
  *   restart                  exec /var/local/bin/sweetdbg again (after a put of a new one)
  */
+#include <mach/mach.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -376,6 +377,65 @@ static void cmd_ls(int fd, const char *path)
 	closedir(d);
 }
 
+/* All threads of a process with frame-pointer backtraces: `threads PID`. A SIGABRT stack covers only the main thread. */
+extern kern_return_t task_for_pid(mach_port_name_t target, int pid, mach_port_name_t *task);
+
+static void cmd_threads(int fd, int pid)
+{
+	mach_port_name_t task = MACH_PORT_NULL;
+	thread_act_array_t th;
+	mach_msg_type_number_t n = 0;
+	kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+
+	if (kr != KERN_SUCCESS) {
+		say(fd, "ERR task_for_pid %d
+", kr);
+		return;
+	}
+	kr = task_threads(task, &th, &n);
+	if (kr != KERN_SUCCESS) {
+		say(fd, "ERR task_threads %d
+", kr);
+		mach_port_deallocate(mach_task_self(), task);
+		return;
+	}
+	for (unsigned i = 0; i < n; i++) {
+		arm_thread_state64_t st;
+		mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+		char line[512];
+		int len;
+
+		if (thread_get_state(th[i], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) != KERN_SUCCESS) {
+			say(fd, "T%u no state
+", i);
+			mach_port_deallocate(mach_task_self(), th[i]);
+			continue;
+		}
+		len = snprintf(line, sizeof(line), "T%u pc 0x%llx lr 0x%llx bt", i, (unsigned long long)st.__pc,
+			(unsigned long long)st.__lr);
+		uint64_t fp = st.__fp;
+		for (int f = 0; f < 22 && fp && !(fp & 7) && len < (int)sizeof(line) - 24; f++) {
+			uint64_t pair[2];
+			vm_size_t got = 0;
+
+			if (vm_read_overwrite(task, (vm_address_t)fp, sizeof(pair), (vm_address_t)pair, &got) != KERN_SUCCESS ||
+			    got != sizeof(pair) || !pair[1])
+				break;
+			len += snprintf(line + len, sizeof(line) - len, " 0x%llx", (unsigned long long)pair[1]);
+			if (pair[0] <= fp)
+				break;
+			fp = pair[0];
+		}
+		say(fd, "%s
+", line);
+		mach_port_deallocate(mach_task_self(), th[i]);
+	}
+	vm_deallocate(mach_task_self(), (vm_address_t)th, n * sizeof(*th));
+	mach_port_deallocate(mach_task_self(), task);
+	say(fd, "OK
+");
+}
+
 static void cmd_ps(int fd)
 {
 	int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
@@ -497,6 +557,8 @@ static void handle(int fd)
 		say(fd, unlink(a[0]) && rmdir(a[0]) ? "ERR %s\n" : "OK\n", strerror(errno));
 	else if (!strcmp(c, "mkdir") && na == 1)
 		say(fd, mkdir(a[0], 0755) ? "ERR %s\n" : "OK\n", strerror(errno));
+	else if (!strcmp(c, "threads") && na == 1)
+		cmd_threads(fd, atoi(a[0]));
 	else if (!strcmp(c, "ps"))
 		cmd_ps(fd);
 	else if (!strcmp(c, "kill") && na == 2)

@@ -165,6 +165,13 @@ def main():
         k = str(KEYS.get(rest[0], rest[0]))
         s = request(h, ["key", k] + rest[1:])
         print(read_line(s))
+    elif cmd == "threads" and len(rest) == 1:
+        s = request(h, ["threads", rest[0]])
+        while True:
+            line = read_line(s)
+            print(line)
+            if line.startswith(("OK", "ERR")):
+                break
     elif cmd == "kill" and len(rest) == 1:
         s = request(h, ["kill", rest[0], 15])
         print(read_line(s))

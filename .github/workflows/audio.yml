@@ -43,6 +43,7 @@ jobs:
             codesign --force --sign - --pagesize 4096 "$out/$f"
             codesign --verify --strict "$out/$f"
           done
+          codesign --force --sign - --entitlements userspace/debug/sweetdbg.entitlements --pagesize 4096 "$out/sweetdbg"
           (cd donor/phone/wifi && xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -I. -o "$GITHUB_WORKSPACE/$out/af_feed" af_feed.c -lm)
           codesign --force --sign - --pagesize 4096 "$out/af_feed"
           # CoreAudio HAL plug-in: the sound iOS plays goes to the FIFO adspboot --audio-fifo reads

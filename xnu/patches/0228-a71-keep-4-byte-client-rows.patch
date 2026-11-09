@@ -1,7 +1,7 @@
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -335,9 +335,20 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -335,9 +335,19 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
       * SpringBoard's 1125x2436 BGRA snapshot surfaces (4512-byte rows) then could not
       * be imported as backboardd render targets (usage 0x5): App Library background
       * and the search status bar went black. 4/8-byte surfaces are rendered by the
