@@ -283,6 +283,7 @@ native_early_stderr(void)
  * A71 2026-11-09: Settings died in CI::GLContext::init (call through NULL) from +[CIContext _MI_sharedIconCompositorContext]
  * while scaling app icons: this system has no OpenGL. CoreImage's EAGL entry now returns a software-rendered context.
  */
+static id native_ci_none(id self_, SEL cmd) { (void)self_; (void)cmd; return nil; }
 static IMP native_ci_orig;
 static id
 native_ci_no_gl(id cls, SEL cmd, id eagl, id options)
@@ -304,4 +305,9 @@ native_ci_install(void)
 	Method m = c ? class_getClassMethod(c, sel_registerName("internalContextWithEAGLContext:options:")) : NULL;
 	if (m && !native_ci_orig)
 		native_ci_orig = method_setImplementation(m, (IMP)native_ci_no_gl);
+	/* The software flag is not honoured there: without a context the icon scaler has nothing to call into GL with. */
+	dlopen("/System/Library/PrivateFrameworks/MobileIcons.framework/MobileIcons", RTLD_LAZY);
+	Method icon = c ? class_getClassMethod(c, sel_registerName("_MI_sharedIconCompositorContext")) : NULL;
+	if (icon)
+		method_setImplementation(icon, (IMP)native_ci_none);
 }
