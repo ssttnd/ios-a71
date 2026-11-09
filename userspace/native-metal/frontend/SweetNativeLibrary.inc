@@ -141,6 +141,10 @@ static unsigned native_constant_bytes(NSUInteger type) {
     f->_nativeAIR=[[NSData alloc] initWithBytes:bytes length:size];f->_nativeName=[name copy];
     f->_nativeType=type;f->_nativeConstants=[constants copy];if(error)*error=nil;return f;
 }
+- (id)newFunctionWithName:(NSString *)name constantValues:(id)values pipelineLibrary:(id)library error:(NSError **)error {
+    (void)library; /* a cache hint: VectorKit (Maps) passes one, nothing depends on it */
+    return [self newFunctionWithName:name constantValues:values error:error];
+}
 - (void)newFunctionWithName:(NSString *)name constantValues:(id)values completionHandler:(void (^)(id,NSError *))handler {
     NSError *e=nil;id f=[self newFunctionWithName:name constantValues:values error:&e];
     if(handler)handler(f,e);[f release];
