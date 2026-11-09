@@ -1,0 +1,66 @@
+diff --git a/phone/wifi/adspboot.c b/phone/wifi/adspboot.c
+--- a/phone/wifi/adspboot.c
++++ b/phone/wifi/adspboot.c
+@@ -2330,6 +2330,28 @@
+ #define AF_KEEP_QUEUED	3
+ static unsigned af_held[PCM_PERIODS], af_nheld;
+ static uint32_t af_held_total, af_forced;
++/* A71: one line per 100 pulls while there is sound */
++static struct { uint32_t pulls, partial, empty, lmin, lmax, omin, bmax; int active; } af_st;
++static void af_stat(uint32_t lvl, uint32_t got, int sound)
++{
++	if (!af_st.pulls || lvl < af_st.lmin)
++		af_st.lmin = lvl;
++	if (lvl > af_st.lmax)
++		af_st.lmax = lvl;
++	if (!af_st.pulls || pcm_out < af_st.omin)
++		af_st.omin = pcm_out;
++	if (!got)
++		af_st.empty++;
++	else if (got < PCM_FRAMES)
++		af_st.partial++;
++	af_st.active |= sound != 0;
++	if (++af_st.pulls < 100)
++		return;
++	if (af_st.active)
++		printf("audio: 100 pulls: %u partial, %u empty, ring %u..%u, at DSP min %u, burst max %u, held now %u\n",
++		       af_st.partial, af_st.empty, af_st.lmin, af_st.lmax, af_st.omin, af_st.bmax, af_nheld);
++	memset(&af_st, 0, sizeof(af_st));
++}
+ 
+ #define PCM_WD_MS	(af_on && !af_full_off ? 3000 : 1000)	/* sp25: a stall must not kill a stream with its periods coming */
+ 
+@@ -2339,7 +2361,7 @@
+ 	if (af_on) {	/* sp23: both slots, as the tone; the amp reads slot 0 */
+ 		int16_t m[PCM_FRAMES];
+ 		int was = af_g.muted, sound = 0;
+-		af_ring_pull(&af_r, m, PCM_FRAMES);
++		uint32_t lvl = af_r.n, got = af_ring_pull(&af_r, m, PCM_FRAMES);
+ 		if (af_dc_feed(&af_g, m, PCM_FRAMES)) {
+ 			memset(m, 0, sizeof(m));
+ 			if (!was)
+@@ -2350,6 +2372,7 @@
+ 			s[2 * f] = s[2 * f + 1] = m[f];
+ 			sound |= m[f];
+ 		}
++		af_stat(lvl, got, sound);
+ 		if (sound)
+ 			af_last_sound = now_ms();
+ 		pm_wr(pcm_pa + (uint64_t)PCM_STRIDE * p, s, sizeof(s));
+@@ -2705,6 +2728,16 @@
+ 	if (pcm_step != P_PLAY)
+ 		return;
+ 	if (af_on) {	/* sp23: no period limit; af_poll starts the amp and asks for the stop */
++		static uint64_t burst_ms;
++		static uint32_t burst_n;
++		if (pcm_t1 == burst_ms)
++			burst_n++;
++		else {
++			burst_ms = pcm_t1;
++			burst_n = 1;
++		}
++		if (burst_n > af_st.bmax)
++			af_st.bmax = burst_n;
+ 		if (!af_stop_req) {
+ 			if (af_r.n >= PCM_FRAMES || pcm_out < AF_KEEP_QUEUED) {
+ 				if (af_r.n < PCM_FRAMES)
