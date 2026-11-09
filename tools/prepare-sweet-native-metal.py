@@ -86,6 +86,7 @@ air_specialization_check = executable(
 air2nir = executable(""")
     p.write_text(s)
     p=air/'air_to_nir.c';s=p.read_text()
+    s=replace(s,'      struct air_ptr p = { .binding = index, .pointee = t->elem };\n      enum air_resource_kind rk;\n      switch (as) {',"      struct air_ptr p = { .binding = index, .pointee = t->elem };\n      enum air_resource_kind rk;\n      /* VectorKit's buffers have no air.address_space: the pointer type has it. */\n      if (!as)\n         as = t->addrspace;\n      switch (as) {")
     s=replace(s,'               (*out)[num++].index = idx;',
         '               const char *constant_name = md_str(node, 2);\n               (*out)[num].name = constant_name ? ralloc_strdup(mem_ctx, constant_name) : NULL;\n               (*out)[num++].index = idx;')
     s=replace(s,'   return v && (v->kind == AIR_VAL_PTR || v->kind == AIR_VAL_PTR_SELECT);',
@@ -304,6 +305,7 @@ air2nir = executable(""")
                 '         add_varying(c, md_key_str(node, "air.fragment_input"), slot, air_nir_components(t), node);')
     p.write_text(s)
     p=air/'air_intrinsics.c';s=p.read_text()
+    s=replace(s,'   } else if (!strcmp(op, "convert")) {\n      /* air.convert.<dst sign>','   } else if (!strcmp(op, "pack") && n->num >= 2 &&\n              (!strcmp(n->part[1], "unorm2x16") || !strcmp(n->part[1], "snorm2x16"))) {\n      nir_def *v = a[0]->bit_size == 32 ? a[0] : nir_f2f32(&c->b, a[0]);\n      r = n->part[1][0] == \'u\' ? nir_pack_unorm_2x16(&c->b, v) : nir_pack_snorm_2x16(&c->b, v);\n   } else if (!strcmp(op, "convert")) {\n      /* air.convert.<dst sign>')
     s=replace(s,'   struct air_tex_name t;\n   if (!parse_tex_name(n->part[0], &t))\n','''   /* metal::texture2d() and its kin: a NULL handle, which is no binding. Every
     * member but is_null_texture is undefined on one, so a use that reaches
     * tex_handle is refused there; the QuartzCore uber shaders only phi it with
