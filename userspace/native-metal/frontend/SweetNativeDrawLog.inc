@@ -283,16 +283,17 @@ native_early_stderr(void)
  * A71 2026-11-09: Settings died in CI::GLContext::init (call through NULL) from +[CIContext _MI_sharedIconCompositorContext]
  * while scaling app icons: this system has no OpenGL. CoreImage's EAGL entry now returns a software-rendered context.
  */
+static IMP native_ci_orig;
 static id
 native_ci_no_gl(id cls, SEL cmd, id eagl, id options)
 {
-	(void)cmd;
-	(void)eagl;
+	/* contextWithOptions: comes back here: stack overflow; the original honours the software flag */
+	/* eagl is passed through */
 	NSString **key = dlsym(RTLD_DEFAULT, "kCIContextUseSoftwareRenderer");
 	NSMutableDictionary *o = options ? [NSMutableDictionary dictionaryWithDictionary:options] : [NSMutableDictionary dictionary];
 	if (key && *key)
 		o[*key] = @YES;
-	return ((id (*)(id, SEL, id))objc_msgSend)(cls, sel_registerName("contextWithOptions:"), o);
+	return ((id (*)(id, SEL, id, id))native_ci_orig)(cls, cmd, eagl, o);
 }
 
 __attribute__((constructor)) static void
@@ -301,6 +302,6 @@ native_ci_install(void)
 	dlopen("/System/Library/Frameworks/CoreImage.framework/CoreImage", RTLD_LAZY);
 	Class c = objc_getClass("CIContext");
 	Method m = c ? class_getClassMethod(c, sel_registerName("internalContextWithEAGLContext:options:")) : NULL;
-	if (m)
-		method_setImplementation(m, (IMP)native_ci_no_gl);
+	if (m && !native_ci_orig)
+		native_ci_orig = method_setImplementation(m, (IMP)native_ci_no_gl);
 }
