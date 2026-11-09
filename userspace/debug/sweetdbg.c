@@ -628,8 +628,10 @@ static void load_key(void)
 
 int main(void)
 {
-	/* launched under wland as a background process: usleep(1 ms) took 26-33 ms (sleeptest, 2026-11-09), children inherit it */
-	setpriority(PRIO_DARWIN_PROCESS, 0, 0);
+	/* 2026-11-09: -5 stretched every sleep of a background-band process 32 times (usleep 2 ms took 55-66 ms), up to 100 ms.
+	 * That starved the HAL thread chain: 33-41 k frames/s of sound instead of 48 k. 3 is the timeshare value. */
+	int coalesce_scale = 3;
+	sysctlbyname("kern.timer_coalesce_bg_scale", NULL, NULL, &coalesce_scale, sizeof(coalesce_scale));
 	signal(SIGPIPE, SIG_IGN);
 	setsid();
 	load_key();
