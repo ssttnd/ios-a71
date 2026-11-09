@@ -1,0 +1,13 @@
+--- a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -63,7 +63,9 @@
+  /* 0223: SpringBoard with a device dies in -[MPSImageGaussianBlur initWithDevice:] (no MPSDevice for this GPU), a boot loop. */
+  /* 0225: without a device CoreImage falls back to GL, which does not exist here: Settings died in CI::GLContext::init
+   * (call through NULL) while scaling icons. Everyone gets a device while a slot is free, except SpringBoard (see 0223). */
+- return strcmp(name,"SpringBoard")!=0;
++ /* 0227: everyone-but-SpringBoard turned the home widgets black (chronod) and lost the text in Safari (WebKit.GPU). */
++ for(const char *p=name;*p;++p) {const char *a=p,*b="Poster";while(*b && *a==*b) {++a;++b;} if(!*b)return true;}
++ return !strcmp(name,"Maps") || !strcmp(name,"FitnessWidget");
+ }
+ // Release/acquire publishes the completed backend to the framebuffer workloop.
+ static bool presentation_ready=false;

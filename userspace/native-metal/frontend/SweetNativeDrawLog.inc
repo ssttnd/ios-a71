@@ -1,3 +1,6 @@
+#include <objc/runtime.h>
+#include <objc/message.h>
+#include <dlfcn.h>
 /* SPDX-License-Identifier: MIT */
 /* Draw log (2026-11-02, Control Centre vector glyph diagnosis).
  *
@@ -274,4 +277,30 @@ native_early_stderr(void)
 		dup2(fd, 2);
 		close(fd);
 	}
+}
+
+/*
+ * A71 2026-11-09: Settings died in CI::GLContext::init (call through NULL) from +[CIContext _MI_sharedIconCompositorContext]
+ * while scaling app icons: this system has no OpenGL. CoreImage's EAGL entry now returns a software-rendered context.
+ */
+static id
+native_ci_no_gl(id cls, SEL cmd, id eagl, id options)
+{
+	(void)cmd;
+	(void)eagl;
+	NSString **key = dlsym(RTLD_DEFAULT, "kCIContextUseSoftwareRenderer");
+	NSMutableDictionary *o = options ? [NSMutableDictionary dictionaryWithDictionary:options] : [NSMutableDictionary dictionary];
+	if (key && *key)
+		o[*key] = @YES;
+	return ((id (*)(id, SEL, id))objc_msgSend)(cls, sel_registerName("contextWithOptions:"), o);
+}
+
+__attribute__((constructor)) static void
+native_ci_install(void)
+{
+	dlopen("/System/Library/Frameworks/CoreImage.framework/CoreImage", RTLD_LAZY);
+	Class c = objc_getClass("CIContext");
+	Method m = c ? class_getClassMethod(c, sel_registerName("internalContextWithEAGLContext:options:")) : NULL;
+	if (m)
+		method_setImplementation(m, (IMP)native_ci_no_gl);
 }
