@@ -32,6 +32,8 @@ struct pipe_surface *native_rt_surface(struct rwa_device *, struct pipe_resource
 void native_rt_sync(struct rwa_device *, struct pipe_resource *);
 void native_rt_stale(struct rwa_device *, struct pipe_resource *);
 void native_rt_forget(struct rwa_device *, struct pipe_resource *);
+struct pipe_sampler_view *native_src_view(struct rwa_device *, struct pipe_sampler_view *);
+void native_src_forget(struct rwa_device *, struct pipe_resource *);
 int rwa_command_begin(struct rwa_device *, char *, size_t);
 int rwa_command_end(struct rwa_device *, char *, size_t);
 /* Asynchronous end: hands the transaction to the GPU without waiting and

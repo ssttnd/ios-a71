@@ -338,7 +338,7 @@ air2nir = executable(""")
     p=air/'air_metal.c';s=p.read_text()
     s=replace(s,'rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,\n                  const unsigned origin[3], const unsigned size[3], const void *bytes,\n                  size_t stride, char *why, size_t why_size)\n{\n','rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,\n                  const unsigned origin[3], const unsigned size[3], const void *bytes,\n                  size_t stride, char *why, size_t why_size)\n{\n   native_rt_stale(texture->device, texture->res);\n')
     s=replace(s,'rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,\n                 const unsigned origin[3], const unsigned size[3], void *bytes,\n                 size_t stride, char *why, size_t why_size)\n{\n','rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,\n                 const unsigned origin[3], const unsigned size[3], void *bytes,\n                 size_t stride, char *why, size_t why_size)\n{\n   native_rt_sync(texture->device, texture->res);\n')
-    s=replace(s,'   argbuf_scrub(texture->device, NULL, texture, NULL);\n','   argbuf_scrub(texture->device, NULL, texture, NULL);\n   native_rt_forget(texture->device, texture->res);\n')
+    s=replace(s,'   argbuf_scrub(texture->device, NULL, texture, NULL);\n','   argbuf_scrub(texture->device, NULL, texture, NULL);\n   native_rt_forget(texture->device, texture->res);\n   native_src_forget(texture->device, texture->res);\n')
     s=replace(s,'[RWA_MIP_NOT_MIPMAPPED] = PIPE_TEX_MIPFILTER_NONE,','[RWA_MIP_NOT_MIPMAPPED] = PIPE_TEX_MIPFILTER_LINEAR,')
     # A71: the extended-range formats CAMetalLayer asks for (the Astronomy wallpaper). These surfaces are only ever read
     # back through the same Metal format, so an unsigned-normalised reading round-trips what was drawn (values outside
@@ -712,7 +712,7 @@ native_render_surface(struct rwa_texture *texture, unsigned level)
    if (bound->num_views)''')
     # Clear stale trailing slots when a new shader uses fewer resources. The
     # remaining bindings are reused, not blindly unbound and rebound per draw.
-    s=replace(s,'   if (num_views)\n      pipe->set_sampler_views(pipe, stage, 0, num_views, 0, false, views);','''   for (unsigned k = 0; k < num_views; k++)\n      if (views[k]) native_rt_sync(device, views[k]->texture);\n   unsigned old_views=device->native_pending_views[stage];
+    s=replace(s,'   if (num_views)\n      pipe->set_sampler_views(pipe, stage, 0, num_views, 0, false, views);','''   for (unsigned k = 0; k < num_views; k++)\n      if (views[k]) native_rt_sync(device, views[k]->texture);\n   for (unsigned k = 0; k < num_views; k++)\n      views[k] = native_src_view(device, views[k]);\n   unsigned old_views=device->native_pending_views[stage];
    if (device->in_command && device->native_views_valid[stage] &&
        !memcmp(device->native_views[stage],views,sizeof(views)))device->native_binding_reused++;
    else {

@@ -290,6 +290,78 @@ static void native_rt_flush(struct rwa_device *d)
          rt_flushes++;
       }
 }
+
+/* Tiled copies of large linear textures that shaders sample (2026-11-13). Imported IOSurfaces
+ * (wallpaper, snapshots, icons) are linear, and the texture units fetch linear images poorly.
+ * Once per command buffer each such texture is copied by the blitter into a tiled/UBWC copy
+ * and the sampler view is pointed at the copy. On when /var/local/sweet-ubwc-src exists. */
+#define SRC_N 24
+static struct { struct pipe_resource *lin, *copy; struct pipe_sampler_view *view, *from; unsigned gen; } src_tab[SRC_N];
+static int src_on = -1;
+static unsigned src_gen = 1, src_copies, src_hits, src_seen;
+static uint64_t src_px;
+static void native_src_new_command(void) { src_gen++; }
+struct pipe_sampler_view *native_src_view(struct rwa_device *d, struct pipe_sampler_view *v)
+{
+   if (src_on < 0) {
+      src_on = access("/var/local/sweet-ubwc-src", F_OK) == 0;
+      fprintf(stderr, "SweetNativeMetal: tiled copies of sampled linear textures %s\n", src_on ? "on" : "off");
+   }
+   if (!v || !v->texture) return v;
+   struct pipe_resource *r = v->texture;
+   if (r->target != PIPE_TEXTURE_2D || r->array_size > 1 || r->nr_samples > 1 ||
+       (uint64_t)r->width0 * r->height0 < 250000 || rt_find(r) >= 0 || !d->screen->resource_get_param)
+      return v;
+   int i;
+   for (i = 0; i < SRC_N && src_tab[i].lin != r && src_tab[i].copy != r; i++) ;
+   if (i < SRC_N && src_tab[i].copy == r) return v;
+   if (i == SRC_N) {
+      uint64_t mod = 1;
+      if (!d->screen->resource_get_param(d->screen, d->pipe, r, 0, 0, 0, PIPE_RESOURCE_PARAM_MODIFIER, 0, &mod) ||
+          mod != DRM_FORMAT_MOD_LINEAR)
+         return v;
+      src_seen++; src_px += (uint64_t)r->width0 * r->height0;
+      if (src_on <= 0) return v;
+      for (i = 0; i < SRC_N && src_tab[i].lin; i++) ;
+      if (i == SRC_N) return v;
+      struct pipe_resource t = *r;
+      t.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET;
+      t.flags = 0; t.next = NULL;
+      struct pipe_resource *c = d->screen->resource_create(d->screen, &t);
+      if (!c) return v;
+      pipe_resource_reference(&src_tab[i].lin, r);
+      src_tab[i].copy = c;
+      src_tab[i].gen = 0;
+   }
+   if (src_tab[i].gen != src_gen) {
+      for (unsigned l = 0; l <= r->last_level; l++) {
+         struct pipe_box box;
+         u_box_2d(0, 0, u_minify(r->width0, l), u_minify(r->height0, l), &box);
+         d->pipe->resource_copy_region(d->pipe, src_tab[i].copy, l, 0, 0, 0, r, l, &box);
+      }
+      src_tab[i].gen = src_gen;
+      src_copies++;
+   } else src_hits++;
+   if (src_tab[i].from != v || !src_tab[i].view) {
+      struct pipe_sampler_view tmpl = *v;
+      if (src_tab[i].view && p_atomic_dec_zero(&src_tab[i].view->reference.count))
+         d->pipe->sampler_view_destroy(d->pipe, src_tab[i].view);
+      src_tab[i].view = d->pipe->create_sampler_view(d->pipe, src_tab[i].copy, &tmpl);
+      src_tab[i].from = v;
+   }
+   return src_tab[i].view ? src_tab[i].view : v;
+}
+void native_src_forget(struct rwa_device *d, struct pipe_resource *r)
+{
+   for (int i = 0; i < SRC_N; i++)
+      if (src_tab[i].lin == r) {
+         if (src_tab[i].view && p_atomic_dec_zero(&src_tab[i].view->reference.count))
+            d->pipe->sampler_view_destroy(d->pipe, src_tab[i].view);
+         src_tab[i].view = NULL; src_tab[i].from = NULL;
+         pipe_resource_reference(&src_tab[i].copy, NULL);
+         pipe_resource_reference(&src_tab[i].lin, NULL);
+      }
+}
 static uint64_t native_cpu_commands[8],native_cpu_encode_ns[8],native_cpu_draws[8],native_cpu_draw_count_at_begin;
 int rwa_command_begin(struct rwa_device *d,char *why,size_t n)
 {
@@ -302,6 +374,7 @@ int rwa_command_begin(struct rwa_device *d,char *why,size_t n)
    memset(d->native_samplers_valid,0,sizeof(d->native_samplers_valid));
    d->native_begin_ns=native_now_ns();
    if(!d->native_window_ns)d->native_window_ns=d->native_begin_ns;
+   native_src_new_command();
    d->in_command=true;native_passprof_mark(d,1,1,false);return 0;
 }
 static int native_command_end(struct rwa_device *d,uint64_t *submitted,char *why,size_t n)
@@ -362,6 +435,7 @@ static int native_command_end(struct rwa_device *d,uint64_t *submitted,char *why
          (unsigned long long)native_cpu_draws[0],(unsigned long long)native_cpu_draws[1],(unsigned long long)native_cpu_draws[2],(unsigned long long)native_cpu_draws[3],
          (unsigned long long)native_cpu_draws[4],(unsigned long long)native_cpu_draws[5],(unsigned long long)native_cpu_draws[6],(unsigned long long)native_cpu_draws[7]);
       memset(native_cpu_commands,0,sizeof native_cpu_commands);memset(native_cpu_encode_ns,0,sizeof native_cpu_encode_ns);memset(native_cpu_draws,0,sizeof native_cpu_draws);
+      fprintf(stderr,"SweetNativeMetal: large linear sampled textures new=%u px=%llu copies=%u reuse=%u\n",src_seen,(unsigned long long)src_px,src_copies,src_hits);src_seen=src_copies=src_hits=0;src_px=0;
       if(rt_on>0)fprintf(stderr,"SweetNativeMetal: UBWC shadows made=%u syncs=%u flushes=%u\n",rt_made,rt_syncs,rt_flushes);
       fprintf(stderr,"SweetNativeMetal: draw phases validation_surface_us=%llu fixed_state_us=%llu bindings_us=%llu draw_vbo_us=%llu\n",
          (unsigned long long)(d->native_phase_ns[0]/1000),(unsigned long long)(d->native_phase_ns[1]/1000),
