@@ -83,6 +83,22 @@ def adapt_submit_merging(mesa):
     (16 IBs) and the 1024-entry resource table, so the transport never resends
     a resource list for a second chunk.
     """
+    # Mach-O has no ELF build-id, so ir3's disk cache was never created and every boot compiled
+    # every shader again (the first lock-screen swipe, Control Centre, widgets stalled). The
+    # commit being built identifies the compiler instead.
+    p=mesa/'src/freedreno/ir3/ir3_disk_cache.c';s=p.read_text()
+    s=exact(s,"""   const struct build_id_note *note =
+      build_id_find_nhdr_for_addr(ir3_disk_cache_init);
+   assert(note && build_id_length(note) == 20); /* sha1 */
+
+   const uint8_t *id_sha1 = build_id_data(note);
+   assert(id_sha1);
+
+   char timestamp[41];
+   _mesa_sha1_format(timestamp, id_sha1);
+""","""   const char *timestamp = "%s";
+""" % os.environ.get('GITHUB_SHA','local')[:40])
+    p.write_text(s)
     p=mesa/'src/freedreno/drm/freedreno_ringbuffer_sp.c';s=p.read_text()
     s=exact(s,'''static bool
 should_defer(struct fd_submit *submit)
