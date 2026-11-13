@@ -131,6 +131,40 @@ native_drawlog_next(void)
 	return (unsigned)++seq;
 }
 
+/* Diagnostics (2026-11-13): /var/local/sweet-skip holds substrings, one per line; a draw whose
+ * pipeline label or fragment function contains one is not drawn. Read every 2 s; absent = off. */
+static bool
+native_draw_skip(const void *render)
+{
+	static char pat[4][64];
+	static unsigned npat;
+	static time_t checked;
+	time_t now = time(NULL);
+	if (now - checked >= 2) {
+		checked = now;
+		npat = 0;
+		FILE *f = fopen("/var/local/sweet-skip", "r");
+		if (f) {
+			char line[64];
+			while (npat < 4 && fgets(line, sizeof(line), f)) {
+				line[strcspn(line, "\r\n")] = 0;
+				if (line[0])
+					snprintf(pat[npat++], sizeof(pat[0]), "%s", line);
+			}
+			fclose(f);
+		}
+	}
+	if (!npat)
+		return false;
+	bool skip = false;
+	pthread_mutex_lock(&native_drawlog_lock);
+	struct native_drawlog_name *e = native_drawlog_slot(render, false);
+	for (unsigned i = 0; e && !skip && i < npat; i++)
+		skip = strstr(e->label, pat[i]) || strstr(e->ffn, pat[i]);
+	pthread_mutex_unlock(&native_drawlog_lock);
+	return skip;
+}
+
 static void
 native_drawlog_draw(unsigned seq, const void *render, unsigned prim, unsigned start, unsigned count,
                     bool indexed, unsigned index_type, size_t index_offset, unsigned instances,

@@ -1432,7 +1432,7 @@ ensure_function_encoder(void)
         '\t\t\t    work->vertexBuffers, work->vertexBufferOffsets, work->vertexBufferCount,\n'
         '\t\t\t    work->buffers, work->bufferOffsets, work->count);\n'
         '\t}\n'
-        '\tif (mesa.render_draw([work->render render], &draw, why, size) != 0) {')
+        '\tif (!native_draw_skip([work->render render]) && mesa.render_draw([work->render render], &draw, why, size) != 0) {')
     p.write_text(s)
     shutil.copy2(NATIVE/'frontend/SweetNativeLibrary.inc',src/'SweetNativeLibrary.inc')
     shutil.copy2(NATIVE/'frontend/SweetNativeDrawLog.inc',src/'SweetNativeDrawLog.inc')
