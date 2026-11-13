@@ -87,6 +87,7 @@ def adapt_submit_merging(mesa):
     # every shader again (the first lock-screen swipe, Control Centre, widgets stalled). The
     # commit being built identifies the compiler instead.
     p=mesa/'src/freedreno/ir3/ir3_disk_cache.c';s=p.read_text()
+    s=exact(s,"#ifdef __APPLE__\n   /* no build id in a Mach-O library to tell one build's shaders from another's: no cache */\n   return;\n#else\n","#if 0\n#else\n")
     s=exact(s,"""   const struct build_id_note *note =
       build_id_find_nhdr_for_addr(ir3_disk_cache_init);
    assert(note && build_id_length(note) == 20); /* sha1 */
