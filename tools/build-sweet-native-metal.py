@@ -263,7 +263,7 @@ cpp_std = 'c++17'
       '-Dplatforms=','-Dglx=disabled','-Degl=disabled','-Dgbm=disabled','-Dosmesa=false',
       '-Dopengl=false','-Dgles1=disabled','-Dgles2=disabled','-Dllvm=disabled',
       '-Dshared-glapi=disabled','-Dzstd=disabled','-Dxmlconfig=disabled','-Dexpat=disabled',
-      '-Dshader-cache=disabled','-Dvalgrind=disabled','-Dlibunwind=disabled','-Dglvnd=disabled',
+      '-Dshader-cache=enabled','-Dvalgrind=disabled','-Dlibunwind=disabled','-Dglvnd=disabled',
       '-Dvideo-codecs=','-Dtools=','-Dgallium-vdpau=disabled','-Dgallium-va=disabled',
       '-Dgallium-xa=disabled','-Dlmsensors=disabled','-Dbuild-tests=false',
       '-Dbuildtype=release','-Db_ndebug=true']
