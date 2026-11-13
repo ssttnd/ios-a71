@@ -130,9 +130,11 @@ static void pp_drain(struct rwa_device *d)
       if (!d->pipe->get_query_result(d->pipe, pp[i].q, false, &a) ||
           !d->pipe->get_query_result(d->pipe, pp[j].q, false, &b))
          break;
-      if (!pp[i].cmd_end && b.u64 >= a.u64 && b.u64 - a.u64 < 200000000ull) {
-         pp_add(pp[i].w, pp[i].h, pp[j].draws - pp[i].draws, b.u64 - a.u64);
-         pp_total_ns += b.u64 - a.u64;
+      if (b.u64 >= a.u64 && b.u64 - a.u64 < 200000000ull) {
+         /* 0x0 = from a command buffer's end to the next one's start (idle or other
+          * processes); 1x1 = start of a command buffer to its first pass (uploads, blits) */
+         pp_add(pp[i].cmd_end ? 0 : pp[i].w, pp[i].cmd_end ? 0 : pp[i].h, pp[j].draws - pp[i].draws, b.u64 - a.u64);
+         if (!pp[i].cmd_end) pp_total_ns += b.u64 - a.u64;
       }
       if (pp[j].cmd_end) pp_cmds++;
       pp_tail++;
@@ -181,7 +183,7 @@ int rwa_command_begin(struct rwa_device *d,char *why,size_t n)
    memset(d->native_samplers_valid,0,sizeof(d->native_samplers_valid));
    d->native_begin_ns=native_now_ns();
    if(!d->native_window_ns)d->native_window_ns=d->native_begin_ns;
-   d->in_command=true;return 0;
+   d->in_command=true;native_passprof_mark(d,1,1,false);return 0;
 }
 static int native_command_end(struct rwa_device *d,uint64_t *submitted,char *why,size_t n)
 {
