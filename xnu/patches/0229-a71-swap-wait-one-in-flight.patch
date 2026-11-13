@@ -1,0 +1,16 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1860,7 +1860,12 @@
+ 			const uint64_t began = mach_absolute_time();
+ 			uint64_t ns = 0;
+ 			/* 0226, sweetswapwait=2: answer when the GPU has finished the frame, not after the 2.6 ms copy: GPU 15.4 + copy 2.6 ms was 18 ms, over the 16.7 ms tick */
+-			while (!fFB->fPowerOff && (int32_t)(__atomic_load_n(&fFB->fPresentedSwap, __ATOMIC_ACQUIRE) - want) < 0 &&
++			/* 0229, sweetswapwait=3: one swap in flight. CoreAnimation asks after every swap and
++			 * did not encode the next frame until this one was done, so CPU, GPU and copy ran one
++			 * after another (about 25 ms). It draws the next frame into its other surface; only that
++			 * surface's previous frame (want - 1) must be on the panel. */
++			const uint32_t need = on == 3 ? want - 1 : want;
++			while (!fFB->fPowerOff && (int32_t)(__atomic_load_n(&fFB->fPresentedSwap, __ATOMIC_ACQUIRE) - need) < 0 &&
+ 			    (on != 2 || (int32_t)(__atomic_load_n(&fFB->fGateDoneSwap, __ATOMIC_ACQUIRE) - want) < 0)) {
+ 				absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+ 				if (ns >= 40000000ULL) {
