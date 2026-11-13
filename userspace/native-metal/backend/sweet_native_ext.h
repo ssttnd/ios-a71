@@ -27,6 +27,11 @@ void sweet_transport_command_end(void);
 uint64_t sweet_transport_submitted_fence(void);
 int sweet_transport_poll_fence(uint64_t);
 void native_passprof_mark(struct rwa_device *, unsigned, unsigned, bool);
+struct pipe_resource *native_rt(struct rwa_device *, struct pipe_resource *, bool);
+struct pipe_surface *native_rt_surface(struct rwa_device *, struct pipe_resource *);
+void native_rt_sync(struct rwa_device *, struct pipe_resource *);
+void native_rt_stale(struct rwa_device *, struct pipe_resource *);
+void native_rt_forget(struct rwa_device *, struct pipe_resource *);
 int rwa_command_begin(struct rwa_device *, char *, size_t);
 int rwa_command_end(struct rwa_device *, char *, size_t);
 /* Asynchronous end: hands the transaction to the GPU without waiting and

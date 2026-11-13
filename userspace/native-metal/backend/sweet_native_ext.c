@@ -171,6 +171,120 @@ void native_passprof_mark(struct rwa_device *d, unsigned w, unsigned h, bool cmd
    pp_head++;
    if (cmd_end) pp_flushed = pp_head;
 }
+
+/* UBWC shadow render targets (2026-11-13). The frame CoreAnimation composites goes into a
+ * linear IOSurface; blending into it reads and writes uncompressed DRAM, and the GPU trace
+ * showed the full-screen pass is bandwidth-bound (14-20 ms). A private copy of such a
+ * target is tiled and UBWC-compressed; draws and clears go there, and its contents go back
+ * to the IOSurface before anything reads the IOSurface (a sampler, a CPU read) and at the
+ * end of every command buffer. CPU writes into the IOSurface mark the copy stale.
+ * On when /var/local/sweet-ubwc-rt exists at the first use in the process. */
+#define RT_N 4
+static struct { struct pipe_resource *lin, *shadow; struct pipe_surface *surf; bool dirty, stale; } rt_tab[RT_N];
+static int rt_on = -1;
+static unsigned rt_made, rt_syncs, rt_flushes;
+static bool rt_eligible(struct rwa_device *d, struct pipe_resource *r)
+{
+   if (!r || r->target != PIPE_TEXTURE_2D || r->last_level || r->array_size > 1 || r->nr_samples > 1 ||
+       r->width0 < 1000 || r->height0 < 1000 || util_format_get_blocksize(r->format) != 4 ||
+       !(r->bind & PIPE_BIND_RENDER_TARGET) || !d->screen->resource_get_param)
+      return false;
+   uint64_t mod = DRM_FORMAT_MOD_INVALID;
+   if (!d->screen->resource_get_param(d->screen, d->pipe, r, 0, 0, 0, PIPE_RESOURCE_PARAM_MODIFIER, 0, &mod))
+      return false;
+   return mod == DRM_FORMAT_MOD_LINEAR;
+}
+static void rt_copy(struct rwa_device *d, struct pipe_resource *dst, struct pipe_resource *src)
+{
+   struct pipe_box box;
+   u_box_2d(0, 0, src->width0, src->height0, &box);
+   d->pipe->resource_copy_region(d->pipe, dst, 0, 0, 0, 0, src, 0, &box);
+}
+static int rt_find(struct pipe_resource *r)
+{
+   for (int i = 0; i < RT_N; i++)
+      if (rt_tab[i].lin && (rt_tab[i].lin == r || rt_tab[i].shadow == r)) return i;
+   return -1;
+}
+struct pipe_resource *native_rt(struct rwa_device *d, struct pipe_resource *r, bool write)
+{
+   if (rt_on < 0) {
+      rt_on = access("/var/local/sweet-ubwc-rt", F_OK) == 0;
+      fprintf(stderr, "SweetNativeMetal: UBWC shadow render targets %s\n", rt_on ? "on" : "off");
+   }
+   if (!rt_on || !d || !r) return r;
+   int i = rt_find(r);
+   if (i >= 0 && rt_tab[i].shadow == r) return r;
+   if (i < 0) {
+      if (!rt_eligible(d, r)) return r;
+      for (i = 0; i < RT_N && rt_tab[i].lin; i++) ;
+      if (i == RT_N) return r;
+      struct pipe_resource t = *r;
+      t.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
+      t.flags = 0;
+      t.next = NULL;
+      struct pipe_resource *sh = d->screen->resource_create(d->screen, &t);
+      if (!sh) return r;
+      pipe_resource_reference(&rt_tab[i].lin, r);
+      rt_tab[i].shadow = sh;
+      rt_tab[i].stale = true;
+      rt_tab[i].dirty = false;
+      rt_made++;
+   }
+   if (rt_tab[i].stale) {
+      rt_copy(d, rt_tab[i].shadow, rt_tab[i].lin);
+      rt_tab[i].stale = false;
+   }
+   if (write) rt_tab[i].dirty = true;
+   return rt_tab[i].shadow;
+}
+struct pipe_surface *native_rt_surface(struct rwa_device *d, struct pipe_resource *r)
+{
+   struct pipe_resource *sh = native_rt(d, r, true);
+   int i = sh != r ? rt_find(sh) : -1;
+   if (i < 0) return NULL;
+   if (!rt_tab[i].surf)
+      rt_tab[i].surf = d->pipe->create_surface(d->pipe, sh, &(struct pipe_surface){ .format = sh->format });
+   struct pipe_surface *s = NULL;
+   pipe_surface_reference(&s, rt_tab[i].surf);
+   return s;
+}
+/* the IOSurface is about to be read: bring the shadow's contents back */
+void native_rt_sync(struct rwa_device *d, struct pipe_resource *r)
+{
+   if (rt_on <= 0 || !r) return;
+   int i = rt_find(r);
+   if (i < 0 || rt_tab[i].lin != r || !rt_tab[i].dirty) return;
+   rt_copy(d, rt_tab[i].lin, rt_tab[i].shadow);
+   rt_tab[i].dirty = false;
+   rt_syncs++;
+}
+void native_rt_stale(struct rwa_device *d, struct pipe_resource *r)
+{
+   (void)d;
+   int i = rt_on > 0 && r ? rt_find(r) : -1;
+   if (i >= 0 && rt_tab[i].lin == r) rt_tab[i].stale = true;
+}
+void native_rt_forget(struct rwa_device *d, struct pipe_resource *r)
+{
+   int i = rt_on > 0 && r ? rt_find(r) : -1;
+   if (i < 0 || rt_tab[i].lin != r) return;
+   if (rt_tab[i].dirty) rt_copy(d, rt_tab[i].lin, rt_tab[i].shadow);
+   pipe_surface_reference(&rt_tab[i].surf, NULL);
+   pipe_resource_reference(&rt_tab[i].shadow, NULL);
+   pipe_resource_reference(&rt_tab[i].lin, NULL);
+   rt_tab[i].dirty = rt_tab[i].stale = false;
+}
+static void native_rt_flush(struct rwa_device *d)
+{
+   if (rt_on <= 0) return;
+   for (int i = 0; i < RT_N; i++)
+      if (rt_tab[i].lin && rt_tab[i].dirty) {
+         rt_copy(d, rt_tab[i].lin, rt_tab[i].shadow);
+         rt_tab[i].dirty = false;
+         rt_flushes++;
+      }
+}
 static uint64_t native_cpu_commands[8],native_cpu_encode_ns[8],native_cpu_draws[8],native_cpu_draw_count_at_begin;
 int rwa_command_begin(struct rwa_device *d,char *why,size_t n)
 {
@@ -193,6 +307,7 @@ static int native_command_end(struct rwa_device *d,uint64_t *submitted,char *why
    native_cpu_commands[native_begin_cpu]++;
    native_cpu_encode_ns[native_begin_cpu]+=encoded-d->native_begin_ns;
    native_cpu_draws[native_begin_cpu]+=d->native_draw_count-native_cpu_draw_count_at_begin;
+   native_rt_flush(d);
    native_passprof_mark(d,0,0,true);
    // Changing/unbinding framebuffer closes its Gallium batch; no per-draw flush.
    d->pipe->set_framebuffer_state(d->pipe,&(struct pipe_framebuffer_state){0});
@@ -304,7 +419,8 @@ int rwa_clear(struct rwa_device *d,struct rwa_texture *const *color,unsigned cou
          say(why,n,"interface: clear requires a floating-point or normalized render target");return -1;
       }
       const unsigned level=levels?levels[i]:0;
-      struct pipe_surface *surface=native_render_surface(color[i],level);
+      struct pipe_surface *surface=level==0?native_rt_surface(d,res):NULL;
+      if(!surface)surface=native_render_surface(color[i],level);
       if(!surface){say(why,n,"failed to create clear surface");return -1;}
       union pipe_color_union value;
       memcpy(value.f,values[i],sizeof(value.f));
