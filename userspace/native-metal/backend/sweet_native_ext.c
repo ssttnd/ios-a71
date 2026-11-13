@@ -190,9 +190,12 @@ static bool rt_eligible(struct rwa_device *d, struct pipe_resource *r)
        !(r->bind & PIPE_BIND_RENDER_TARGET) || !d->screen->resource_get_param)
       return false;
    uint64_t mod = DRM_FORMAT_MOD_INVALID;
-   if (!d->screen->resource_get_param(d->screen, d->pipe, r, 0, 0, 0, PIPE_RESOURCE_PARAM_MODIFIER, 0, &mod))
-      return false;
-   return mod == DRM_FORMAT_MOD_LINEAR;
+   bool got = d->screen->resource_get_param(d->screen, d->pipe, r, 0, 0, 0, PIPE_RESOURCE_PARAM_MODIFIER, 0, &mod);
+   static unsigned said;
+   if (said++ < 6)
+      fprintf(stderr, "SweetNativeMetal: shadow candidate %ux%u fmt %u bind %#x modifier %s %#llx\n",
+         r->width0, r->height0, (unsigned)r->format, r->bind, got ? "read" : "unknown", (unsigned long long)mod);
+   return got && mod == DRM_FORMAT_MOD_LINEAR;
 }
 static void rt_copy(struct rwa_device *d, struct pipe_resource *dst, struct pipe_resource *src)
 {
@@ -230,6 +233,8 @@ struct pipe_resource *native_rt(struct rwa_device *d, struct pipe_resource *r, b
       rt_tab[i].stale = true;
       rt_tab[i].dirty = false;
       rt_made++;
+      fprintf(stderr, "SweetNativeMetal: UBWC shadow %u for %ux%u (modifier of the copy %s)\n", rt_made, r->width0, r->height0,
+         ({ uint64_t m = 0; d->screen->resource_get_param(d->screen, d->pipe, sh, 0, 0, 0, PIPE_RESOURCE_PARAM_MODIFIER, 0, &m); m == DRM_FORMAT_MOD_LINEAR ? "linear" : "tiled"; }));
    }
    if (rt_tab[i].stale) {
       rt_copy(d, rt_tab[i].shadow, rt_tab[i].lin);
@@ -357,6 +362,7 @@ static int native_command_end(struct rwa_device *d,uint64_t *submitted,char *why
          (unsigned long long)native_cpu_draws[0],(unsigned long long)native_cpu_draws[1],(unsigned long long)native_cpu_draws[2],(unsigned long long)native_cpu_draws[3],
          (unsigned long long)native_cpu_draws[4],(unsigned long long)native_cpu_draws[5],(unsigned long long)native_cpu_draws[6],(unsigned long long)native_cpu_draws[7]);
       memset(native_cpu_commands,0,sizeof native_cpu_commands);memset(native_cpu_encode_ns,0,sizeof native_cpu_encode_ns);memset(native_cpu_draws,0,sizeof native_cpu_draws);
+      if(rt_on>0)fprintf(stderr,"SweetNativeMetal: UBWC shadows made=%u syncs=%u flushes=%u\n",rt_made,rt_syncs,rt_flushes);
       fprintf(stderr,"SweetNativeMetal: draw phases validation_surface_us=%llu fixed_state_us=%llu bindings_us=%llu draw_vbo_us=%llu\n",
          (unsigned long long)(d->native_phase_ns[0]/1000),(unsigned long long)(d->native_phase_ns[1]/1000),
          (unsigned long long)(d->native_phase_ns[2]/1000),(unsigned long long)(d->native_phase_ns[3]/1000));
