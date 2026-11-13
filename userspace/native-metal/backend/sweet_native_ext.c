@@ -305,6 +305,7 @@ struct pipe_sampler_view *native_src_view(struct rwa_device *d, struct pipe_samp
 {
    if (src_on < 0) {
       src_on = access("/var/local/sweet-ubwc-src", F_OK) == 0;
+      if (src_on && access("/var/local/sweet-ubwc-src-once", F_OK) == 0) src_on = 2; /* probe: copy once, never refresh */
       fprintf(stderr, "SweetNativeMetal: tiled copies of sampled linear textures %s\n", src_on ? "on" : "off");
    }
    if (!v || !v->texture) return v;
@@ -333,7 +334,7 @@ struct pipe_sampler_view *native_src_view(struct rwa_device *d, struct pipe_samp
       src_tab[i].copy = c;
       src_tab[i].gen = 0;
    }
-   if (src_tab[i].gen != src_gen) {
+   if (src_tab[i].gen != src_gen && (src_on != 2 || !src_tab[i].gen)) {
       for (unsigned l = 0; l <= r->last_level; l++) {
          struct pipe_box box;
          u_box_2d(0, 0, u_minify(r->width0, l), u_minify(r->height0, l), &box);
