@@ -619,8 +619,7 @@ index_range(const uint8_t *indices, unsigned count, unsigned index_size, bool re
                 'native_render_draw(struct rwa_render *render, const struct rwa_draw *draw,')
     # Return one transient reference so existing draw cleanup stays balanced.
     s=replace(s,'surf[i] = pipe->create_surface(pipe, draw->color[i]->res,\n         &(struct pipe_surface){ .format = draw->color[i]->res->format });',
-                'surf[i] = draw->native_color_level[i] == 0 ? native_rt_surface(device, draw->color[i]->res) : NULL;
-      if (!surf[i]) surf[i] = native_render_surface(draw->color[i], draw->native_color_level[i]);')
+                'surf[i] = draw->native_color_level[i] == 0 ? native_rt_surface(device, draw->color[i]->res) : NULL;\n      if (!surf[i]) surf[i] = native_render_surface(draw->color[i], draw->native_color_level[i]);')
     # CoreAnimation's variable blur draws each downsample into the next mip level of one texture
     # (colorAttachments[i].level). The pass is that level's size; level 0 alone left the other
     # levels unwritten, and sampling them gave the black band over the top of the screen.
