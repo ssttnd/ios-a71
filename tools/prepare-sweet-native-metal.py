@@ -339,7 +339,6 @@ air2nir = executable(""")
     s=replace(s,'rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,\n                  const unsigned origin[3], const unsigned size[3], const void *bytes,\n                  size_t stride, char *why, size_t why_size)\n{\n','rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,\n                  const unsigned origin[3], const unsigned size[3], const void *bytes,\n                  size_t stride, char *why, size_t why_size)\n{\n   native_rt_stale(texture->device, texture->res);\n')
     s=replace(s,'rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,\n                 const unsigned origin[3], const unsigned size[3], void *bytes,\n                 size_t stride, char *why, size_t why_size)\n{\n','rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,\n                 const unsigned origin[3], const unsigned size[3], void *bytes,\n                 size_t stride, char *why, size_t why_size)\n{\n   native_rt_sync(texture->device, texture->res);\n')
     s=replace(s,'   argbuf_scrub(texture->device, NULL, texture, NULL);\n','   argbuf_scrub(texture->device, NULL, texture, NULL);\n   native_rt_forget(texture->device, texture->res);\n')
-    s=replace(s,'      surf[i] = pipe->create_surface(pipe, draw->color[i]->res,\n','      surf[i] = pipe->create_surface(pipe, native_rt(device, draw->color[i]->res, true),\n')
     s=replace(s,'[RWA_MIP_NOT_MIPMAPPED] = PIPE_TEX_MIPFILTER_NONE,','[RWA_MIP_NOT_MIPMAPPED] = PIPE_TEX_MIPFILTER_LINEAR,')
     # A71: the extended-range formats CAMetalLayer asks for (the Astronomy wallpaper). These surfaces are only ever read
     # back through the same Metal format, so an unsigned-normalised reading round-trips what was drawn (values outside
@@ -620,7 +619,8 @@ index_range(const uint8_t *indices, unsigned count, unsigned index_size, bool re
                 'native_render_draw(struct rwa_render *render, const struct rwa_draw *draw,')
     # Return one transient reference so existing draw cleanup stays balanced.
     s=replace(s,'surf[i] = pipe->create_surface(pipe, draw->color[i]->res,\n         &(struct pipe_surface){ .format = draw->color[i]->res->format });',
-                'surf[i] = native_render_surface(draw->color[i], draw->native_color_level[i]);')
+                'surf[i] = draw->native_color_level[i] == 0 ? native_rt_surface(device, draw->color[i]->res) : NULL;
+      if (!surf[i]) surf[i] = native_render_surface(draw->color[i], draw->native_color_level[i]);')
     # CoreAnimation's variable blur draws each downsample into the next mip level of one texture
     # (colorAttachments[i].level). The pass is that level's size; level 0 alone left the other
     # levels unwritten, and sampling them gave the black band over the top of the screen.
