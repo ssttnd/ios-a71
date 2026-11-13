@@ -102,6 +102,73 @@ static unsigned native_cpu(void)
    return (unsigned)(v&0xfff)&7;
 }
 static unsigned native_begin_cpu;
+
+/* Per-pass GPU time (2026-11-13): a GPU timestamp where a pass ends (framebuffer change)
+ * and where a command buffer ends; durations between neighbours, summed by target size
+ * and printed every 2 s. On while /var/local/sweet-passprof exists (checked every 2 s).
+ * Results are read only for command buffers already flushed, without waiting. */
+#include <unistd.h>
+#define PP_N 512u
+static struct { struct pipe_query *q; unsigned w, h, draws, cmd_end; } pp[PP_N];
+static unsigned pp_head, pp_tail, pp_flushed;
+static int pp_on = -1;
+static uint64_t pp_check_ns, pp_window_ns;
+static struct { unsigned w, h, n, draws; uint64_t ns; } pp_sum[24];
+static uint64_t pp_total_ns, pp_cmds, pp_lost;
+static void pp_add(unsigned w, unsigned h, unsigned draws, uint64_t ns)
+{
+   unsigned i;
+   for (i = 0; i < 24 && pp_sum[i].n && (pp_sum[i].w != w || pp_sum[i].h != h); i++) ;
+   if (i == 24) i = 23;
+   pp_sum[i].w = w; pp_sum[i].h = h; pp_sum[i].n++; pp_sum[i].draws += draws; pp_sum[i].ns += ns;
+}
+static void pp_drain(struct rwa_device *d)
+{
+   while (pp_tail + 1 < pp_flushed) {
+      union pipe_query_result a, b;
+      unsigned i = pp_tail % PP_N, j = (pp_tail + 1) % PP_N;
+      if (!d->pipe->get_query_result(d->pipe, pp[i].q, false, &a) ||
+          !d->pipe->get_query_result(d->pipe, pp[j].q, false, &b))
+         break;
+      if (!pp[i].cmd_end && b.u64 >= a.u64 && b.u64 - a.u64 < 200000000ull) {
+         pp_add(pp[i].w, pp[i].h, pp[j].draws - pp[i].draws, b.u64 - a.u64);
+         pp_total_ns += b.u64 - a.u64;
+      }
+      if (pp[j].cmd_end) pp_cmds++;
+      pp_tail++;
+   }
+   uint64_t now = native_now_ns();
+   if (now - pp_window_ns >= 2000000000ull && pp_sum[0].n) {
+      char line[1400]; int len = snprintf(line, sizeof line,
+         "SweetNativeMetal: passprof window_ms=%llu cmds=%llu gpu_ms=%llu lost=%llu by target",
+         (unsigned long long)((now - pp_window_ns) / 1000000), (unsigned long long)pp_cmds,
+         (unsigned long long)(pp_total_ns / 1000000), (unsigned long long)pp_lost);
+      for (unsigned k = 0; k < 24 && pp_sum[k].n && len < (int)sizeof line - 60; k++)
+         len += snprintf(line + len, sizeof line - len, " %ux%u:%u/%u/%lluus", pp_sum[k].w, pp_sum[k].h,
+            pp_sum[k].n, pp_sum[k].draws, (unsigned long long)(pp_sum[k].ns / 1000));
+      fprintf(stderr, "%s\n", line);
+      memset(pp_sum, 0, sizeof pp_sum); pp_total_ns = pp_cmds = pp_lost = 0; pp_window_ns = now;
+   }
+}
+void native_passprof_mark(struct rwa_device *d, unsigned w, unsigned h, bool cmd_end)
+{
+   if (!d || !d->pipe) return;
+   uint64_t now = native_now_ns();
+   if (pp_on < 0 || now - pp_check_ns >= 2000000000ull) {
+      pp_on = access("/var/local/sweet-passprof", F_OK) == 0;
+      pp_check_ns = now;
+      if (!pp_window_ns) pp_window_ns = now;
+   }
+   if (!pp_on) return;
+   if (pp_head - pp_tail >= PP_N - 1) { pp_lost++; return; }
+   unsigned i = pp_head % PP_N;
+   if (!pp[i].q) pp[i].q = d->pipe->create_query(d->pipe, PIPE_QUERY_TIMESTAMP, 0);
+   if (!pp[i].q) { pp_lost++; return; }
+   d->pipe->end_query(d->pipe, pp[i].q);
+   pp[i].w = w; pp[i].h = h; pp[i].draws = (unsigned)d->native_draw_count; pp[i].cmd_end = cmd_end;
+   pp_head++;
+   if (cmd_end) pp_flushed = pp_head;
+}
 static uint64_t native_cpu_commands[8],native_cpu_encode_ns[8],native_cpu_draws[8],native_cpu_draw_count_at_begin;
 int rwa_command_begin(struct rwa_device *d,char *why,size_t n)
 {
@@ -124,6 +191,7 @@ static int native_command_end(struct rwa_device *d,uint64_t *submitted,char *why
    native_cpu_commands[native_begin_cpu]++;
    native_cpu_encode_ns[native_begin_cpu]+=encoded-d->native_begin_ns;
    native_cpu_draws[native_begin_cpu]+=d->native_draw_count-native_cpu_draw_count_at_begin;
+   native_passprof_mark(d,0,0,true);
    // Changing/unbinding framebuffer closes its Gallium batch; no per-draw flush.
    d->pipe->set_framebuffer_state(d->pipe,&(struct pipe_framebuffer_state){0});
    util_unreference_framebuffer_state(&d->batch_fb);
@@ -155,6 +223,7 @@ static int native_command_end(struct rwa_device *d,uint64_t *submitted,char *why
       unbind_stage(d,(enum pipe_shader_type)stage,&pending);
       d->native_pending_views[stage]=d->native_pending_images[stage]=d->native_pending_samplers[stage]=0;
    }
+   if(pp_on>0)pp_drain(d);
    uint64_t ended=native_now_ns();
    d->native_finish_ns+=ended-encoded;d->native_command_count++;
    if(ended-d->native_window_ns>=5000000000ull) {

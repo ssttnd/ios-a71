@@ -26,6 +26,7 @@ int sweet_transport_command_begin(void);
 void sweet_transport_command_end(void);
 uint64_t sweet_transport_submitted_fence(void);
 int sweet_transport_poll_fence(uint64_t);
+void native_passprof_mark(struct rwa_device *, unsigned, unsigned, bool);
 int rwa_command_begin(struct rwa_device *, char *, size_t);
 int rwa_command_end(struct rwa_device *, char *, size_t);
 /* Asynchronous end: hands the transaction to the GPU without waiting and

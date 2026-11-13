@@ -855,6 +855,7 @@ bind_stage(''')
    if (same) same = (!fb.zsbuf && !device->batch_fb.zsbuf) ||
       (fb.zsbuf && device->batch_fb.zsbuf && fb.zsbuf->texture == device->batch_fb.zsbuf->texture);
    if (!same) {
+      if (device->in_command) native_passprof_mark(device, fb.width, fb.height, false);
       pipe->set_framebuffer_state(pipe, &fb);
       if(device->in_command)util_copy_framebuffer_state(&device->batch_fb,&fb);
    }''')
